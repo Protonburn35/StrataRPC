@@ -15,12 +15,14 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
 
       - uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d
+        env:
+          RUNNER_DEBUG: "1"
         with:
           # CUDA 13.2.2 contains the sm_120 compiler fix; 13.2.0 and 13.2.1 are known-bad.
           cuda: "13.2.2"
           method: network
           # Ninja invokes nvcc directly, so the optional Visual Studio IDE integration is not needed.
-          sub-packages: '["nvcc", "cudart", "cudart_dev", "cublas", "cublas_dev"]'
+          sub-packages: '["nvcc", "cudart_dev", "cublas_dev"]'
 
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:
