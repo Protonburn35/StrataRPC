@@ -16,7 +16,8 @@ jobs:
 
       - uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d
         with:
-          cuda: "13.0.3"
+          # CUDA 13.2.2 contains the sm_120 compiler fix; 13.2.0 and 13.2.1 are known-bad.
+          cuda: "13.2.2"
           method: network
           # Ninja invokes nvcc directly, so the optional Visual Studio IDE integration is not needed.
           sub-packages: '["nvcc", "cudart", "cudart_dev", "cublas", "cublas_dev"]'
@@ -27,7 +28,7 @@ jobs:
 
       - name: Install the matching CUDA runtime libraries
         shell: pwsh
-        run: python -m pip install --disable-pip-version-check nvidia-cublas==13.0.2.14 nvidia-cuda-runtime==13.0.96
+        run: python -m pip install --disable-pip-version-check nvidia-cublas==13.2.2.2 nvidia-cuda-runtime==13.2.86
 
       - name: Install CMake and Ninja
         shell: pwsh
@@ -51,7 +52,7 @@ jobs:
       - name: Package the engine
         shell: pwsh
         run: |
-          python tools/package_rpc_windows.py --exe build-rpc/strata.exe --out dist --cuda-version 13.0.3 --archs 89,120
+          python tools/package_rpc_windows.py --exe build-rpc/strata.exe --out dist --cuda-version 13.2.2 --archs 89,120
           $asset = "dist/strata-rpc-windows-x64.zip"
           $hash = (Get-FileHash $asset -Algorithm SHA256).Hash.ToLowerInvariant()
           "$hash  strata-rpc-windows-x64.zip" | Set-Content "$asset.sha256" -Encoding ascii
