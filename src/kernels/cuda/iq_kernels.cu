@@ -2103,6 +2103,40 @@ template<int I, int NI, int RPW> struct S26Bal {
     static_assert(NI >= 32, "a step spans at most two rows");
 };
 
+template<int G0, bool SL, int RPW, int NI, int NC, int... J>
+__device__ __forceinline__ void s26_down_l_group(int lane, const uint8_t* const (&wr)[RPW],
+                                                  const block_q8_1* hbase, const int (&off)[NC], int n,
+                                                  float (&s)[RPW][NC], std::integer_sequence<int, J...>) {
+    Split<20>::W w[sizeof...(J)];
+    int kk[sizeof...(J)];
+    bool hh[sizeof...(J)];
+    ([&] {
+        using B = S26Bal<G0 + J, NI, RPW>;
+        hh[J] = B::QB != B::QA && lane >= B::THR;
+        kk[J] = B::P0 + lane - (hh[J] ? B::QB : B::QA) * NI;
+        const uint8_t* rp = hh[J] ? wr[B::QB] : wr[B::QA];
+        if constexpr (SL) w[J] = S26Split<20, false>::load(rp, kk[J] / 2, 2 * (kk[J] % 2));
+        else w[J] = Split<20>::load(rp, kk[J] / 2, 2 * (kk[J] % 2));
+    }(), ...);
+    ([&] {
+        using B = S26Bal<G0 + J, NI, RPW>;
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+            if (c < n) {
+                const float v = Split<20>::apply(w[J], hbase + off[c] + kk[J] / 2, 2 * (kk[J] % 2));
+                if (hh[J]) s[B::QB][c] += v; else s[B::QA][c] += v;
+            }
+    }(), ...);
+}
+
+template<int IT, int BAL, int G, bool SL, int RPW, int NI, int NC, int... Q>
+__device__ __forceinline__ void s26_down_l_groups(int lane, const uint8_t* const (&wr)[RPW],
+                                                   const block_q8_1* hbase, const int (&off)[NC], int n,
+                                                   float (&s)[RPW][NC], std::integer_sequence<int, Q...>) {
+    (s26_down_l_group<Q * G, SL, RPW, NI, NC>(lane, wr, hbase, off, n, s,
+        std::make_integer_sequence<int, (IT - Q * G < G ? IT - Q * G : G)>{}), ...);
+}
+
 template<bool LT, bool LX, int RPW, bool SL = false, bool TS = false>
 __global__ void __launch_bounds__(256) s26_gu_l_kernel(const unsigned long long* __restrict__ grp_ptr,
                                                        const int32_t* __restrict__ grp_start,
@@ -2244,32 +2278,9 @@ __global__ void __launch_bounds__(256) s26_down_l_kernel(const unsigned long lon
         if constexpr (BAL > 0) {   // S26: 5 items per lane instead of 8 / 4, in BAL groups (loads first)
             constexpr int NI = 2 * S26_HMAX, IT = RPW * NI / 32;
             static_assert(RPW * NI % 32 == 0, "whole steps");
-            auto group = [&]<int G0, int... J>(std::integer_sequence<int, J...>) {
-                Split<20>::W w[sizeof...(J)];
-                int kk[sizeof...(J)];
-                bool hh[sizeof...(J)];
-                ([&] {
-                    using B = S26Bal<G0 + J, NI, RPW>;
-                    hh[J] = B::QB != B::QA && lane >= B::THR;
-                    kk[J] = B::P0 + lane - (hh[J] ? B::QB : B::QA) * NI;
-                    const uint8_t* rp = hh[J] ? wr[B::QB] : wr[B::QA];
-                    if constexpr (SL) w[J] = S26Split<20, false>::load(rp, kk[J] / 2, 2 * (kk[J] % 2));
-                    else w[J] = Split<20>::load(rp, kk[J] / 2, 2 * (kk[J] % 2));
-                }(), ...);
-                ([&] {
-                    using B = S26Bal<G0 + J, NI, RPW>;
-#pragma unroll
-                    for (int c = 0; c < GRP_NC; ++c)
-                        if (c < n) {
-                            const float v = Split<20>::apply(w[J], hbase + off[c] + kk[J] / 2, 2 * (kk[J] % 2));
-                            if (hh[J]) s[B::QB][c] += v; else s[B::QA][c] += v;
-                        }
-                }(), ...);
-            };
             constexpr int G = (IT + BAL - 1) / BAL;
-            [&]<int... Q>(std::integer_sequence<int, Q...>) {
-                (group.template operator()<Q * G>(std::make_integer_sequence<int, (IT - Q * G < G ? IT - Q * G : G)>{}), ...);
-            }(std::make_integer_sequence<int, BAL>{});
+            s26_down_l_groups<IT, BAL, G, SL, RPW, NI, GRP_NC>(lane, wr, hbase, off, n, s,
+                                                               std::make_integer_sequence<int, BAL>{});
         } else
         for (int k = lane; k < nb * 2; k += 32) {
             const int kbx = k / 2, iqs = 2 * (k % 2);
