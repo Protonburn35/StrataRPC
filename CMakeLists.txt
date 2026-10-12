@@ -152,8 +152,8 @@ elseif(STRATA_ENABLE_CUDA)
   endif()
   enable_language(CUDA)
   # CUDA is a separate CMake language; CMAKE_CXX_STANDARD does not apply to .cu files. Set its default after enabling
-  # CUDA so every CUDA target receives the C++20 dialect used by the project's shared headers.
-  set(CMAKE_CUDA_STANDARD 20)
+  # CUDA so every CUDA target receives the C++17 dialect used by the project's shared headers.
+  set(CMAKE_CUDA_STANDARD 17)
   set(CMAKE_CUDA_STANDARD_REQUIRED ON)
   set(CMAKE_CUDA_EXTENSIONS OFF)
   # `enable_language(CUDA)` gives the .cu compile rules but NOT the imported targets, so `CUDA::cudart` has to
@@ -309,7 +309,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_library(strata_core STATIC src/core/device.cu src/core/pinned.cu src/platform/memory.cpp src/core/graph.cpp src/core/weights.cpp
                                src/core/layout.cpp)
   if(STRATA_ENABLE_CUDA)
-    set_target_properties(strata_core PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON CUDA_EXTENSIONS OFF)
+    set_target_properties(strata_core PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON CUDA_EXTENSIONS OFF)
   endif()
   target_include_directories(strata_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   if(STRATA_ENABLE_CUDA AND STRATA_EXPERIMENTAL_SM60)
