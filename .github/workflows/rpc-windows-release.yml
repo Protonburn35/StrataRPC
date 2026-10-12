@@ -20,7 +20,9 @@ jobs:
         with:
           # CUDA 13.2.2 contains the sm_120 compiler fix; 13.2.0 and 13.2.1 are known-bad.
           cuda: "13.2.2"
-          method: network
+          # The network bootstrap exits with a package-install error on hosted Windows;
+          # use the full bundle so installation does not need secondary downloads.
+          method: local
           # Ninja invokes nvcc directly, so the optional Visual Studio IDE integration is not needed.
           sub-packages: '["nvcc", "cudart_dev", "cublas_dev"]'
 
