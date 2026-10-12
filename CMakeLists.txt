@@ -68,6 +68,13 @@ if(STRATA_HIP_GFX906)
   endif()
   set(STRATA_ENABLE_CUDA ON CACHE BOOL "" FORCE)
 endif()
+if(STRATA_ENABLE_CUDA)
+  # CUDA is a separate CMake language; CMAKE_CXX_STANDARD does not apply to .cu files. They include project headers
+  # using C++20, so keep nvcc's dialect aligned with the host translation units.
+  set(CMAKE_CUDA_STANDARD 20)
+  set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+  set(CMAKE_CUDA_EXTENSIONS OFF)
+endif()
 option(STRATA_ENABLE_HIP "Build the HIP targets for wave32 AMD GPUs (gfx1100, gfx1201; gfx1012/gfx1030 unvalidated)" OFF)
 option(STRATA_PREFILL_MMQ "Build the optional GGML MMQ prefill path for HIP" OFF)
 # CUDA: MMQ prompt kernels for Q4_K / Q5_K / Q5_1 (Unsloth's UD-Q4_K_XL experts).  Off by default: the engine loads
