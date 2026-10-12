@@ -10,7 +10,8 @@ namespace strata::core {
 class RemoteExperts;
 class ExpertSource;
 
-// Remote Expert Decode Optimization v1 on existing helper caches. One instance per serial engine.
+// Remote Expert Decode Optimization on helper caches. For RPC, the server returns one weighted sum per token.
+// One instance per serial engine.
 class RemoteExpertOpt {
 public:
     RemoteExpertOpt() = default;

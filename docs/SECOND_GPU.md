@@ -130,6 +130,9 @@ caches.
 
 ## Peer tier (`--peer-device`)
 
+For a second PC over Ethernet, see [Expert-cache RPC](RPC.md). The peer and helper modes described below use GPUs in
+the same process and share CUDA-visible memory; they do not connect to a remote computer.
+
 `--peer-device N` puts a second adaptive expert cache on CUDA device N. It
 takes the ranked pairs CUDA0's cache does not hold, as many as fit. The peer
 computes the rows of its own experts, for decode windows and for prompt

@@ -460,6 +460,9 @@ struct Options {
     int expert_cache = 0;
     std::array<int, 3> expert_cache_remote{}; ///< CUDA1..3 slots; CUDA0 keeps dense/state/MTP
     std::array<bool, 3> expert_cache_remote_auto{};
+    std::string expert_cache_rpc; ///< one remote Strata expert-cache server, host:port
+    std::string expert_cache_rpc_layers; ///< complete remote expert blocks; host cache is packed around these layers
+    std::string rpc_server;       ///< serve a remote expert cache, bind-address:port
     bool remote_expert_opt = false; ///< optional optimization of the existing remote-expert decode path
     std::string expert_cache_remote_placement = "stripe"; ///< stripe experts or assign complete layers to CUDA1..3
     bool expert_cache_cpu_order = false;
@@ -683,7 +686,7 @@ void usage() {
                  "strata generate --pack DIR --tokens \"1,2,3\" [options]\n"
                  "\n"
                  "  --pack DIR           the pack directory (default pack/full)\n"
-                 "  --tokens LIST        the prompt as comma-separated token IDS (required)\n"
+                 "  --tokens LIST        the prompt as comma-separated token IDS (required outside RPC server mode)\n"
                  "  --tokens-file PATH   pretokenized prompt, commas or whitespace (alternative to --tokens)\n"
                  "  --gpu LIST           run on these GPUs, comma-separated nvidia-smi/PCI indices (default: every\n"
                  "                       visible one); sets CUDA_VISIBLE_DEVICES/CUDA_DEVICE_ORDER inside the engine,\n"
@@ -846,6 +849,10 @@ void usage() {
                  "                       real graph that --stage-timing cannot give.  Prints and exits.\n"
                  "  --expert-profile P   R4.2e: pre-load the VRAM tier from a `profile.bin` (see\n"
                  "                       tools/make_profile.py) instead of admitting on first use.\n"
+                 "  --expert-cache-rpc HOST:PORT  use a remote Strata expert cache over TCP (single helper)\n"
+                 "  --expert-cache-rpc-layers L[-H][,...]  keep complete expert blocks for selected layers remotely;\n"
+                 "                       the host cache is repacked over the remaining layers\n"
+                 "  --rpc-server HOST:PORT       serve the local GPU expert cache; set STRATA_RPC_TOKEN on both PCs\n"
                  "  --expert-profile-save P  --serve, #477: save what the adaptive tier learned (the experts in\n"
                  "                       VRAM, then the routing counted since the start) as a profile at P, on\n"
                  "                       QUIT and every --expert-profile-save-every MIN minutes (default 10;\n"
@@ -862,7 +869,8 @@ void usage() {
                  "  --expert-cache-device1 N|auto  fill CUDA1 with N experts or as many as fit\n"
                  "  --expert-cache-device2 N|auto  fill CUDA2 with more experts\n"
                  "  --expert-cache-device3 N|auto  fill CUDA3 with more experts\n"
-                 "  --remote-expert-opt   enable remote-expert decode optimizations (serve mode)\n"
+                 "  --remote-expert-opt   combine remote expert rows on the helper and return one weighted\n"
+                 "                       sum per token (lower RPC traffic; serve mode)\n"
                  "  --expert-cache-remote-placement stripe|layer  distribute expert ranks or whole\n"
                  "                       layers across CUDA1..3 (default: stripe)\n"
                  "  --peer-device N      a second GPU as an adaptive expert-cache tier (rows over P2P; it also\n"
@@ -958,6 +966,46 @@ bool parse_i64_list(const char* s, std::vector<int64_t>& out, std::string& err) 
         out.push_back(id);
     }
     if (out.empty()) { err = "token list was empty"; return false; }
+    return true;
+}
+
+bool parse_layer_ranges(const std::string& text, int64_t layers, std::vector<uint8_t>& selected, std::string& err) {
+    selected.assign((size_t)std::max<int64_t>(0, layers), 0);
+    size_t begin = 0;
+    bool any = false;
+    auto number = [&](const std::string& token, int64_t& value) {
+        if (token.empty()) return false;
+        const auto parsed = std::from_chars(token.data(), token.data() + token.size(), value);
+        return parsed.ec == std::errc{} && parsed.ptr == token.data() + token.size() && value >= 0;
+    };
+    while (begin < text.size()) {
+        const size_t comma = text.find(',', begin);
+        const size_t end = comma == std::string::npos ? text.size() : comma;
+        const std::string part = text.substr(begin, end - begin);
+        const size_t dash = part.find('-');
+        int64_t first = 0, last = 0;
+        if (dash == std::string::npos) {
+            if (!number(part, first)) { err = "expected comma-separated layer numbers or inclusive ranges"; return false; }
+            last = first;
+        } else if (part.find('-', dash + 1) != std::string::npos ||
+                   !number(part.substr(0, dash), first) || !number(part.substr(dash + 1), last) || first > last) {
+            err = "expected comma-separated layer numbers or inclusive ranges, such as 4,8-15";
+            return false;
+        }
+        if (last >= layers) {
+            err = "a requested RPC layer is outside the model's 0.." + std::to_string(layers - 1) + " range";
+            return false;
+        }
+        for (int64_t l = first; l <= last; ++l) selected[(size_t)l] = 1;
+        any = true;
+        if (comma == std::string::npos) break;
+        if (comma + 1 == text.size()) {
+            err = "expected comma-separated layer numbers or inclusive ranges, such as 4,8-15";
+            return false;
+        }
+        begin = comma + 1;
+    }
+    if (!any) { err = "the RPC layer selection is empty"; return false; }
     return true;
 }
 
@@ -1835,6 +1883,12 @@ int main(int argc, char** argv) {
         bool parsed = true;
         if (a == "--help" || a == "-h") { usage(); return 0; }
         else if (a == "--gpu") { (void) next("--gpu"); }   // applied at startup, before any CUDA call
+        else if (a == "--rpc-server") o.rpc_server = next("--rpc-server");
+        else if (a == "--expert-cache-rpc") {
+            o.expert_cache_rpc = next("--expert-cache-rpc");
+            o.expert_cache_remote_auto[0] = true; // also give the server the unprofiled tail to fill its free VRAM
+        }
+        else if (a == "--expert-cache-rpc-layers") o.expert_cache_rpc_layers = next("--expert-cache-rpc-layers");
         else if (a == "--pack") o.pack = next("--pack");
         else if (a == "--tokens") {
             if (have_tokens) { std::fprintf(stderr, "supply one token input only\n"); return 2; }
@@ -2355,8 +2409,27 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: --resident-cpu-experts requires --mmap-experts and a static --expert-profile\n");
         return 2;
     }
-    const bool remote_caches = o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 ||
-                               o.expert_cache_remote[2] > 0;
+    const bool remote_caches = !o.expert_cache_rpc.empty() || o.expert_cache_remote[0] > 0 ||
+                               o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0;
+    const bool rpc_full_layers = !o.expert_cache_rpc_layers.empty();
+    const bool any_local_helper = std::any_of(o.expert_cache_remote.begin(), o.expert_cache_remote.end(),
+                                              [](int slots) { return slots > 0; });
+    if (!o.expert_cache_rpc.empty() && (any_local_helper || !o.layer_split.empty() || o.peer_device >= 1)) {
+        std::fprintf(stderr, "strata generate: --expert-cache-rpc currently supports one TCP helper, with no local helper, peer tier or layer split\n");
+        return 2;
+    }
+    if (!o.expert_cache_rpc.empty() && (!o.serve || o.expert_profile.empty())) {
+        std::fprintf(stderr, "strata generate: --expert-cache-rpc requires --serve and --expert-profile\n");
+        return 2;
+    }
+    if (rpc_full_layers && o.expert_cache_rpc.empty()) {
+        std::fprintf(stderr, "strata generate: --expert-cache-rpc-layers requires --expert-cache-rpc\n");
+        return 2;
+    }
+    if (!o.rpc_server.empty() && (!o.expert_cache_rpc.empty() || any_local_helper || o.peer_device >= 1 || !o.layer_split.empty())) {
+        std::fprintf(stderr, "strata generate: --rpc-server is a standalone expert-cache mode and cannot be combined with another GPU tier\n");
+        return 2;
+    }
     // A layer split keeps the resident RAM mode: every stage's GPU cache is left out of the RAM copy, and an adaptive
     // swap copies an evicted expert back from the card that owns its layer (resident_stage_swaps).
     if (o.resident_cpu_experts && remote_caches) {
@@ -2471,7 +2544,7 @@ int main(int argc, char** argv) {
         have_tokens = true;
         o.stop_eos = true;
     }
-    if (!have_tokens) {
+    if (!have_tokens && o.rpc_server.empty()) {
         std::fprintf(stderr, "strata generate: --tokens is required (this build has no tokenizer; see the "
                              "header of src/program/generate.cpp)\n");
         usage();
@@ -2638,16 +2711,20 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: --expert-cache-remote-placement must be stripe or layer\n");
         return 2;
     }
+    if (!o.rpc_server.empty() && (o.serve || have_tokens)) {
+        std::fprintf(stderr, "strata generate: --rpc-server is a standalone process mode; do not pass --serve or token input\n");
+        return 2;
+    }
     if (o.remote_expert_opt && !o.serve) {
         std::fprintf(stderr, "strata generate: --remote-expert-opt requires --serve\n");
         return 2;
     }
     // the peer tier is the second card's only user: a layer split or a remote expert cache would put a second engine
     // part (and a second copy of the same experts) on it
-    if (o.peer_device >= 1 && (!o.layer_split.empty() || o.expert_cache_remote[0] > 0)) {
+    if (o.peer_device >= 1 && (!o.layer_split.empty() || o.expert_cache_remote[0] > 0 || !o.expert_cache_rpc.empty())) {
         std::fprintf(stderr, "strata generate: --peer-device cannot be combined with %s\n",
                      !o.layer_split.empty() ? "--layer-split (use one or the other)"
-                                            : "--expert-cache-device1..3 (the peer tier already caches experts there)");
+                                            : "a remote expert cache (the peer tier already caches experts there)");
         return 2;
     }
 
@@ -2747,6 +2824,14 @@ int main(int argc, char** argv) {
                              f.gu_type, f.d_type);
                 return 1;
             }
+        }
+        if (!o.rpc_server.empty()) {
+            if (!strata::core::RemoteExperts::serve_rpc(o.rpc_server, o.pack, o.native_preset,
+                                                        g0.n_layers, g0.n_expert, err)) {
+                std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                return 1;
+            }
+            return 0;
         }
     }
     const bool native_pack = strata::kernels::cpu::expert_layout().native;
@@ -3532,6 +3617,9 @@ int main(int argc, char** argv) {
     GpuStage* const last_st = stages.empty() ? nullptr : stages.back().get();
 
     std::vector<std::pair<int32_t, int32_t>> profile;
+    std::vector<std::pair<int32_t, int32_t>> profile_original;
+    std::vector<std::pair<int32_t, int32_t>> rpc_layer_ranked;
+    std::vector<uint8_t> rpc_owned_layers;
     if (!o.expert_profile.empty()) {
         int64_t pslots = 0;
         if (!strata::core::read_expert_profile(o.expert_profile, g.n_layers, g.n_expert, profile, pslots, err)) {
@@ -3574,11 +3662,57 @@ int main(int argc, char** argv) {
         }
         std::fprintf(stderr, "strata generate: profile %s: %zu ranked pairs, built for %lld slots\n",
                      o.expert_profile.c_str(), profile.size(), (long long) pslots);
+        profile_original = profile;
+        if (rpc_full_layers) {
+            if (!parse_layer_ranges(o.expert_cache_rpc_layers, g.n_layers, rpc_owned_layers, err)) {
+                std::fprintf(stderr, "strata generate: --expert-cache-rpc-layers: %s\n", err.c_str());
+                return 2;
+            }
+            const size_t total = (size_t)g.n_layers * (size_t)g.n_expert;
+            std::vector<uint8_t> remote_seen(total, 0);
+            for (const auto& pair : profile_original) {
+                if (!rpc_owned_layers[(size_t)pair.first]) continue;
+                const size_t ix = (size_t)pair.first * (size_t)g.n_expert + (size_t)pair.second;
+                if (!remote_seen[ix]) {
+                    remote_seen[ix] = 1;
+                    rpc_layer_ranked.push_back(pair);
+                }
+            }
+            for (int64_t l = 0; l < g.n_layers; ++l)
+                if (rpc_owned_layers[(size_t)l])
+                    for (int64_t e = 0; e < g.n_expert; ++e) {
+                        const size_t ix = (size_t)l * (size_t)g.n_expert + (size_t)e;
+                        if (!remote_seen[ix]) {
+                            remote_seen[ix] = 1;
+                            rpc_layer_ranked.emplace_back((int32_t)l, (int32_t)e);
+                        }
+                    }
+            std::vector<std::pair<int32_t, int32_t>> host_ranked;
+            host_ranked.reserve(total - rpc_layer_ranked.size());
+            std::vector<uint8_t> host_seen(total, 0);
+            for (const auto& pair : profile_original) {
+                if (rpc_owned_layers[(size_t)pair.first]) continue;
+                const size_t ix = (size_t)pair.first * (size_t)g.n_expert + (size_t)pair.second;
+                if (!host_seen[ix]) { host_seen[ix] = 1; host_ranked.push_back(pair); }
+            }
+            // Refill otherwise unused host slots with the unprofiled complement, excluding every RPC-owned pair.
+            for (int64_t l = 0; l < g.n_layers; ++l)
+                if (!rpc_owned_layers[(size_t)l])
+                    for (int64_t e = 0; e < g.n_expert; ++e) {
+                        const size_t ix = (size_t)l * (size_t)g.n_expert + (size_t)e;
+                        if (!host_seen[ix]) { host_seen[ix] = 1; host_ranked.emplace_back((int32_t)l, (int32_t)e); }
+                    }
+            profile.swap(host_ranked);
+            const size_t owned_count = std::count(rpc_owned_layers.begin(), rpc_owned_layers.end(), (uint8_t)1);
+            std::fprintf(stderr, "strata generate: RPC owns all experts in %zu selected layers; the 4090 profile "
+                                 "is repacked over the other layers (%zu ranked and unranked candidates)\n",
+                         owned_count, profile.size());
+        }
     }
     // #477: the whole ranking as loaded, the prior of --expert-profile-save's order (a layer split keeps only
     // CUDA0's pairs in `profile` below).  Empty without --expert-profile-save.
     std::vector<std::pair<int32_t, int32_t>> profile_loaded;
-    if (!o.expert_profile_save.empty()) profile_loaded = profile;
+    if (!o.expert_profile_save.empty()) profile_loaded = profile_original.empty() ? profile : profile_original;
     // ---- layer split across GPUs: "auto" places the split points by a cost model of one decode window, measured on
     // the 5080 + 3090 rig (bench/results/2026-09-29-layer-split):
     //   - every layer costs its GPU a time inversely proportional to SMs x clock (0.33 ms on an RTX 5080, 0.50 on a
@@ -4267,7 +4401,7 @@ int main(int argc, char** argv) {
         // that can give slots up, and every expert in RAM for the CPU to compute the ones it gives up
         {
             const char* ev = std::getenv("STRATA_KV_GROW");
-            bool remote = false;
+            bool remote = !o.expert_cache_rpc.empty();
             for (const int r : o.expert_cache_remote) remote = remote || r > 0;
             const bool asked = ev != nullptr && ev[0] != '\0' ? ev[0] != '0' : o.kv_grow;
             const bool on = asked && !multi_gpu && o.kv_resident <= 0 &&
@@ -5016,13 +5150,15 @@ int main(int argc, char** argv) {
         const uint64_t cap = std::min<uint64_t>(budget, (uint64_t) free_room);
         uint64_t sum = 0;
         for (int64_t l = 0; l < g.n_layers; ++l)
-            sum += (lay.blob_bytes(l) + 255) / 256 * 256;
+            if (!rpc_full_layers || !rpc_owned_layers[(size_t)l])
+                sum += (lay.blob_bytes(l) + 255) / 256 * 256;
         int64_t q = sum > 0 ? (int64_t) (cap / sum) : 0;
         if (q > g.n_expert) q = g.n_expert;
         if (q > 0) {
             per_layer_bytes = sum;
             sized_slots.reserve((size_t) q * (size_t) g.n_layers);
             for (int64_t l = 0; l < g.n_layers; ++l) {
+                if (rpc_full_layers && rpc_owned_layers[(size_t)l]) continue;
                 const int64_t b = (int64_t) lay.blob_bytes(l);
                 for (int64_t s = 0; s < q; ++s) sized_slots.push_back(b);
             }
@@ -5061,7 +5197,7 @@ int main(int argc, char** argv) {
     if (o.vram_elastic) {
         const char* why = !o.serve ? "it works between requests of --serve"
                         : multi_gpu ? "a layer split has a cache per GPU"
-                        : std::any_of(o.expert_cache_remote.begin(), o.expert_cache_remote.end(),
+                        : !o.expert_cache_rpc.empty() || std::any_of(o.expert_cache_remote.begin(), o.expert_cache_remote.end(),
                                       [](int n) { return n > 0; }) ? "the helper caches on other GPUs"
                         : o.vram_segment_mib < 64 ? "--vram-segment-mib is below 64" : nullptr;
 #if defined(STRATA_USE_HIP)
@@ -5426,22 +5562,23 @@ int main(int argc, char** argv) {
 
     std::array<strata::core::RemoteExperts, 3> remote_experts;
     std::unique_ptr<strata::core::RemoteExpertOpt> remote_opt;
-    if (o.remote_expert_opt && o.expert_cache_remote[0] > 0) remote_opt = std::make_unique<strata::core::RemoteExpertOpt>();
+    if (o.remote_expert_opt && (o.expert_cache_remote[0] > 0 || !o.expert_cache_rpc.empty()))
+        remote_opt = std::make_unique<strata::core::RemoteExpertOpt>();
     const bool multi_remote = o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0;
-    if (o.expert_cache_remote[0] > 0) {
+    if (o.expert_cache_remote[0] > 0 || !o.expert_cache_rpc.empty()) {
         if (o.expert_cache <= 0 || profile.empty() || o.no_pool) {
             std::fprintf(stderr, "strata generate: remote experts need --expert-profile, "
                                  "a CUDA0 expert cache and the expert pool\n");
             return 2;
         }
-        std::vector<std::pair<int32_t, int32_t>> ranked = profile;
+        std::vector<std::pair<int32_t, int32_t>> ranked = rpc_full_layers ? rpc_layer_ranked : profile;
         if (!stages.empty()) {   // a layer split: CUDA0's share of the profile, then the later stages' pairs no cache holds
             for (auto& st : stages)
                 for (const auto& pr : st->profile)
                     if (st->cache.slot_of(pr.first, pr.second) < 0) ranked.push_back(pr);
         }
-        if (multi_remote || std::any_of(o.expert_cache_remote_auto.begin(), o.expert_cache_remote_auto.end(),
-                                        [](bool automatic) { return automatic; })) {
+        if (!rpc_full_layers && (multi_remote || std::any_of(o.expert_cache_remote_auto.begin(), o.expert_cache_remote_auto.end(),
+                                        [](bool automatic) { return automatic; }))) {
             // The shipped frequency profile names only 8000 of 24576 experts. Once exhausted,
             // fill remaining VRAM from unranked pairs in expert-then-layer order: this spreads
             // the tail across all layers instead of concentrating it on layer zero.
@@ -5454,7 +5591,7 @@ int main(int argc, char** argv) {
                     if (!seen[(size_t) l * (size_t) g.n_expert + (size_t) e])
                         ranked.emplace_back((int32_t) l, (int32_t) e);
             std::fprintf(stderr, "strata generate: remote ranking: %zu profiled pairs, "
-                                 "%zu other pairs to fill CUDA1..3\n", profile.size(), ranked.size() - profile.size());
+                                 "%zu other pairs to fill remote helper VRAM\n", profile.size(), ranked.size() - profile.size());
         }
         std::array<std::vector<std::pair<int32_t, int32_t>>, 3> by_device;
         if (multi_remote) {
@@ -5498,17 +5635,26 @@ int main(int argc, char** argv) {
             for (const auto& pr : st->profile)
                 if (st->cache.slot_of(pr.first, pr.second) >= 0)
                     claimed[(size_t) pr.first * (size_t) g.n_expert + (size_t) pr.second] = 1;
-        for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0) {
+        for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0 || (r == 0 && !o.expert_cache_rpc.empty())) {
             if (remote_opt) remote_opt->attach(remote_experts[(size_t) r]);
-            if (!remote_experts[(size_t) r].open(remote_dev[r], o.expert_cache_remote[(size_t) r],
+            const bool opened = r == 0 && !o.expert_cache_rpc.empty()
+                ? remote_experts[(size_t)r].open_rpc(o.expert_cache_rpc, g.n_layers, g.n_expert,
+                                                     by_device[(size_t)r], xcache, *srcp, claimed, err,
+                                                     rpc_full_layers)
+                : remote_experts[(size_t)r].open(remote_dev[r], o.expert_cache_remote[(size_t) r],
                      g.n_layers, g.n_expert, by_device[(size_t) r], xcache, *srcp, claimed, err,
-                     o.expert_cache_remote_auto[(size_t) r])) {
+                     o.expert_cache_remote_auto[(size_t) r]);
+            if (!opened) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
             }
-            std::fprintf(stderr, "strata generate: CUDA%d: %lld additional experts, %.2f GiB; "
-                                 "results return through pinned host rows\n", remote_dev[r],
-                         (long long) remote_experts[(size_t) r].resident(), remote_experts[(size_t) r].gib());
+            if (remote_experts[(size_t)r].is_rpc_client())
+                std::fprintf(stderr, "strata generate: RPC: %lld additional experts, %.2f GiB; results return over TCP\n",
+                             (long long)remote_experts[(size_t)r].resident(), remote_experts[(size_t)r].gib());
+            else
+                std::fprintf(stderr, "strata generate: CUDA%d: %lld additional experts, %.2f GiB; "
+                                     "results return through pinned host rows\n", remote_dev[r],
+                             (long long) remote_experts[(size_t) r].resident(), remote_experts[(size_t) r].gib());
         }
     }
 
@@ -5538,12 +5684,12 @@ int main(int argc, char** argv) {
     // #854), so an expert the helper's tier swaps in or out later is followed - never a copy taken at load.
     const bool disjoint_adapt = [] { const char* v = std::getenv("STRATA_DISJOINT_ADAPT"); return v != nullptr && std::atoi(v) != 0; }();
     auto helper_holds = [&](int64_t l, int32_t e) -> bool {
-        if (!disjoint_adapt) return false;
+        if (!disjoint_adapt && o.expert_cache_rpc.empty()) return false;
         for (int r = 0; r < drive.d.remote_count; ++r)
             if (drive.d.remote[r]->holds(l, e)) return true;
         return false;
     };
-    for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0)
+    for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0 || (r == 0 && !o.expert_cache_rpc.empty()))
         drive.d.remote[drive.d.remote_count++] = &remote_experts[(size_t) r];
     drive.d.peer = peer.valid() ? &peer : nullptr;
     drive.d.hit_cpu_order = o.expert_cache_cpu_order;
@@ -6944,7 +7090,8 @@ int main(int argc, char** argv) {
         // Everything else - the fallback's batched unbuffered reads, its pinned RAM copy, the prompt path's own
         // decisions - is forwarded unchanged.  Default off: the prompt path's source is srcp, exactly as before.
         std::vector<strata::core::RemoteExperts*> prefill_helpers;
-        for (int r = 0; r < drive.d.remote_count; ++r) prefill_helpers.push_back(drive.d.remote[r]);
+        for (int r = 0; r < drive.d.remote_count; ++r)
+            if (!drive.d.remote[r]->is_rpc_client()) prefill_helpers.push_back(drive.d.remote[r]);
         std::unique_ptr<strata::core::RemotePrefillSource> prefill_helper_src;
         strata::core::ExpertSource* prefill_src = srcp;
         uint64_t helper_blobs_before = 0, helper_bytes_before = 0;
@@ -9069,7 +9216,7 @@ int main(int argc, char** argv) {
                 mib_all += (int64_t) (st->cache.bytes() >> 20);
             }
             for (int r = 0; r < 3; ++r)
-                if (o.expert_cache_remote[(size_t) r] > 0) {
+                if (o.expert_cache_remote[(size_t) r] > 0 || (r == 0 && !o.expert_cache_rpc.empty())) {
                     slots_all += remote_experts[(size_t) r].resident();
                     mib_all += (int64_t) (remote_experts[(size_t) r].gib() * 1024.0);
                 }
@@ -10304,15 +10451,18 @@ int main(int argc, char** argv) {
             std::array<int64_t, 3> remote_before{};
             std::array<int64_t, 3> launches_before{};
             std::array<uint64_t, 3> compact_before{}, full_before{};
+            std::array<uint64_t, 3> rpc_sent_before{}, rpc_received_before{};
             // ms_begin/ms_wait are cumulative since boot; the log line used to print them next to per-request deltas,
             // so the host time read as if it belonged to this request.  Take deltas here like every other column.
             std::array<double, 3> begin_before{}, wait_before{};
-            for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0)
+            for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0 || (r == 0 && !o.expert_cache_rpc.empty()))
             {
                 remote_before[(size_t) r] = remote_experts[(size_t) r].computed();
                 launches_before[(size_t) r] = remote_experts[(size_t) r].launched_layers();
                 compact_before[(size_t) r] = remote_experts[(size_t) r].returned_bytes();
                 full_before[(size_t) r] = remote_experts[(size_t) r].full_row_bytes();
+                rpc_sent_before[(size_t) r] = remote_experts[(size_t) r].rpc_sent_bytes();
+                rpc_received_before[(size_t) r] = remote_experts[(size_t) r].rpc_received_bytes();
                 begin_before[(size_t) r] = remote_experts[(size_t) r].ms_begin();
                 wait_before[(size_t) r] = remote_experts[(size_t) r].ms_wait();
             }
@@ -12526,16 +12676,20 @@ int main(int argc, char** argv) {
                                      "of %lld windows\n", (long long) t2_rej[0], (long long) t2_hit[0], (long long) t2_rej[1],
                              (long long) t2_hit[1], (long long) t2_rej[2], (long long) t2_hit[2], (long long) t2_rej[3],
                              (long long) t2_hit[3], (long long) dec_windows);
-            for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0)
-                std::fprintf(stderr, "strata serve: CUDA%d: %lld expert entries, %lld active layer launches, %.1f MiB returned "
+            for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0 || (r == 0 && !o.expert_cache_rpc.empty()))
+                std::fprintf(stderr, "strata serve: %s: %lld expert entries, %lld active layer launches, %.1f MiB returned "
                                      "(%.1f MiB with full rows) in this request; host %.0f ms staging+launching, %.0f ms "
-                                     "waiting for it in this request\n", r + 1,
+                                     "waiting for it in this request\n", remote_experts[(size_t)r].is_rpc_client() ? "RPC" : "CUDA helper",
                              (long long) (remote_experts[(size_t) r].computed() - remote_before[(size_t) r]),
                              (long long) (remote_experts[(size_t) r].launched_layers() - launches_before[(size_t) r]),
                              (double) (remote_experts[(size_t) r].returned_bytes() - compact_before[(size_t) r]) / 1048576.0,
                              (double) (remote_experts[(size_t) r].full_row_bytes() - full_before[(size_t) r]) / 1048576.0,
                              remote_experts[(size_t) r].ms_begin() - begin_before[(size_t) r],
                              remote_experts[(size_t) r].ms_wait() - wait_before[(size_t) r]);
+            if (!o.expert_cache_rpc.empty())
+                std::fprintf(stderr, "strata serve: RPC wire: %.2f MiB sent, %.2f MiB received in this request\n",
+                             (double)(remote_experts[0].rpc_sent_bytes() - rpc_sent_before[0]) / 1048576.0,
+                             (double)(remote_experts[0].rpc_received_bytes() - rpc_received_before[0]) / 1048576.0);
             if (prefill_helper_src) {
                 const uint64_t blobs = prefill_helper_src->helper_blobs(), bytes = prefill_helper_src->helper_bytes();
                 std::fprintf(stderr, "strata serve: prefill helper source: %lld blobs / %.1f MiB taken from a helper's "
@@ -13515,9 +13669,10 @@ int main(int argc, char** argv) {
                         "  pool phases", wp / per, dr / per, rp / per);
         }
         std::printf("%-24s %lld blobs read\n", "  expert blobs", (long long) srcp->reads());
-        for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0)
-            std::printf("  CUDA%d experts           %lld routed entries computed\n",
-                        r + 1, (long long) remote_experts[(size_t) r].computed());
+        for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0 || (r == 0 && !o.expert_cache_rpc.empty()))
+            std::printf("  %s experts           %lld routed entries computed\n",
+                        remote_experts[(size_t)r].is_rpc_client() ? "RPC" : "CUDA helper",
+                        (long long) remote_experts[(size_t) r].computed());
         // ---- **R4's DISPATCH MEASUREMENT: h, ON THE ENGINE'S OWN ROUTING.**  No offline trace, no corpus
         // question, no k-fold - these are the ids the router actually produced on this run.  Reported as
         // hits/lookups so it can be read directly as the h the cache would deliver, and alongside `refused`

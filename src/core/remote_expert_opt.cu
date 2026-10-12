@@ -62,6 +62,8 @@ bool RemoteExpertOpt::init(std::string& err) {
     h_mask_ = reinterpret_cast<int32_t*>(h_sum_ + MAXT * H);
     m_mask_ = reinterpret_cast<int32_t*>(m_sum_ + MAXT * H);
     for (auto& p : peers_) {
+        // An RPC client only needs the mapped host sum/mask; its server performs the expert reduction.
+        if (p.remote->rpc_client_) continue;
         const OnDevice on(p.remote->device_);
         if (!check(cudaMalloc((void**) &p.sum, MAXT * H * sizeof(float)), err)) return false;
     }
@@ -70,9 +72,11 @@ bool RemoteExpertOpt::init(std::string& err) {
 
 RemoteExpertOpt::~RemoteExpertOpt() {
     for (auto& p : peers_) {
-        const OnDevice on(p.remote->device_);
-        if (p.remote->stream_) cudaStreamSynchronize(p.remote->stream_);
-        if (p.sum) cudaFree(p.sum);
+        if (p.remote->device_ >= 0) {
+            const OnDevice on(p.remote->device_);
+            if (p.remote->stream_) cudaStreamSynchronize(p.remote->stream_);
+            if (p.sum) cudaFree(p.sum);
+        }
         p.remote->remote_opt_ = nullptr;
     }
     if (h_sum_) cudaFreeHost(h_sum_);
@@ -129,7 +133,7 @@ void RemoteExpertOpt::combine(float* dst, float* scratch, int token_begin, int t
 
 bool RemoteExpertOpt::owns(int64_t layer, int32_t expert) const {
     for (const auto& p : peers_)
-        if (p.remote->cache_.slot_of(layer, expert) >= 0) return true;
+        if (p.remote->holds(layer, expert)) return true;
     return false;
 }
 

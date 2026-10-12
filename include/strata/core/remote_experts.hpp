@@ -2,6 +2,7 @@
 
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_source.hpp"
+#include "strata/core/rpc_transport.hpp"
 
 #include <cuda_runtime.h>
 
@@ -31,6 +32,11 @@ public:
               const std::vector<std::pair<int32_t, int32_t>>& ranked,
               const ExpertCache& primary, ExpertSource& source,
               std::vector<uint8_t>& claimed, std::string& err, bool auto_size = false);
+    /// Connect to a remote Strata expert-cache server. The server picks the highest-ranked pairs that fit.
+    bool open_rpc(const std::string& endpoint, int64_t layers, int64_t experts,
+                  const std::vector<std::pair<int32_t, int32_t>>& ranked,
+                  const ExpertCache& primary, ExpertSource& source,
+                  std::vector<uint8_t>& claimed, std::string& err, bool require_all = false);
     void close();
 
     /// `kind` is the primary verifier's classification (-1 = CPU candidate),
@@ -40,15 +46,23 @@ public:
                std::string& err);
     bool owns(int64_t index) const { return owned_[(size_t) index] != 0; }
     /// This helper's cache holds (layer, expert): begin() will take its rows unless the plan gave them away.
-    bool holds(int64_t layer, int32_t expert) const { return cache_.slot_of(layer, expert) >= 0; }
+    bool holds(int64_t layer, int32_t expert) const {
+        if (rpc_client_) return layer >= 0 && expert >= 0 && expert < n_expert_ &&
+                                  (size_t)layer * (size_t)n_expert_ + (size_t)expert < remote_present_.size() &&
+                                  remote_present_[(size_t)layer * (size_t)n_expert_ + (size_t)expert] != 0;
+        return cache_.slot_of(layer, expert) >= 0;
+    }
+    bool is_rpc_client() const { return rpc_client_; }
     bool optimized_decode() const { return remote_opt_ != nullptr; }
     bool finish(float* out, std::string& err);
-    int64_t resident() const { return cache_.resident(); }
+    int64_t resident() const { return rpc_client_ ? (int64_t)remote_pairs_.size() : cache_.resident(); }
     int64_t computed() const { return computed_; }
     int64_t launched_layers() const { return launched_layers_; }
-    double gib() const { return cache_.gib(); }
+    double gib() const { return rpc_client_ ? (double)remote_bytes_ / 1073741824.0 : cache_.gib(); }
     uint64_t returned_bytes() const { return returned_bytes_; }
     uint64_t full_row_bytes() const { return full_row_bytes_; }
+    uint64_t rpc_sent_bytes() const { return rpc_sent_bytes_; }
+    uint64_t rpc_received_bytes() const { return rpc_received_bytes_; }
     /// host time spent in begin() (staging + launches) and in finish() (waiting for this GPU), cumulative
     double ms_begin() const { return ms_begin_; }
     double ms_wait() const { return ms_wait_; }
@@ -61,6 +75,10 @@ public:
     /// (one stream, one lock): the prompt path's stager is threaded.
     bool copy_cached_blobs(const int32_t* layers, const int32_t* experts, uint8_t* const* dst, size_t n,
                            uint8_t* hit, std::string& err);
+
+    /// Run a single-client expert-cache RPC endpoint. STRATA_RPC_TOKEN must be set on both processes.
+    static bool serve_rpc(const std::string& endpoint, const std::string& pack_dir, const std::string& native_gguf,
+                          int64_t layers, int64_t experts, std::string& err);
 
 private:
     friend class RemoteExpertOpt;
@@ -99,6 +117,19 @@ private:
     std::vector<int32_t> group_of_, group_id_;
     std::vector<int32_t> start_, dst_, tok_, original_row_;
     std::vector<unsigned long long> ptr_;
+    bool rpc_client_ = false;
+    bool rpc_pending_ = false;
+    rpc::Socket rpc_socket_ = rpc::kInvalidSocket;
+    uint64_t remote_bytes_ = 0;
+    uint64_t rpc_sent_bytes_ = 0;
+    uint64_t rpc_received_bytes_ = 0;
+    std::vector<uint8_t> remote_present_;
+    std::vector<std::pair<int32_t, int32_t>> remote_pairs_;
+    std::vector<uint32_t> rpc_rows_;
+    std::vector<int32_t> rpc_kind_;
+    std::vector<float> rpc_out_;
+    uint32_t rpc_n_tok_ = 0;
+    bool rpc_reduce_pending_ = false;
 };
 
 /// STRATA_PREFILL_HELPER_SOURCE (opt-in): the prompt path's view of the expert tiers, where a blob a helper

@@ -1,0 +1,72 @@
+name: Experimental RPC Windows release
+
+on:
+  push:
+    tags:
+      - "rpc-v*"
+
+permissions:
+  contents: write
+
+jobs:
+  windows-cuda:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d
+        with:
+          cuda: "13.0.3"
+          method: network
+          sub-packages: '["nvcc", "cudart", "cudart_dev", "cublas", "cublas_dev", "visual_studio_integration"]'
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.12"
+
+      - name: Install the matching CUDA runtime libraries
+        shell: pwsh
+        run: python -m pip install --disable-pip-version-check cmake==4.4.3 nvidia-cublas==13.0.2.14 nvidia-cuda-runtime==13.0.96
+
+      - name: Configure and build for RTX 4090 and RTX 5070 Ti
+        shell: pwsh
+        run: >-
+          cmake -S . -B build-rpc -G "Visual Studio 17 2022" -A x64
+          -DSTRATA_ENABLE_CUDA=ON
+          -DSTRATA_BUILD_TESTS=ON
+          -DSTRATA_PORTABLE=ON
+          "-DCMAKE_CUDA_ARCHITECTURES=89;120"
+
+      - name: Build the engine and RPC transport test
+        shell: pwsh
+        run: cmake --build build-rpc --config Release --parallel 2 --target strata rpc_transport_test
+
+      - name: Test the Windows TCP transport
+        shell: pwsh
+        run: ctest --test-dir build-rpc --build-config Release -R "^rpc_transport_test$" --output-on-failure
+
+      - name: Package the engine
+        shell: pwsh
+        run: |
+          python tools/package_rpc_windows.py --exe build-rpc/Release/strata.exe --out dist --cuda-version 13.0.3 --archs 89,120
+          $asset = "dist/strata-rpc-windows-x64.zip"
+          $hash = (Get-FileHash $asset -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  strata-rpc-windows-x64.zip" | Set-Content "$asset.sha256" -Encoding ascii
+
+      - name: Create or update the GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $asset = "dist/strata-rpc-windows-x64.zip"
+          $checksum = "$asset.sha256"
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag $asset $checksum --clobber
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            gh release edit $tag --title "StrataRPC RPC experimental $tag" --notes-file docs/RPC.md --prerelease
+          } else {
+            gh release create $tag $asset $checksum --title "StrataRPC RPC experimental $tag" --notes-file docs/RPC.md --prerelease
+          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
