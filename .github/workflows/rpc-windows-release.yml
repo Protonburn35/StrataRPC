@@ -49,7 +49,7 @@ jobs:
           if errorlevel 1 exit /b %errorlevel%
           nvcc --version
           if errorlevel 1 exit /b %errorlevel%
-          cmake -S . -B build-rpc -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=ON -DSTRATA_PORTABLE=ON "-DCMAKE_CUDA_COMPILER=%CUDA_PATH%\bin\nvcc.exe" "-DCUDAToolkit_ROOT=%CUDAToolkit_ROOT%" "-DCMAKE_CUDA_ARCHITECTURES=89;120" > configure.log 2>&1
+          cmake -S . -B build-rpc -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=ON -DSTRATA_PORTABLE=ON -DCMAKE_CUDA_STANDARD=20 -DCMAKE_CUDA_STANDARD_REQUIRED=ON -DCMAKE_CUDA_EXTENSIONS=OFF "-DCMAKE_CUDA_COMPILER=%CUDA_PATH%\bin\nvcc.exe" "-DCUDAToolkit_ROOT=%CUDAToolkit_ROOT%" "-DCMAKE_CUDA_ARCHITECTURES=89;120" > configure.log 2>&1
           if errorlevel 1 (
             powershell -NoProfile -Command "$m = @(Select-String -Path configure.log -Pattern 'error|fatal|failed'); $x = @($m | Select-Object -First 10) + @($m | Select-Object -Last 10); if (-not $x) { $x = Get-Content configure.log -Tail 20 }; foreach ($i in $x) { Write-Output ('::error::' + $i.Line) }"
             exit /b 1
