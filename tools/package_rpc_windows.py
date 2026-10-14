@@ -88,6 +88,8 @@ def main() -> int:
         shutil.copy2(exe, stage / "strata.exe")
         shutil.copy2(ROOT / "LICENSE", stage / "LICENSE")
         shutil.copy2(ROOT / "docs" / "RPC.md", stage / "RPC.md")
+        shutil.copy2(ROOT / "docs" / "LAYER_STAGE_RPC.md", stage / "LAYER_STAGE_RPC.md")
+        shutil.copy2(ROOT / "tools" / "layer_stage_ray.py", stage / "layer_stage_ray.py")
         (stage / "BUILD.json").write_text(json.dumps({
             "source": "prebuilt",
             "backend": "cuda",

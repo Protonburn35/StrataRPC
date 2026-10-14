@@ -31,6 +31,8 @@
 #include "strata/core/foresight_swap.hpp"
 #include "strata/core/pinned.hpp"
 #include "strata/core/remote_experts.hpp"
+#include "strata/core/layer_stage_rpc.hpp"
+#include "strata/core/rpc_transport.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/peer_experts.hpp"
 #include "strata/core/layer.hpp"
@@ -461,6 +463,9 @@ struct Options {
     std::array<int, 3> expert_cache_remote{}; ///< CUDA1..3 slots; CUDA0 keeps dense/state/MTP
     std::array<bool, 3> expert_cache_remote_auto{};
     std::string expert_cache_rpc; ///< one remote Strata expert-cache server, host:port
+    std::string layer_stage_client; ///< persistent remote suffix stage, host:port
+    std::string layer_stage_server; ///< serve one persistent remote suffix stage, bind-address:port
+    std::string layer_stage_split;  ///< first layer owned by the remote suffix worker
     std::string expert_cache_rpc_layers; ///< complete remote expert blocks; host cache is packed around these layers
     std::string rpc_server;       ///< serve a remote expert cache, bind-address:port
     bool remote_expert_opt = false; ///< optional optimization of the existing remote-expert decode path
@@ -527,6 +532,7 @@ struct Options {
     /// `--prefill auto`: the largest chunk (up to 8192) whose buffers the expert cache can lend.  Every expert a chunk
     /// routes to is streamed once per chunk, so a bigger chunk streams fewer bytes per token (the "ubatch" effect).
     bool prefill_auto = false;
+    bool prefill_explicit = false;
     /// #282, opt-in: the largest chunk `--prefill auto` may take - 8192 by default; `--prefill auto:16384` or
     /// `auto:32768` (or STRATA_PREFILL_AUTO_MAX) lets it go further, never past the context
     int64_t prefill_auto_max = 8192;
@@ -853,6 +859,9 @@ void usage() {
                  "  --expert-cache-rpc-layers L[-H][,...]  keep complete expert blocks for selected layers remotely;\n"
                  "                       the host cache is repacked over the remaining layers\n"
                  "  --rpc-server HOST:PORT       serve the local GPU expert cache; set STRATA_RPC_TOKEN on both PCs\n"
+                 "  --layer-stage-client HOST:PORT  --serve: layers 0..K-1 here, with a persistent remote suffix worker\n"
+                 "  --layer-stage-server HOST:PORT  --serve: own suffix layers K..last; pair with --layer-stage-split K\n"
+                 "  --layer-stage-split K         first remote layer (same value on both PCs); use a fixed --prefill chunk\n"
                  "  --expert-profile-save P  --serve, #477: save what the adaptive tier learned (the experts in\n"
                  "                       VRAM, then the routing counted since the start) as a profile at P, on\n"
                  "                       QUIT and every --expert-profile-save-every MIN minutes (default 10;\n"
@@ -1122,6 +1131,121 @@ struct GpuStage {
     cudaEvent_t adapt_ev = nullptr;
     bool adapt_live = false;                             ///< swaps of this request are in flight on it
     int32_t* mrope = nullptr;                            ///< --vision: the image-position table on its device
+};
+
+struct MappedLayerStageBuffer {
+    float* host = nullptr;
+    float* device = nullptr;
+    size_t bytes = 0;
+    ~MappedLayerStageBuffer() { if (host != nullptr) (void) cudaFreeHost(host); }
+    bool init(size_t n, std::string& err) {
+        if (n == 0 || host != nullptr) { err = "layer-stage mapped buffer has an invalid size or is already allocated"; return false; }
+        if (cudaHostAlloc((void**)&host, n, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+            cudaHostGetDevicePointer((void**)&device, host, 0) != cudaSuccess) {
+            if (host != nullptr) { (void) cudaFreeHost(host); host = nullptr; }
+            device = nullptr;
+            err = "layer-stage mapped activation allocation failed";
+            return false;
+        }
+        bytes = n;
+        std::memset(host, 0, bytes);
+        return true;
+    }
+};
+
+class ModelLayerStageExecutor final : public strata::core::LayerStageExecutor {
+public:
+    ModelLayerStageExecutor(strata::core::SessionState& session, const strata::core::ModelGeometry& geometry,
+                            strata::core::Verifier& verifier, strata::prefill::Prefill& prefill,
+                            Drive& drive, MappedLayerStageBuffer& handoff,
+                            cudaStream_t stream, uint32_t max_verify_rows)
+        : session_(session), geometry_(geometry), verifier_(verifier), prefill_(prefill), drive_(drive),
+          handoff_(handoff), stream_(stream), max_verify_rows_(max_verify_rows) {}
+
+    bool reset(uint64_t session, uint64_t generation, int64_t position, std::string& err) override {
+        if (session == 0 || generation == 0 || position < 0) { err = "layer-stage reset has invalid session metadata"; return false; }
+        if (!verifier_.wait_commit(err)) return false;
+        strata::core::session_zero(session_, geometry_, nullptr, stream_);
+        if (cudaStreamSynchronize(stream_) != cudaSuccess) { err = "layer-stage session reset failed"; return false; }
+        session_id_ = session;
+        generation_ = generation;
+        position_ = position;
+        pending_ = 0;
+        valid_ = true;
+        return true;
+    }
+
+    bool prefill(uint64_t session, uint64_t generation, uint64_t, int64_t position, uint32_t rows,
+                 const int64_t* tokens, const float* residual, std::string& err) override {
+        if (!matches(session, generation, position, err) || pending_ != 0 || tokens == nullptr || residual == nullptr) return false;
+        prefill_.set_stage_input(residual);
+        if (!prefill_.run(tokens, (int64_t) rows, position, err)) { valid_ = false; return false; }
+        position_ += rows;
+        return true;
+    }
+
+    bool verify(uint64_t session, uint64_t generation, uint64_t, int64_t position, uint32_t rows,
+                const int32_t* tokens, const float* handoff, int32_t* picks, std::string& err) override {
+        if (!matches(session, generation, position, err) || pending_ != 0 || tokens == nullptr || handoff == nullptr ||
+            picks == nullptr || rows > max_verify_rows_) return false;
+        const size_t floats = (size_t) rows * (size_t) strata::core::Verifier::handoff_floats(geometry_);
+        const size_t bytes = floats * sizeof(float);
+        if (bytes > handoff_.bytes) { err = "layer-stage verify activation exceeds the mapped input buffer"; return false; }
+        std::memcpy(handoff_.host, handoff, bytes);
+        drive_.d.failed = false;
+        drive_.d.fail = nullptr;
+        if (!verifier_.run((int) rows, tokens, position, &drive_pool_multi, &drive_, picks, err) || drive_.d.failed) {
+            if (err.empty()) err = drive_.d.fail != nullptr ? drive_.d.fail : "layer-stage expert dispatch failed";
+            valid_ = false;
+            return false;
+        }
+        pending_ = rows;
+        return true;
+    }
+
+    bool commit(uint64_t session, uint64_t generation, uint64_t, uint32_t keep, std::string& err) override {
+        if (!matches(session, generation, position_, err) || pending_ == 0 || keep == 0 || keep > pending_) return false;
+        if (!verifier_.commit((int) keep, err) || !verifier_.wait_commit(err)) { valid_ = false; return false; }
+        position_ += keep;
+        pending_ = 0;
+        return true;
+    }
+
+    bool abort(uint64_t session, uint64_t generation, uint64_t, std::string& err) override {
+        if (session_id_ != session || generation_ != generation) { err = "layer-stage abort belongs to a stale session"; return false; }
+        if (!verifier_.wait_commit(err)) return false;
+        strata::core::session_zero(session_, geometry_, nullptr, stream_);
+        if (cudaStreamSynchronize(stream_) != cudaSuccess) { err = "layer-stage session abort failed"; return false; }
+        valid_ = false;
+        pending_ = 0;
+        position_ = 0;
+        return true;
+    }
+
+    bool health(std::string& err) override {
+        if (cudaDeviceSynchronize() != cudaSuccess) { err = std::string("layer-stage CUDA health check failed: ") + cudaGetErrorString(cudaGetLastError()); return false; }
+        return true;
+    }
+
+private:
+    bool matches(uint64_t session, uint64_t generation, int64_t position, std::string& err) const {
+        if (!valid_ || session_id_ != session || generation_ != generation || position_ != position || position < 0) {
+            err = "layer-stage operation does not match the active worker session position";
+            return false;
+        }
+        return true;
+    }
+    strata::core::SessionState& session_;
+    const strata::core::ModelGeometry& geometry_;
+    strata::core::Verifier& verifier_;
+    strata::prefill::Prefill& prefill_;
+    Drive& drive_;
+    MappedLayerStageBuffer& handoff_;
+    cudaStream_t stream_ = nullptr;
+    uint32_t max_verify_rows_ = 0, pending_ = 0;
+    uint64_t session_id_ = 0, generation_ = 0;
+    int64_t position_ = 0;
+    bool valid_ = false;
 };
 
 // what a refusal on the RAM guard says it had: "900 MiB available, source cgroup" (the smallest of MemAvailable, the
@@ -1888,6 +2012,9 @@ int main(int argc, char** argv) {
             o.expert_cache_rpc = next("--expert-cache-rpc");
             o.expert_cache_remote_auto[0] = true; // also give the server the unprofiled tail to fill its free VRAM
         }
+        else if (a == "--layer-stage-client") o.layer_stage_client = next("--layer-stage-client");
+        else if (a == "--layer-stage-server") o.layer_stage_server = next("--layer-stage-server");
+        else if (a == "--layer-stage-split") o.layer_stage_split = next("--layer-stage-split");
         else if (a == "--expert-cache-rpc-layers") o.expert_cache_rpc_layers = next("--expert-cache-rpc-layers");
         else if (a == "--pack") o.pack = next("--pack");
         else if (a == "--tokens") {
@@ -2036,6 +2163,7 @@ int main(int argc, char** argv) {
         else if (a == "--vram-reserve-later-mib")
             o.vram_reserve_later_mib = std::atoi(next("--vram-reserve-later-mib"));
         else if (a == "--prefill") {
+            o.prefill_explicit = true;
             const std::string v = next("--prefill");
             o.prefill_auto = v == "auto" || v.rfind("auto:", 0) == 0;
             // #282: auto:N (N = 16384 or 32768) or STRATA_PREFILL_AUTO_MAX lets auto take chunks above 8192
@@ -2398,6 +2526,44 @@ int main(int argc, char** argv) {
                                  "GPUs, not \"24,12,6,6\" (got \"%s\")\n", n_dev - 1, o.layer_split.c_str());
             return 2;
         }
+    }
+    const bool layer_stage_client = !o.layer_stage_client.empty();
+    const bool layer_stage_server = !o.layer_stage_server.empty();
+    const bool layer_stage_mode = layer_stage_client || layer_stage_server;
+    if (layer_stage_mode) {
+        int64_t cut = 0;
+        const auto parsed_cut = std::from_chars(o.layer_stage_split.data(),
+                                                o.layer_stage_split.data() + o.layer_stage_split.size(), cut);
+        if (layer_stage_client == layer_stage_server || !o.serve || !o.layer_split.empty() || !o.split_device.empty() ||
+            parsed_cut.ec != std::errc{} || parsed_cut.ptr != o.layer_stage_split.data() + o.layer_stage_split.size() ||
+            cut < 2 || (layer_stage_mode && o.layer_stage_split.empty())) {
+            std::fprintf(stderr, "strata generate: layer-stage RPC needs exactly one of --layer-stage-client or "
+                                 "--layer-stage-server, --serve, and --layer-stage-split K (K >= 2); do not combine it "
+                                 "with --layer-split\n");
+            return 2;
+        }
+        split_at.push_back(cut);
+        const bool stage_local_helpers = std::any_of(o.expert_cache_remote.begin(), o.expert_cache_remote.end(),
+                                                     [](int slots) { return slots > 0; });
+        if (o.batch > 0 || !o.mtp.empty() || o.peer_device >= 0 || stage_local_helpers || o.vision ||
+            !o.expert_cache_rpc.empty() || !o.rpc_server.empty() || o.conversation_cache_mib > 0) {
+            std::fprintf(stderr, "strata generate: layer-stage RPC currently requires one request at a time, no MTP, "
+                                 "vision, peer/helper RPC, or conversation parking\n");
+            return 2;
+        }
+        if (o.expert_profile.empty() || !o.expert_profile_save.empty()) {
+            std::fprintf(stderr, "strata generate: layer-stage RPC needs a static --expert-profile (no profile saving)\n");
+            return 2;
+        }
+        if (!o.prefill_explicit || o.prefill_auto || o.prefill_chunk <= 0) {
+            std::fprintf(stderr, "strata generate: layer-stage RPC needs an explicit fixed --prefill CHUNK on both PCs\n");
+            return 2;
+        }
+        // The worker is a single persistent sequence. Prompt/conversation checkpoints would require remote state
+        // snapshots, so every request starts from an empty state and rereads its complete prompt.
+        o.prompt_cache = 0;
+        o.prompt_cache_every = 0;
+        o.prompt_cache_tail = false;
     }
     bool multi_gpu = !split_devs.empty() && !split_same;   // cleared by --split-skip-if-fits before any stage loads
     bool split_own_auto = false;   // #340: the split keeps own prompt buffers by its rule (not --no-prefill-borrow)
@@ -3007,6 +3173,14 @@ int main(int argc, char** argv) {
                              rope_cfg.type == RST::YaRN ? "YaRN" : "--yarn-attn-factor", rope_cfg.mscale());
         }
     }
+    if (layer_stage_mode && (split_at[0] >= g.n_layers || !native_pack || o.native_preset.empty() || o.spec < 2)) {
+        std::fprintf(stderr, "strata generate: layer-stage RPC requires a native pack, --spec >= 2, and a split "
+                             "inside the model's 0..%lld layers\n", (long long) g.n_layers);
+        return 2;
+    }
+    const int64_t local_layer_begin = layer_stage_server ? split_at[0] : 0;
+    const int64_t local_layer_end = layer_stage_client ? split_at[0] :
+                                    layer_stage_server ? g.n_layers : multi_gpu ? split_at[0] : g.n_layers;
     strata::core::NativeEmbed native_embed;
     if (native_pack) {
         if (o.native_preset.empty() || o.spec < 2 || o.keep_canonical ||
@@ -3015,19 +3189,22 @@ int main(int argc, char** argv) {
                                  "and --prefill CHUNK\n", o.pack.c_str());
             return 2;
         }
-        const strata::core::ModelGeometry g0;
-        const auto embed_t0 = std::chrono::steady_clock::now();
-        if (!native_embed.load(o.embd_gguf.empty() ? o.native_shards : std::vector<std::string>{o.embd_gguf}, g0.n_embd,
-                               248320, err)) {
-            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
-            return 1;
+        if (!layer_stage_server) {
+            const strata::core::ModelGeometry g0;
+            const auto embed_t0 = std::chrono::steady_clock::now();
+            if (!native_embed.load(o.embd_gguf.empty() ? o.native_shards : std::vector<std::string>{o.embd_gguf},
+                                   g0.n_embd, 248320, err)) {
+                std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                return 1;
+            }
+            strata::core::set_native_embed(&native_embed);
+            std::fprintf(stderr, "strata generate: native pack: %s experts (largest blob %.2f MB), token embedding "
+                                 "%s in mapped host memory (%.0f MiB, %.1f s)\n",
+                         o.pack.c_str(), (double) strata::kernels::cpu::expert_layout().max_blob / 1e6,
+                         strata::ggml_type_name((uint32_t) native_embed.type()),
+                         (double) native_embed.bytes() / 1048576.0,
+                         std::chrono::duration<double>(std::chrono::steady_clock::now() - embed_t0).count());
         }
-        strata::core::set_native_embed(&native_embed);
-        std::fprintf(stderr, "strata generate: native pack: %s experts (largest blob %.2f MB), token embedding "
-                             "%s in mapped host memory (%.0f MiB, %.1f s)\n",
-                     o.pack.c_str(), (double) strata::kernels::cpu::expert_layout().max_blob / 1e6,
-                     strata::ggml_type_name((uint32_t) native_embed.type()), (double) native_embed.bytes() / 1048576.0,
-                     std::chrono::duration<double>(std::chrono::steady_clock::now() - embed_t0).count());
     }
     // Plan v0.3 P1: tensors served in native form are not also loaded in canonical form (~2.7 GB of VRAM back
     // to the expert cache with --native).  `--keep-canonical` loads both, as before.
@@ -3038,7 +3215,9 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
-        if (!o.native_head_gguf.empty()) skip.insert("output.weight");
+        // The client needs output.weight's indexed shape for Verifier::init, but the remote suffix owns the actual
+        // head in serve mode. WeightTable keeps metadata for skipped tensors, so do not upload the canonical head.
+        if (!o.native_head_gguf.empty() || layer_stage_client) skip.insert("output.weight");
         // the PLE module validates its canonical key at construction (8 MB); a native pack has none to load
         if (!native_pack) skip.erase("blk.1.ple_key.weight");
         // #326: a --compat-bf16 pack (OrcaRouter IQ3_XXS) keeps its BF16 key in the arena
@@ -3064,8 +3243,8 @@ int main(int argc, char** argv) {
     // the device with the most room, and on the 4-way IQ3_S rig the trim buys it 4598 -> 4608 slots.  The VRAM
     // is on the later cards (CUDA2 1241 -> 2485, CUDA3 533 -> 1772), and THEIR weights load after the search,
     // so they trim under `auto` too - see the block past it.
-    const bool stage_trim = trim_asked && multi_gpu && !split_auto && !split_at.empty();
-    if (o.trim_stage_weights && !multi_gpu)
+    const bool stage_trim = layer_stage_mode || (trim_asked && multi_gpu && !split_auto && !split_at.empty());
+    if (o.trim_stage_weights && !multi_gpu && !layer_stage_mode)
         std::fprintf(stderr, "strata generate: --trim-stage-weights needs a layer split across GPUs (ignored)\n");
     // Only `--layer-split auto` WITH the trim asked loads the later stages' weights after the split search (they can
     // only be trimmed once the split is known).  Every other run keeps the 0.1.39 order: weights first, then the
@@ -3089,10 +3268,10 @@ int main(int argc, char** argv) {
         std::fclose(f);
     };
     if (stage_trim) {
-        add_foreign(0, split_at[0], skip, o.mmap_experts);
-        strata::core::NativeDense::set_layer_range(0, (int) split_at[0]);
-        std::fprintf(stderr, "strata generate: layer split: CUDA0 loads the dense weights of layers 0-%lld only\n",
-                     (long long) split_at[0] - 1);
+        add_foreign(local_layer_begin, local_layer_end, skip, o.mmap_experts);
+        strata::core::NativeDense::set_layer_range((int) local_layer_begin, (int) local_layer_end);
+        std::fprintf(stderr, "strata generate: layer-stage: CUDA0 loads the dense weights of layers %lld-%lld only\n",
+                     (long long) local_layer_begin, (long long) local_layer_end - 1);
     }
     uint64_t pool_bytes = 0;
     if (!strata::core::WeightTable::pool_bytes(o.pack, pool_bytes, err, skip.empty() ? nullptr : &skip)) {
@@ -4361,6 +4540,10 @@ int main(int argc, char** argv) {
             stages[i]->lb = split_at[i];
             stages[i]->le = i + 1 < stages.size() ? split_at[i + 1] : g.n_layers;
         }
+    } else if (layer_stage_mode) {
+        profile.erase(std::remove_if(profile.begin(), profile.end(), [&](const auto& pr) {
+                          return pr.first < local_layer_begin || pr.first >= local_layer_end;
+                      }), profile.end());
     }
 
     // ---- `--layer-split auto` with the trim asked: THE STAGES' WEIGHTS, NOW THAT THE SPLIT IS KNOWN.  Each later card
@@ -4396,7 +4579,8 @@ int main(int argc, char** argv) {
     // fixed in llama.cpp: allocation sized by the whole model instead of the device's own work.
     {
         const strata::core::OnDevice on0(0);
-        const int64_t hi0 = multi_gpu ? split_at[0] : -1;
+        const int64_t lo0 = local_layer_begin;
+        const int64_t hi0 = local_layer_end < g.n_layers ? local_layer_end : -1;
         // the elastic K/V (--kv-grow, see kvg_ensure): one GPU, the whole K/V in VRAM (no streaming), a profiled cache
         // that can give slots up, and every expert in RAM for the CPU to compute the ones it gives up
         {
@@ -4416,11 +4600,11 @@ int main(int argc, char** argv) {
             strata::core::qsa_set_kv_elastic(on, iv != nullptr && std::atoll(iv) > 0 ? std::atoll(iv) : 16384);
             strata::core::ExpertCache::set_vmm(on);
         }
-        if (cudaMalloc(&sbuf, strata::core::session_bytes(g, o.max_context, K, 0, hi0)) != cudaSuccess) {
+        if (cudaMalloc(&sbuf, strata::core::session_bytes(g, o.max_context, K, lo0, hi0)) != cudaSuccess) {
             std::fprintf(stderr, "strata generate: session state allocation failed\n");
             return 1;
         }
-        if (strata::core::session_init(g, o.max_context, K, sbuf, ss, 0, hi0) == 0) {
+        if (strata::core::session_init(g, o.max_context, K, sbuf, ss, lo0, hi0) == 0) {
             std::fprintf(stderr, "strata generate: session_init failed\n");
             return 1;
         }
@@ -4673,7 +4857,7 @@ int main(int argc, char** argv) {
     if (wo == nullptr) { std::fprintf(stderr, "strata generate: output.weight is missing\n"); return 1; }
     const int64_t n_vocab = wo->ne1;
     strata::core::NativeHead native_head;
-    if (!o.native_head_gguf.empty() && !multi_gpu) {   // a layer split's head is on its last stage
+    if (!o.native_head_gguf.empty() && !multi_gpu && !layer_stage_client) {   // a layer split's head is on its last stage
         const auto head_t0 = std::chrono::steady_clock::now();
         if (!native_head.load(o.native_head_shards, g.n_embd, n_vocab, err)) {
             std::fprintf(stderr, "strata generate: %s%s\n", err.c_str(), vram_free_note().c_str());
@@ -5904,8 +6088,8 @@ int main(int argc, char** argv) {
         // a layer split's CUDA0 session owns only [0, split_at[0]), so its graphs cover that range; the
         // whole-model replay paths (`session_loop`, the plain generate loop) refuse rather than read another
         // stage's state - a split runs its layers on the stages' verifiers (serve) or prefill stage chain
-        if (!strata::core::session_capture(wt, g, ss, d_parts, gr, err, /*split=*/o.gpu_stages, 0,
-                                           multi_gpu ? split_at[0] : -1)) {
+        if (!strata::core::session_capture(wt, g, ss, d_parts, gr, err, /*split=*/o.gpu_stages,
+                                           local_layer_begin, local_layer_end < g.n_layers ? local_layer_end : -1)) {
             std::fprintf(stderr, "strata generate: session_capture: %s\n", err.c_str());
             return 1;
         }
@@ -7141,6 +7325,13 @@ int main(int argc, char** argv) {
                                  "cache (STRATA_PREFILL_HELPER_SOURCE)\n");
         }
         strata::prefill::Prefill sp;
+        MappedLayerStageBuffer stage_handoff;
+        strata::core::LayerStageClient stage_client;
+        uint64_t stage_session = (uint64_t) Clock::now().time_since_epoch().count() ^
+                                 (uint64_t) (uintptr_t) &stage_client;
+        if (stage_session == 0) stage_session = 1;
+        uint64_t stage_generation = 0;
+        const int64_t stage_prefill_requested = o.prefill_chunk;
         // the pool is idle while a prompt is read unless batch slots decode between its parts; with
         // STRATA_PREFILL_CPU_SHARE the staged-chunk limit before the chunk below sizes the loans (bytes_needed reads it)
         // #1607: Windows, the commit limit (RAM + page file) is what ends the engine silently; compare what this run plans
@@ -7219,7 +7410,7 @@ int main(int argc, char** argv) {
         // whose cache already filled its reserve, that is the over-subscription the auto sizing avoids - so the
         // chunk is the largest one EVERY participant can lend (a smaller chunk only reads slower)
         if (pf_borrow && d_res != nullptr) {
-            pf_parts.push_back({&xcache, &ss, &sp, -1, 0, multi_gpu ? split_at[0] : g.n_layers, -1, -1, 0, {}});
+            pf_parts.push_back({&xcache, &ss, &sp, -1, local_layer_begin, local_layer_end, -1, -1, 0, {}});
             for (auto& st : stages)
                 pf_parts.push_back({&st->cache, &st->ss, &st->sp, st->dev, st->lb, st->le, -1, -1, 0, {}});
             // The two tests plan_lend makes for CUDA0 alone, one participant at a time: a loan must leave the
@@ -7466,7 +7657,16 @@ int main(int argc, char** argv) {
                     return err.find("do not fit") != std::string::npos ? 2 : 1;
                 }
             }
-            if (multi_gpu) sp.set_stage(0, split_at[0], &stages[0]->sp);
+            if (layer_stage_client) {
+                sp.set_stage(0, local_layer_end, nullptr);
+                sp.set_remote_stage([&](const int64_t* tokens, int64_t rows, int64_t position, const float* residual,
+                                        std::string& e) {
+                    return stage_client.prefill(stage_session, stage_generation, position, (uint32_t) rows, tokens,
+                                               residual, e);
+                });
+            } else if (layer_stage_server) {
+                sp.set_stage(local_layer_begin, -1, nullptr);
+            } else if (multi_gpu) sp.set_stage(0, split_at[0], &stages[0]->sp);
             if (share_pool) sp.set_cpu_pool(&pool);
             if (!sp.init(wt, g, ss, prefill_src, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes))
                 return err.find("do not fit") != std::string::npos ? 2 : 1;
@@ -7549,6 +7749,12 @@ int main(int argc, char** argv) {
                                      "off (setup: --vision no), close other programs using the GPU, use a shorter "
                                      "context, or read prompts in smaller chunks (--prefill 512)\n");
             return 1;
+        }
+        if (layer_stage_mode && (o.prefill_chunk != stage_prefill_requested || sp.chunk() != stage_prefill_requested)) {
+            std::fprintf(stderr, "strata serve: layer-stage RPC requires the requested fixed prefill chunk (%lld) to fit "
+                                 "unchanged; this process selected %lld\n", (long long) stage_prefill_requested,
+                         (long long) sp.chunk());
+            return 2;
         }
         if (peer.valid() && o.peer_prefill_rows != 0) {
             const int64_t rows = o.peer_prefill_rows > 0 ? o.peer_prefill_rows : o.prefill_chunk * K / 2;
@@ -7790,6 +7996,30 @@ int main(int argc, char** argv) {
             for (int st = 0; st + 1 < n_stages; ++st) stage_ver_p(st, 1).set_next(&stage_ver_p(st + 1, 1), &split_drive_b);
         }
         ver.set_remote_expert_opt(remote_opt.get());
+        std::unique_ptr<ModelLayerStageExecutor> stage_executor;
+        if (layer_stage_mode) {
+            const size_t handoff_bytes = (size_t) strata::kernels::kVerifyMaxT *
+                                         (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
+            if (!stage_handoff.init(handoff_bytes, err)) {
+                std::fprintf(stderr, "strata serve: %s\n", err.c_str());
+                return 1;
+            }
+            if (layer_stage_client) {
+                ver.set_stage(0, local_layer_end, nullptr, stage_handoff.device);
+                ver.set_remote_stage(
+                    [&](int rows, const int32_t* tokens, int64_t position, int32_t* picks, std::string& e) {
+                        return stage_client.verify(stage_session, stage_generation, position, (uint32_t) rows,
+                                                  tokens, stage_handoff.host, picks, e);
+                    },
+                    [&](int keep, std::string& e) {
+                        return stage_client.commit(stage_session, stage_generation, (uint32_t) keep, e);
+                    });
+            } else {
+                ver.set_stage(local_layer_begin, -1, stage_handoff.device, nullptr);
+                stage_executor = std::make_unique<ModelLayerStageExecutor>(ss, g, ver, sp, drive, stage_handoff,
+                                                                           main_cs, (uint32_t) o.spec);
+            }
+        }
         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr,
                       batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), err) ||
@@ -7797,6 +8027,20 @@ int main(int argc, char** argv) {
                                   pipe ? pl_mtp_R : ver.final_R_all(), err))) {
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
             return 1;
+        }
+        if (layer_stage_server) {
+            // The coordinator sends token IDs and activations, not its sampler state. Until sampling state is part of
+            // the wire contract, the remote terminal stage must be deterministic greedy with neutral penalties.
+            strata::kernels::SamplerParams stage_sampling;
+            stage_sampling.greedy = true;
+            stage_sampling.temperature = 0.0f;
+            stage_sampling.top_p = 1.0f;
+            stage_sampling.min_p = 0.0f;
+            stage_sampling.penalty_last_n = 0;
+            stage_sampling.penalty_repeat = 1.0f;
+            stage_sampling.penalty_freq = 0.0f;
+            stage_sampling.penalty_present = 0.0f;
+            ver.set_sampling(stage_sampling);
         }
         if (pipe) mtp.set_source_R(ver.final_R_all());   // the serial decode's rows (the last stage's even verifier)
         auto free_slot_mtp_rows = [](float* p) { if (p != nullptr) (void) cudaFree(p); };
@@ -8063,6 +8307,69 @@ int main(int argc, char** argv) {
             id.config = *config_fp;
             return true;
         };
+        strata::core::LayerStageSpec layer_stage_spec{};
+        if (layer_stage_mode) {
+            strata::core::SessionFileIdentity identity;
+            if (!session_identity(identity, err, {})) {
+                std::fprintf(stderr, "strata serve: layer-stage model identity: %s\n", err.c_str());
+                return 1;
+            }
+            layer_stage_spec.model_fingerprint = identity.model;
+            layer_stage_spec.config_fingerprint = identity.config;
+            layer_stage_spec.max_context = (uint64_t) o.max_context;
+            layer_stage_spec.n_layers = (uint32_t) g.n_layers;
+            layer_stage_spec.n_embd = (uint32_t) g.n_embd;
+            layer_stage_spec.n_expert = (uint32_t) g.n_expert;
+            layer_stage_spec.hc = (uint32_t) g.hc;
+            layer_stage_spec.layer_begin = (uint32_t) split_at[0];
+            layer_stage_spec.layer_end = (uint32_t) g.n_layers;
+            layer_stage_spec.max_verify_rows = (uint32_t) o.spec;
+            layer_stage_spec.max_prefill_rows = (uint32_t) sp.chunk();
+            layer_stage_spec.capabilities = 1; // contiguous native CUDA stage; FP32 activation boundary
+            const char* token_env = std::getenv("STRATA_RPC_TOKEN");
+            if (token_env == nullptr || token_env[0] == '\0') {
+                std::fprintf(stderr, "strata serve: layer-stage RPC requires a nonempty STRATA_RPC_TOKEN on both PCs\n");
+                return 2;
+            }
+            if (layer_stage_client) {
+                if (!stage_client.connect(o.layer_stage_client, token_env, layer_stage_spec, err) ||
+                    !stage_client.health(err)) {
+                    std::fprintf(stderr, "strata serve: layer-stage worker connection failed: %s\n", err.c_str());
+                    return 1;
+                }
+                std::fprintf(stderr, "strata serve: persistent layer-stage worker ready at %s (layers %u-%u, prefill %u, verify %u)\n",
+                             o.layer_stage_client.c_str(), layer_stage_spec.layer_begin,
+                             layer_stage_spec.layer_end - 1, layer_stage_spec.max_prefill_rows,
+                             layer_stage_spec.max_verify_rows);
+            } else {
+                if (!stage_executor) {
+                    std::fprintf(stderr, "strata serve: layer-stage worker executor was not initialized\n");
+                    return 1;
+                }
+                strata::core::rpc::Socket listener = strata::core::rpc::kInvalidSocket;
+                if (!strata::core::rpc::listen(o.layer_stage_server, listener, err)) {
+                    std::fprintf(stderr, "strata serve: layer-stage listen failed: %s\n", err.c_str());
+                    return 1;
+                }
+                strata::core::LayerStageServer server(token_env, layer_stage_spec, *stage_executor);
+                std::fprintf(stderr, "strata serve: persistent layer-stage worker listening at %s (layers %u-%u)\n",
+                             o.layer_stage_server.c_str(), layer_stage_spec.layer_begin,
+                             layer_stage_spec.layer_end - 1);
+                std::printf("LAYER_STAGE_READY %u %u\n", layer_stage_spec.layer_begin, layer_stage_spec.layer_end);
+                std::fflush(stdout);
+                for (;;) {
+                    strata::core::rpc::Socket client = strata::core::rpc::kInvalidSocket;
+                    if (!strata::core::rpc::accept(listener, client, err)) {
+                        std::fprintf(stderr, "strata serve: layer-stage accept failed: %s\n", err.c_str());
+                        strata::core::rpc::close(listener);
+                        return 1;
+                    }
+                    std::string client_error;
+                    if (!server.serve(client, client_error) && !client_error.empty())
+                        std::fprintf(stderr, "strata serve: layer-stage client ended: %s\n", client_error.c_str());
+                }
+            }
+        }
         // Save only on a switch/rewind, not on each continuing request. No graph
         // addresses change: all parked images live in ordinary host vectors.
         auto park_current_body = [&](size_t held) -> bool {
@@ -10394,6 +10701,14 @@ int main(int argc, char** argv) {
                 std::printf("ERR bad request: %s\n", pe.empty() ? "max_new" : pe.c_str());
                 continue;
             }
+            if (layer_stage_mode &&
+                (geni || req_temperature > 0.0f || req_bias_present || req_penalty_last_n > 0 ||
+                 req_penalty_repeat != 1.0f || req_penalty_freq != 0.0f || req_penalty_present != 0.0f ||
+                 req_min_p > 0.0f || req_cvec != 1)) {
+                std::printf("ERR layer-stage RPC currently supports text-only greedy requests without logit bias, "
+                            "penalties, min_p, or cvec overrides\n");
+                continue;
+            }
             const int64_t n = (int64_t) ids.size();
             req_imgs.clear();
             if (geni && !o.vision) { std::printf("ERR this engine was started without --vision\n"); continue; }
@@ -10808,6 +11123,17 @@ int main(int argc, char** argv) {
                                return false;
                            }()) {
                     std::printf("ERR restoring a conversation checkpoint failed\n");
+                    return 1;
+                }
+            }
+            if (layer_stage_client) {
+                if (resume != 0 || stage_generation == UINT64_MAX) {
+                    std::printf("ERR layer-stage RPC requires a fresh prompt and available session generation\n");
+                    return 1;
+                }
+                ++stage_generation;
+                if (!stage_client.reset(stage_session, stage_generation, 0, err)) {
+                    std::printf("ERR resetting the remote layer-stage session: %s\n", err.c_str());
                     return 1;
                 }
             }

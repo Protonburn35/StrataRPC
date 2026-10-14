@@ -119,11 +119,15 @@ int main() {
     if (!client.commit(42, 1, 2, err) || !client.health(err) || !client.abort(42, 1, err)) {
         client.close(); server.join(); std::fprintf(stderr, "stage state control failed: %s\n", err.c_str()); return 1;
     }
+    // A new request reuses the TCP connection but must start operation numbering at one and advance its generation.
+    if (!client.reset(42, 2, 0, err) || !client.health(err) || !client.abort(42, 2, err)) {
+        client.close(); server.join(); std::fprintf(stderr, "stage generation reset failed: %s\n", err.c_str()); return 1;
+    }
     client.close();
     server.join();
 
-    if (!server_ok || !server_error.empty() || executor.resets != 1 || executor.prefills != 1 || executor.verifies != 1 ||
-        executor.commits != 1 || executor.aborts != 1 || executor.health_checks != 1 ||
+    if (!server_ok || !server_error.empty() || executor.resets != 2 || executor.prefills != 1 || executor.verifies != 1 ||
+        executor.commits != 1 || executor.aborts != 2 || executor.health_checks != 2 ||
         client.bytes_sent() == 0 || client.bytes_received() == 0) {
         std::fprintf(stderr, "stage worker lifecycle failed: %s\n", server_error.c_str());
         return 1;
