@@ -405,6 +405,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         arg_scratch_ = b.take<uint8_t>(strata::kernels::argmax_rows_scratch_bytes((int) T));
         top_scratch_ = b.take<uint8_t>(strata::kernels::row_top_prob_scratch_bytes((int) T));
         dummy_inj_ = b.take<float>(HC);
+        prefill_tail_ = b.take<float>(HC * N);
     };
     Bump count;
     carve(count);
@@ -1268,6 +1269,20 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
         }
     }
     ms_prefill += ms_since(t0);
+    return true;
+}
+
+bool MtpDrafter::save_prefill_tail(const float* R_row, std::string& err) {
+    const OnDevice on_device(device_);
+    if (R_row == nullptr || prefill_tail_ == nullptr || g_ == nullptr) {
+        err = "mtp prefill: the retained prompt residual is unavailable";
+        return false;
+    }
+    const size_t bytes = (size_t)(g_->hc * g_->n_embd) * sizeof(float);
+    if (cudaMemcpyAsync(prefill_tail_, R_row, bytes, cudaMemcpyDeviceToDevice, cs_) != cudaSuccess) {
+        err = std::string("mtp prefill: retaining the prompt residual failed: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
     return true;
 }
 

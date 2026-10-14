@@ -466,6 +466,9 @@ struct Options {
     std::string layer_stage_client; ///< persistent remote suffix stage, host:port
     std::string layer_stage_server; ///< serve one persistent remote suffix stage, bind-address:port
     std::string layer_stage_split;  ///< first layer owned by the remote suffix worker
+    std::string layer_stage_wire = "fp32"; ///< negotiated activation boundary representation (fp32 default)
+    bool layer_stage_reuse = false; ///< keep one active remote sequence for exact append-only conversation continuation
+    bool layer_stage_mtp = false; ///< run native MTP on the terminal layer-stage worker
     std::string expert_cache_rpc_layers; ///< complete remote expert blocks; host cache is packed around these layers
     std::string rpc_server;       ///< serve a remote expert cache, bind-address:port
     bool remote_expert_opt = false; ///< optional optimization of the existing remote-expert decode path
@@ -862,6 +865,9 @@ void usage() {
                  "  --layer-stage-client HOST:PORT  --serve: layers 0..K-1 here, with a persistent remote suffix worker\n"
                  "  --layer-stage-server HOST:PORT  --serve: own suffix layers K..last; pair with --layer-stage-split K\n"
                  "  --layer-stage-split K         first remote layer (same value on both PCs); use a fixed --prefill chunk\n"
+                 "  --layer-stage-wire fp32|bf16|fp16  negotiated activation wire dtype (default fp32; lossy formats opt in)\n"
+                 "  --layer-stage-reuse        --serve: retain one committed conversation on both stages for append-only turns\n"
+                 "  --layer-stage-mtp          --serve: place --mtp drafting on the suffix worker (greedy requests only)\n"
                  "  --expert-profile-save P  --serve, #477: save what the adaptive tier learned (the experts in\n"
                  "                       VRAM, then the routing counted since the start) as a profile at P, on\n"
                  "                       QUIT and every --expert-profile-save-every MIN minutes (default 10;\n"
@@ -1158,9 +1164,19 @@ public:
     ModelLayerStageExecutor(strata::core::SessionState& session, const strata::core::ModelGeometry& geometry,
                             strata::core::Verifier& verifier, strata::prefill::Prefill& prefill,
                             Drive& drive, MappedLayerStageBuffer& handoff,
-                            cudaStream_t stream, uint32_t max_verify_rows)
+                            cudaStream_t stream, uint32_t max_verify_rows,
+                            strata::core::MtpDrafter* mtp = nullptr)
         : session_(session), geometry_(geometry), verifier_(verifier), prefill_(prefill), drive_(drive),
-          handoff_(handoff), stream_(stream), max_verify_rows_(max_verify_rows) {}
+          handoff_(handoff), stream_(stream), max_verify_rows_(max_verify_rows), mtp_(mtp) {
+        if (mtp_ != nullptr) {
+            auto previous = prefill_.on_chunk;
+            prefill_.on_chunk = [this, previous](const float* rows, int64_t count, int64_t position,
+                                                 std::string& err) {
+                if (!on_prefill_chunk(rows, count, position, err)) return false;
+                return !previous || previous(rows, count, position, err);
+            };
+        }
+    }
 
     bool reset(uint64_t session, uint64_t generation, int64_t position, std::string& err) override {
         if (session == 0 || generation == 0 || position != 0) {
@@ -1168,13 +1184,35 @@ public:
             return false;
         }
         if (!verifier_.wait_commit(err)) return false;
+        if (mtp_ != nullptr) {
+            const strata::core::OnDevice on_mtp(mtp_->device());
+            if (!mtp_->idle(err)) return false;
+            strata::kernels::qsa_state_zero(mtp_->kv_state_rw(), geometry_, stream_);
+        }
         strata::core::session_zero(session_, geometry_, nullptr, stream_);
         if (cudaStreamSynchronize(stream_) != cudaSuccess) { err = "layer-stage session reset failed"; return false; }
         session_id_ = session;
         generation_ = generation;
         position_ = position;
         pending_ = 0;
+        pending_mtp_cell_ = -1;
+        current_prefill_tokens_ = nullptr;
+        last_verify_rows_ = 0;
         valid_ = true;
+        // The worker learns prompt rows incrementally through prefill RPCs, so it cannot use the final prompt
+        // length to skip early MTP K/V writes. Zero disables that optimization and preserves the full prefix.
+        if (mtp_ != nullptr) mtp_->set_prompt_len(0);
+        return true;
+    }
+
+    bool resume(uint64_t session, uint64_t old_generation, uint64_t new_generation, int64_t position,
+                std::string& err) override {
+        if (!valid_ || session_id_ != session || generation_ != old_generation || new_generation <= old_generation ||
+            position_ != position || pending_ != 0 || pending_mtp_cell_ >= 0) {
+            err = "layer-stage worker cannot resume: its committed session position is not exact";
+            return false;
+        }
+        generation_ = new_generation;
         return true;
     }
 
@@ -1182,7 +1220,15 @@ public:
                  const int64_t* tokens, const float* residual, std::string& err) override {
         if (!matches(session, generation, position, err) || pending_ != 0 || tokens == nullptr || residual == nullptr) return false;
         prefill_.set_stage_input(residual);
-        if (!prefill_.run(tokens, (int64_t) rows, position, err)) { valid_ = false; return false; }
+        current_prefill_tokens_ = tokens;
+        current_prefill_rows_ = rows;
+        current_prefill_position_ = position;
+        const bool ok = prefill_.run(tokens, (int64_t) rows, position, err);
+        current_prefill_tokens_ = nullptr;
+        current_prefill_rows_ = 0;
+        if (!ok) { valid_ = false; return false; }
+        // Prefill advances session_.ple_prev for every stage from the token stream, even when this stage starts
+        // after layer 1. MTP therefore sees the same prompt history as the coordinator.
         position_ += rows;
         return true;
     }
@@ -1191,6 +1237,19 @@ public:
                 const int32_t* tokens, const float* handoff, int32_t* picks, std::string& err) override {
         if (!matches(session, generation, position, err) || pending_ != 0 || tokens == nullptr || handoff == nullptr ||
             picks == nullptr || rows > max_verify_rows_) return false;
+        if (mtp_ != nullptr && pending_mtp_cell_ >= 0) {
+            if (pending_mtp_cell_ + 1 != position || tokens[0] < 0) {
+                err = "layer-stage MTP prompt lookahead does not match the first verifier position";
+                valid_ = false;
+                return false;
+            }
+            const int32_t lookahead = tokens[0];
+            if (!mtp_->prefill(mtp_->prefill_tail(), &lookahead, 1, pending_mtp_cell_, err)) {
+                valid_ = false;
+                return false;
+            }
+            pending_mtp_cell_ = -1;
+        }
         const size_t floats = (size_t) rows * (size_t) strata::core::Verifier::handoff_floats(geometry_);
         const size_t bytes = floats * sizeof(float);
         if (bytes > handoff_.bytes) { err = "layer-stage verify activation exceeds the mapped input buffer"; return false; }
@@ -1209,24 +1268,66 @@ public:
             return false;
         }
         pending_ = rows;
+        last_verify_rows_ = rows;
+        last_verify_position_ = position;
+        last_verify_tokens_.assign(tokens, tokens + rows);
+        last_verify_picks_.assign(picks, picks + rows);
         return true;
     }
 
-    bool commit(uint64_t session, uint64_t generation, uint64_t, uint32_t keep, std::string& err) override {
+    bool commit(uint64_t session, uint64_t generation, uint64_t, uint32_t keep, bool draft_next, float min_p,
+                strata::core::LayerStageMtpReply* reply, std::string& err) override {
         if (!matches(session, generation, position_, err) || pending_ == 0 || keep == 0 || keep > pending_) return false;
+        if ((draft_next && (mtp_ == nullptr || reply == nullptr)) || (mtp_ == nullptr && reply != nullptr)) {
+            err = "layer-stage MTP commit does not match the worker's MTP configuration";
+            return false;
+        }
         if (!verifier_.commit((int) keep, err) || !verifier_.wait_commit(err)) { valid_ = false; return false; }
+        if (session_.ple.ready()) {
+            for (uint32_t t = 0; t < keep; ++t) {
+                session_.ple_prev[0] = session_.ple_prev[1];
+                session_.ple_prev[1] = last_verify_tokens_[t];
+            }
+        }
         position_ += keep;
         pending_ = 0;
+        if (draft_next) {
+            std::vector<int32_t> drafts(strata::core::kLayerStageMaxMtpDrafts, 0);
+            std::vector<float> probabilities(strata::core::kLayerStageMaxMtpDrafts, 0.0f);
+            int count = 0;
+            if (!mtp_->draft((int)last_verify_rows_, last_verify_picks_.data(), last_verify_position_, (int)keep - 1,
+                             drafts.data(), err, probabilities.data(), min_p, &count)) {
+                valid_ = false;
+                return false;
+            }
+            reply->count = (uint32_t)count;
+            for (int i = 0; i < count; ++i) {
+                reply->tokens[(size_t)i] = drafts[(size_t)i];
+                reply->probabilities[(size_t)i] = probabilities[(size_t)i];
+            }
+        }
+        last_verify_rows_ = 0;
+        last_verify_tokens_.clear();
+        last_verify_picks_.clear();
         return true;
     }
 
     bool abort(uint64_t session, uint64_t generation, uint64_t, std::string& err) override {
         if (session_id_ != session || generation_ != generation) { err = "layer-stage abort belongs to a stale session"; return false; }
         if (!verifier_.wait_commit(err)) return false;
+        if (mtp_ != nullptr) {
+            const strata::core::OnDevice on_mtp(mtp_->device());
+            if (!mtp_->idle(err)) return false;
+            strata::kernels::qsa_state_zero(mtp_->kv_state_rw(), geometry_, stream_);
+        }
         strata::core::session_zero(session_, geometry_, nullptr, stream_);
         if (cudaStreamSynchronize(stream_) != cudaSuccess) { err = "layer-stage session abort failed"; return false; }
         valid_ = false;
         pending_ = 0;
+        pending_mtp_cell_ = -1;
+        last_verify_rows_ = 0;
+        last_verify_tokens_.clear();
+        last_verify_picks_.clear();
         position_ = 0;
         return true;
     }
@@ -1237,6 +1338,36 @@ public:
     }
 
 private:
+    bool on_prefill_chunk(const float* rows, int64_t count, int64_t position, std::string& err) {
+        if (mtp_ == nullptr) return true;
+        if (rows == nullptr || count <= 0 || current_prefill_tokens_ == nullptr || position < current_prefill_position_ ||
+            (uint64_t)(position - current_prefill_position_) > current_prefill_rows_ ||
+            (uint64_t)count > current_prefill_rows_ - (uint64_t)(position - current_prefill_position_)) {
+            err = "layer-stage MTP prefill callback does not match its token chunk";
+            return false;
+        }
+        const size_t offset = (size_t)(position - current_prefill_position_);
+        if (pending_mtp_cell_ >= 0) {
+            if (pending_mtp_cell_ + 1 != position) {
+                err = "layer-stage MTP prefill chunks are not contiguous";
+                return false;
+            }
+            const int32_t next = (int32_t)current_prefill_tokens_[offset];
+            if (!mtp_->prefill(mtp_->prefill_tail(), &next, 1, pending_mtp_cell_, err)) return false;
+            pending_mtp_cell_ = -1;
+        }
+        if (count > 1) {
+            std::vector<int32_t> next((size_t)count - 1);
+            for (int64_t i = 0; i + 1 < count; ++i)
+                next[(size_t)i] = (int32_t)current_prefill_tokens_[offset + (size_t)i + 1];
+            if (!mtp_->prefill(rows, next.data(), count - 1, position, err)) return false;
+        }
+        const size_t row_floats = (size_t)geometry_.hc * (size_t)geometry_.n_embd;
+        if (!mtp_->save_prefill_tail(rows + (size_t)(count - 1) * row_floats, err)) return false;
+        pending_mtp_cell_ = position + count - 1;
+        return true;
+    }
+
     bool matches(uint64_t session, uint64_t generation, int64_t position, std::string& err) const {
         if (!valid_ || session_id_ != session || generation_ != generation || position_ != position || position < 0) {
             err = "layer-stage operation does not match the active worker session position";
@@ -1251,9 +1382,14 @@ private:
     Drive& drive_;
     MappedLayerStageBuffer& handoff_;
     cudaStream_t stream_ = nullptr;
-    uint32_t max_verify_rows_ = 0, pending_ = 0;
+    uint32_t max_verify_rows_ = 0, pending_ = 0, last_verify_rows_ = 0;
     uint64_t session_id_ = 0, generation_ = 0;
-    int64_t position_ = 0;
+    int64_t position_ = 0, pending_mtp_cell_ = -1;
+    int64_t current_prefill_position_ = 0, last_verify_position_ = 0;
+    uint32_t current_prefill_rows_ = 0;
+    const int64_t* current_prefill_tokens_ = nullptr;
+    std::vector<int32_t> last_verify_tokens_, last_verify_picks_;
+    strata::core::MtpDrafter* mtp_ = nullptr;
     bool valid_ = false;
 };
 
@@ -2024,6 +2160,9 @@ int main(int argc, char** argv) {
         else if (a == "--layer-stage-client") o.layer_stage_client = next("--layer-stage-client");
         else if (a == "--layer-stage-server") o.layer_stage_server = next("--layer-stage-server");
         else if (a == "--layer-stage-split") o.layer_stage_split = next("--layer-stage-split");
+        else if (a == "--layer-stage-wire") o.layer_stage_wire = next("--layer-stage-wire");
+        else if (a == "--layer-stage-reuse") o.layer_stage_reuse = true;
+        else if (a == "--layer-stage-mtp") o.layer_stage_mtp = true;
         else if (a == "--expert-cache-rpc-layers") o.expert_cache_rpc_layers = next("--expert-cache-rpc-layers");
         else if (a == "--pack") o.pack = next("--pack");
         else if (a == "--tokens") {
@@ -2539,6 +2678,31 @@ int main(int argc, char** argv) {
     const bool layer_stage_client = !o.layer_stage_client.empty();
     const bool layer_stage_server = !o.layer_stage_server.empty();
     const bool layer_stage_mode = layer_stage_client || layer_stage_server;
+    const bool remote_mtp = layer_stage_client && o.layer_stage_mtp;
+    if (o.layer_stage_wire != "fp32" && o.layer_stage_wire != "bf16" && o.layer_stage_wire != "fp16") {
+        std::fprintf(stderr, "strata generate: --layer-stage-wire must be fp32, bf16, or fp16 (got '%s')\n",
+                     o.layer_stage_wire.c_str());
+        return 2;
+    }
+    if (!layer_stage_mode && (o.layer_stage_reuse || o.layer_stage_mtp || o.layer_stage_wire != "fp32")) {
+        std::fprintf(stderr, "strata generate: --layer-stage-reuse, --layer-stage-mtp, and --layer-stage-wire require a layer-stage endpoint\n");
+        return 2;
+    }
+    if (o.layer_stage_mtp && (o.mtp.empty() || o.spec < 2)) {
+        std::fprintf(stderr, "strata generate: --layer-stage-mtp requires --mtp PATH and --spec >= 2 on both PCs\n");
+        return 2;
+    }
+    if (layer_stage_mode && o.pipeline_windows > 0) {
+        std::fprintf(stderr, "strata generate: layer-stage RPC does not support --pipeline-windows; use --pipeline-windows 0\n");
+        return 2;
+    }
+    if (layer_stage_mode && o.layer_stage_mtp) {
+        if (strata::core::coupled_draft_env()) {
+            std::fprintf(stderr, "strata generate: remote layer-stage MTP does not support STRATA_SPEC_PROB or "
+                                 "STRATA_SPEC_COUPLED / --coupled-draft; disable them on both PCs\n");
+            return 2;
+        }
+    }
     if (layer_stage_mode) {
         int64_t cut = 0;
         const auto parsed_cut = std::from_chars(o.layer_stage_split.data(),
@@ -2554,10 +2718,14 @@ int main(int argc, char** argv) {
         split_at.push_back(cut);
         const bool stage_local_helpers = std::any_of(o.expert_cache_remote.begin(), o.expert_cache_remote.end(),
                                                      [](int slots) { return slots > 0; });
-        if (o.batch > 0 || !o.mtp.empty() || o.peer_device >= 0 || stage_local_helpers || o.vision ||
+        if (o.batch > 0 || (!o.mtp.empty() && !o.layer_stage_mtp) || o.peer_device >= 0 || stage_local_helpers || o.vision ||
             !o.expert_cache_rpc.empty() || !o.rpc_server.empty() || o.conversation_cache_mib > 0) {
-            std::fprintf(stderr, "strata generate: layer-stage RPC currently requires one request at a time, no MTP, "
+            std::fprintf(stderr, "strata generate: layer-stage RPC requires one request at a time and no unsupported MTP, "
                                  "vision, peer/helper RPC, or conversation parking\n");
+            return 2;
+        }
+        if (o.layer_stage_reuse && o.prompt_cache == 0) {
+            std::fprintf(stderr, "strata generate: --layer-stage-reuse requires --prompt-cache > 0\n");
             return 2;
         }
         if (o.expert_profile.empty() || !o.expert_profile_save.empty()) {
@@ -2576,11 +2744,17 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: layer-stage worker keeps prefill buffers outside the expert cache; "
                                  "cache borrowing is disabled for worker safety\n");
         }
-        // The worker is a single persistent sequence. Prompt/conversation checkpoints would require remote state
-        // snapshots, so every request starts from an empty state and rereads its complete prompt.
-        o.prompt_cache = 0;
-        o.prompt_cache_every = 0;
-        o.prompt_cache_tail = false;
+        if (!o.layer_stage_reuse) {
+            // Preserve the corrected baseline: without the explicit opt-in every request resets both stage states.
+            o.prompt_cache = 0;
+            o.prompt_cache_every = 0;
+            o.prompt_cache_tail = false;
+        } else {
+            // This first distributed cache retains only the exact live sequence. Checkpoint snapshots and multi-chat
+            // parking remain disabled; a rewind or divergent prompt replays from zero on both PCs.
+            o.prompt_cache_every = 0;
+            o.prompt_cache_tail = false;
+        }
     }
     bool multi_gpu = !split_devs.empty() && !split_same;   // cleared by --split-skip-if-fits before any stage loads
     bool split_own_auto = false;   // #340: the split keeps own prompt buffers by its rule (not --no-prefill-borrow)
@@ -3210,7 +3384,7 @@ int main(int argc, char** argv) {
                                  "and --prefill CHUNK\n", o.pack.c_str());
             return 2;
         }
-        if (!layer_stage_server) {
+        if (!layer_stage_server || o.layer_stage_mtp) {
             const strata::core::ModelGeometry g0;
             const auto embed_t0 = std::chrono::steady_clock::now();
             if (!native_embed.load(o.embd_gguf.empty() ? o.native_shards : std::vector<std::string>{o.embd_gguf},
@@ -4823,7 +4997,7 @@ int main(int argc, char** argv) {
     // slots' draft-KV copies use this one too
     static const strata::core::ModelGeometry draft_geometry{};
     std::vector<std::unique_ptr<strata::core::MtpDrafter>> slot_mtp;
-    if (!o.mtp.empty()) {
+    if (!o.mtp.empty() && !remote_mtp) {
         if (o.spec < 2) {
             std::fprintf(stderr, "strata generate: --mtp is ignored without --spec T (T >= 2)\n");
             o.mtp.clear();
@@ -4841,6 +5015,10 @@ int main(int argc, char** argv) {
         const int mtp_t = o.pipeline_windows >= 2 ? strata::kernels::kVerifyMaxT : o.spec;
         if (o.pipeline_windows >= 2) mtp.set_force_capture(true);
         if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, last_st ? last_st->ss : ss, mtp_t, err, o.mtp_window)) { std::fprintf(stderr, "strata generate: %s%s\n", err.c_str(), vram_free_note().c_str()); return 1; }
+        if (layer_stage_server && o.layer_stage_mtp) {
+            const int max_drafts = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) - 1 : o.spec - 1;
+            mtp.set_max_drafts(max_drafts);
+        }
         mtp.set_ple_session(&ss);
         if (batch_mtp) {
             // Slot b's drafter lives where the solo drafter does (the guard above: the last stage's GPU), carved from the
@@ -7332,6 +7510,7 @@ int main(int argc, char** argv) {
         // neither fires, plain one-token-per-round decoding - slower, never wrong: the verify window still
         // confirms every emitted token against the real model regardless of where the draft came from.
         const bool use_mtp = !o.mtp.empty();
+        const bool use_local_mtp = use_mtp && !remote_mtp;
         // STRATA_PREFILL_HELPER_SOURCE (opt-in): the prompt path may take a blob a helper's VRAM cache already
         // holds from that cache instead of reading the files again.  The helpers are idle while a prompt is read
         // (the serve path is serial: no batch slots), so the copy needs no ordering against their kernel streams.
@@ -7859,7 +8038,7 @@ int main(int argc, char** argv) {
         vh.d_res = thits.d_res;
         // STRATA_ROUTE_RESIDENT_MTP=1 (EXPERIMENTAL, with STRATA_ROUTE_RESIDENT=<margin>; changes the output): the MTP
         // draft's router gets the same residency bias, with the last layer's residency row as its table (single GPU)
-        if (use_mtp && stages.empty() && thits.d_res != nullptr && std::getenv("STRATA_ROUTE_RESIDENT") != nullptr &&
+        if (use_local_mtp && stages.empty() && thits.d_res != nullptr && std::getenv("STRATA_ROUTE_RESIDENT") != nullptr &&
             std::getenv("STRATA_ROUTE_RESIDENT_MTP") != nullptr && std::atoi(std::getenv("STRATA_ROUTE_RESIDENT_MTP")) != 0) {
             const float margin = (float) std::atof(std::getenv("STRATA_ROUTE_RESIDENT"));
             int lo = 6, hi = 9;
@@ -8037,19 +8216,39 @@ int main(int argc, char** argv) {
                         return stage_client.verify(stage_session, stage_generation, position, (uint32_t) rows,
                                                   tokens, stage_handoff.host, picks, e);
                     },
-                    [&](int keep, std::string& e) {
-                        return stage_client.commit(stage_session, stage_generation, (uint32_t) keep, e);
+                    [&](int keep, bool draft_next, float min_p, std::vector<int32_t>* draft_tokens,
+                        std::vector<float>* draft_probabilities, std::string& e) {
+                        strata::core::LayerStageMtpReply reply;
+                        strata::core::LayerStageMtpReply* reply_ptr = o.layer_stage_mtp ? &reply : nullptr;
+                        if (!stage_client.commit(stage_session, stage_generation, (uint32_t) keep, draft_next,
+                                                 min_p, reply_ptr, e)) return false;
+                        if (draft_next) {
+                            if (draft_tokens == nullptr || draft_probabilities == nullptr) {
+                                e = "layer-stage MTP commit has no destination for the draft reply";
+                                return false;
+                            }
+                            std::fill(draft_tokens->begin(), draft_tokens->end(), 0);
+                            std::fill(draft_probabilities->begin(), draft_probabilities->end(), 0.0f);
+                            const size_t count = std::min<size_t>(reply.count,
+                                std::min(draft_tokens->size(), draft_probabilities->size()));
+                            for (size_t i = 0; i < count; ++i) {
+                                (*draft_tokens)[i] = reply.tokens[i];
+                                (*draft_probabilities)[i] = reply.probabilities[i];
+                            }
+                        }
+                        return true;
                     });
             } else {
                 ver.set_stage(local_layer_begin, -1, stage_handoff.device, nullptr);
                 stage_executor = std::make_unique<ModelLayerStageExecutor>(ss, g, ver, sp, drive, stage_handoff,
-                                                                           main_stream, (uint32_t) o.spec);
+                                                                           main_stream, (uint32_t) o.spec,
+                                                                           o.layer_stage_mtp ? &mtp : nullptr);
             }
         }
         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr,
                       batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), err) ||
-            (use_mtp && !mtp.bind(last_st ? last_st->wt : wt, last_st ? &last_st->head : &native_head,
+            (use_local_mtp && !mtp.bind(last_st ? last_st->wt : wt, last_st ? &last_st->head : &native_head,
                                   pipe ? pl_mtp_R : ver.final_R_all(), err))) {
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
             return 1;
@@ -8290,6 +8489,8 @@ int main(int argc, char** argv) {
                     for (const char* n : {"dense.txt", "experts.bin"}) files.push_back({std::string("mtp ") + n, o.mtp + "/" + n});
                     files.push_back({"mtp draft_vocab.bin", o.mtp + "/draft_vocab.bin", true});
                 }
+                if (layer_stage_mode && o.layer_stage_mtp && !o.mtp_draft_vocab.empty())
+                    files.push_back({"mtp custom draft vocabulary", o.mtp_draft_vocab});
                 uint64_t fp = 0;
                 // each file is one blocking read of at most 2 MiB (head and tail): announced before it starts
                 if (next_file) next_file();
@@ -8327,6 +8528,12 @@ int main(int argc, char** argv) {
                     {"keep_canonical", o.keep_canonical}, {"no_fused_gr", o.no_fused_gr},
                     {"no_fast_attn", o.no_fast_attn}, {"no_fused_gdn", o.no_fused_gdn},
                     {"no_fast_select", o.no_fast_select}, {"vision", o.vision}};
+                if (layer_stage_mode && o.layer_stage_mtp) {
+                    c.switches.emplace_back("mtp_hnorm_stream", o.mtp_hnorm_stream);
+                    c.switches.emplace_back("mtp_q4_proj", o.mtp_q4 == "all" || o.mtp_q4 == "proj");
+                    c.switches.emplace_back("mtp_q4_head", o.mtp_q4 == "all" || o.mtp_q4 == "head");
+                    c.switches.emplace_back("mtp_max_t", o.mtp_max_t);
+                }
                 config_fp = strata::core::session_config_fingerprint(c);
             }
             id.model = *model_fp;
@@ -8351,7 +8558,12 @@ int main(int argc, char** argv) {
             layer_stage_spec.layer_end = (uint32_t) g.n_layers;
             layer_stage_spec.max_verify_rows = (uint32_t) o.spec;
             layer_stage_spec.max_prefill_rows = (uint32_t) sp.chunk();
-            layer_stage_spec.capabilities = 1; // contiguous native CUDA stage; FP32 activation boundary
+            layer_stage_spec.capabilities = strata::core::kLayerStageCapabilityBase |
+                (o.layer_stage_reuse ? strata::core::kLayerStageCapabilityReuse : 0u) |
+                (o.layer_stage_mtp ? strata::core::kLayerStageCapabilityMtp : 0u);
+            layer_stage_spec.wire_format = o.layer_stage_wire == "bf16" ? strata::core::LayerStageWireFormat::bf16
+                                           : o.layer_stage_wire == "fp16" ? strata::core::LayerStageWireFormat::fp16
+                                                                           : strata::core::LayerStageWireFormat::fp32;
             const char* token_env = std::getenv("STRATA_RPC_TOKEN");
             if (token_env == nullptr || token_env[0] == '\0') {
                 std::fprintf(stderr, "strata serve: layer-stage RPC requires a nonempty STRATA_RPC_TOKEN on both PCs\n");
@@ -8429,8 +8641,8 @@ int main(int argc, char** argv) {
             const size_t n_st = stages.size();
             // the draft layer's K/V lives on the last stage's GPU (the drafter is loaded there): with a split it is
             // saved with that stage's image, under its device; stage 0's image holds none
-            const strata::core::QsaState* draft0 = n_st > 0 || !use_mtp ? nullptr : &mtp.kv_state();   // no --mtp: no draft K/V (snapshots accept null)
-            auto draft_of = [&](size_t k) -> const strata::core::QsaState* { return use_mtp && k + 1 == n_st ? &mtp.kv_state() : nullptr; };
+            const strata::core::QsaState* draft0 = n_st > 0 || !use_local_mtp ? nullptr : &mtp.kv_state();   // no local MTP K/V (snapshots accept null)
+            auto draft_of = [&](size_t k) -> const strata::core::QsaState* { return use_local_mtp && k + 1 == n_st ? &mtp.kv_state() : nullptr; };
             strata::core::ConversationCheckpointSplit cs;
             if (n_st > 0) cs = strata::core::conversation_checkpoints_split(std::move(checks), n_st);   // #752: two-phase; a bad_alloc leaves `checks` whole
             struct MergeBack {
@@ -8621,6 +8833,7 @@ int main(int argc, char** argv) {
         };
         auto checkpoint_at = [&](int64_t L, std::vector<ConvCheckpoint>* parts = nullptr, bool as_tail = false) -> bool {
             ckpt_why.clear();
+            if (layer_stage_mode) return true; // stage reuse keeps one exact live prefix; no local-only checkpoint is reusable remotely
             if (o.prompt_cache <= 0 || L < 1) return true;
             for (ConvCheckpoint& c : checks)
                 if ((int64_t) c.ids.size() == L) {
@@ -8690,12 +8903,15 @@ int main(int argc, char** argv) {
         // come from Q8_1 x Q8_0 MMQ rather than mmvq: drafts may differ, the target's tokens never.
         static const bool split_mtp_batch = strata::program::draft_kv::split_env_on(std::getenv("STRATA_SPLIT_MTP_BATCH"));
         sp.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
+            // The worker's ModelLayerStageExecutor owns remote prompt bookkeeping and MTP lookahead. This normal
+            // request callback captures the coordinator's `cur` prompt and must not run in the persistent worker.
+            if (layer_stage_server) return true;
             std::vector<int32_t> nxt((size_t) T);
             for (int64_t t = 0; t < T; ++t) nxt[(size_t) t] = (int32_t) cur[(size_t) (p0 + t + 1)];
             // E-9: batched through the prompt path when it can (a layer split: only with STRATA_SPLIT_MTP_BATCH=1)
             bool batched = false;
             const strata::program::draft_kv::Plan dkv = strata::program::draft_kv::plan(
-                use_mtp, multi_gpu, split_mtp_batch, strata::core::native_embed() != nullptr);
+                use_local_mtp, multi_gpu, split_mtp_batch, strata::core::native_embed() != nullptr);
             if (dkv.try_batched || dkv.why != nullptr) {
                 strata::prefill::Prefill& dsp = multi_gpu ? stages.back()->sp : sp;   // the drafter's stage
                 const char* why = dkv.why;
@@ -8713,8 +8929,8 @@ int main(int argc, char** argv) {
                     }
                 }
             }
-            if (!e.empty() || (use_mtp && !batched && !mtp.prefill(R_rows, nxt.data(), T, p0, e))) return false;
-            if (use_mtp && std::getenv("STRATA_SNAPSHOT_VERIFY") != nullptr)
+            if (!e.empty() || (use_local_mtp && !batched && !mtp.prefill(R_rows, nxt.data(), T, p0, e))) return false;
+            if (use_local_mtp && std::getenv("STRATA_SNAPSHOT_VERIFY") != nullptr)
                 std::fprintf(stderr, "strata serve: DRAFT_PREFILL path=%s mode=%d cells=%lld\n",
                              batched ? "batched" : "token", mtp.kv_state().kv_mode, (long long) T);
             // progress for the server window: PP <position reached> <prompt tokens> <ms> <fresh tokens/s>
@@ -9678,9 +9894,9 @@ int main(int argc, char** argv) {
         int64_t rounds = 0;
         const int S = o.spec;
         const int S_mtp = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, S) : S;   // the MTP's windows; suffixes go up to S
-        if (use_mtp && S_mtp < S) mtp.set_max_drafts(S_mtp - 1);
+        if (use_local_mtp && S_mtp < S) mtp.set_max_drafts(S_mtp - 1);
         // --pipeline-windows 2 loads the drafter with 8 rows: the serial loop's chain keeps its own length
-        else if (use_mtp && mtp.max_t() > S_mtp) mtp.set_max_drafts(S_mtp - 1);
+        else if (use_local_mtp && mtp.max_t() > S_mtp) mtp.set_max_drafts(S_mtp - 1);
         strata::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
         strata::spec::DraftPolicy policy(S);   // MTP or lookup window, learned over the whole process
         // The vision path (--vision): GENI <max_new> <embeddings file> <id,id,...> carries images.  The file is one
@@ -10457,6 +10673,7 @@ int main(int argc, char** argv) {
                 };
                 strata::core::progress_at(save ? "saving a session" : "restoring a session");
                 if (path.empty()) { refuse("missing path"); continue; }
+                if (layer_stage_mode) { refuse("session files do not support layer-stage RPC"); continue; }
                 if (!stages.empty() || multi_gpu) { refuse("session files do not support --layer-split"); continue; }
                 if (o.peer_device >= 1) { refuse("session files do not support --peer-device"); continue; }
                 if (o.batch > 0) { refuse("session files do not support --batch (parallel requests)"); continue; }
@@ -10923,6 +11140,13 @@ int main(int argc, char** argv) {
                         from_live = false;
                     }
             }
+            const int64_t layer_stage_previous_live =
+                layer_stage_mode && o.layer_stage_reuse && live_ok && want_cvec == cvec_cached
+                    ? (int64_t)live.size() : 0;
+            int64_t layer_stage_common_tokens = 0;
+            while (layer_stage_common_tokens < layer_stage_previous_live && layer_stage_common_tokens < n &&
+                   (int32_t)ids[(size_t)layer_stage_common_tokens] == live[(size_t)layer_stage_common_tokens])
+                ++layer_stage_common_tokens;
             // --batch: an idle slot that holds the start of this prompt (the conversation it served last) is a
             // source too - its sessions are copied back below, so only the new part is read
             int slot_source = -1;
@@ -10958,7 +11182,7 @@ int main(int argc, char** argv) {
             if (incoming) for (size_t i = 0; i < stages.size(); ++i) {
                 const strata::core::OnDevice on(stages[i]->dev);
                 if (!strata::core::conversation_snapshot_validate(incoming->stage_images[i], stages[i]->ss, g,
-                        use_mtp && i + 1 == stages.size() ? &mtp.kv_state() : nullptr, err)) {   // the draft: the last stage's
+                        use_local_mtp && i + 1 == stages.size() ? &mtp.kv_state() : nullptr, err)) {   // the draft: the last stage's
                     std::fprintf(stderr, "strata serve: conversation cache: discard invalid stage snapshot (%s)\n",
                                  err.c_str());
                     incoming.reset();
@@ -10967,7 +11191,7 @@ int main(int argc, char** argv) {
                 }
             }
             if (incoming && !strata::core::conversation_snapshot_validate(*incoming, ss, g,
-                    use_mtp && stages.empty() ? &mtp.kv_state() : nullptr, err)) {
+                    use_local_mtp && stages.empty() ? &mtp.kv_state() : nullptr, err)) {
                 std::fprintf(stderr, "strata serve: conversation cache: discard invalid snapshot (%s)\n", err.c_str());
                 incoming.reset();
                 err.clear();
@@ -11032,7 +11256,7 @@ int main(int argc, char** argv) {
             if (incoming) {
                 const auto t0 = Clock::now();
                 if (strata::core::conversation_snapshot_restore(*incoming, ss, g,
-                        use_mtp && stages.empty() ? &mtp.kv_state() : nullptr, err) !=
+                        use_local_mtp && stages.empty() ? &mtp.kv_state() : nullptr, err) !=
                     strata::core::ConversationRestore::restored) {
                     // Already prevalidated above: a failure here is fatal, never
                     // permission to decode from a partially restored session.
@@ -11042,7 +11266,7 @@ int main(int argc, char** argv) {
                 for (size_t i = 0; i < stages.size(); ++i) {   // the later stages' parts
                     const strata::core::OnDevice on(stages[i]->dev);
                     if (strata::core::conversation_snapshot_restore(incoming->stage_images[i], stages[i]->ss, g,
-                            use_mtp && i + 1 == stages.size() ? &mtp.kv_state() : nullptr, err) !=
+                            use_local_mtp && i + 1 == stages.size() ? &mtp.kv_state() : nullptr, err) !=
                         strata::core::ConversationRestore::restored) {
                         std::printf("ERR restoring parked conversation (stage CUDA%d): %s\n", stages[i]->dev,
                                     err.c_str());
@@ -11050,7 +11274,7 @@ int main(int argc, char** argv) {
                     }
                     if (cudaDeviceSynchronize() != cudaSuccess) { std::printf("ERR stage sync\n"); return 1; }
                 }
-                if (use_mtp && std::getenv("STRATA_SNAPSHOT_VERIFY") != nullptr) {
+                if (use_local_mtp && std::getenv("STRATA_SNAPSHOT_VERIFY") != nullptr) {
                     uint64_t draft_hash = 0;
                     const auto& draft_kv = stages.empty() ? incoming->kv.back() : incoming->stage_images.back().kv.back();
                     const strata::core::OnDevice on_d(stages.empty() ? 0 : stages.back()->dev);
@@ -11156,21 +11380,75 @@ int main(int argc, char** argv) {
                 }
             }
             if (layer_stage_client) {
-                if (resume != 0 || stage_generation == UINT64_MAX) {
-                    std::printf("ERR layer-stage RPC requires a fresh prompt and available session generation\n");
+                if (stage_generation >= UINT64_MAX - 2) {
+                    std::printf("ERR layer-stage session generation is exhausted; restart the coordinator and worker\n");
                     return 1;
                 }
-                ++stage_generation;
-                if (!stage_client.reset(stage_session, stage_generation, 0, err)) {
-                    std::printf("ERR resetting the remote layer-stage session: %s\n", err.c_str());
-                    return 1;
+                bool remote_reused = false;
+                const bool exact_live_resume = o.layer_stage_reuse && from_live && live_ok && !cancelled && !nf_hit &&
+                                               resume == (int64_t)live.size() && resume > 0;
+                if (exact_live_resume) {
+                    ++stage_generation;
+                    const auto prefix = strata::core::layer_stage_prefix_identity(live.data(), live.size());
+                    remote_reused = stage_client.resume(stage_session, stage_generation, resume, prefix, err);
+                    if (!remote_reused) {
+                        const std::string why = err.empty() ? "worker state was unavailable" : err;
+                        err.clear();
+                        ++stage_generation; // a resume acknowledgement may have been lost after the worker advanced
+                        if (!stage_client.reset(stage_session, stage_generation, 0, err)) {
+                            std::printf("ERR resetting the remote layer-stage session after resume refusal (%s): %s\n",
+                                        why.c_str(), err.c_str());
+                            return 1;
+                        }
+                        resume = 0;
+                        from_live = false;
+                        live_ok = false;
+                        live.clear();
+                        checks.clear();
+                        strata::core::session_zero(ss, g, nullptr, main_cs);
+                        if (cudaStreamSynchronize(main_stream) != cudaSuccess) {
+                            std::printf("ERR clearing the coordinator state after remote resume refusal\n");
+                            return 1;
+                        }
+                        std::fprintf(stderr, "strata serve: layer-stage reuse was refused (%s); reset both stages and replay the full prompt\n",
+                                     why.c_str());
+                    }
+                } else {
+                    // The worker cannot import a local checkpoint or resume a divergent prefix. If the ordinary
+                    // conversation planner selected a partial local prefix, discard it here and replay both stages.
+                    if (resume > 0) {
+                        strata::core::session_zero(ss, g, nullptr, main_cs);
+                        if (cudaStreamSynchronize(main_stream) != cudaSuccess) {
+                            std::printf("ERR clearing the coordinator state before layer-stage replay\n");
+                            return 1;
+                        }
+                        resume = 0;
+                        from_live = false;
+                        checks.clear();
+                    }
+                    ++stage_generation;
+                    if (!stage_client.reset(stage_session, stage_generation, 0, err)) {
+                        std::printf("ERR resetting the remote layer-stage session: %s\n", err.c_str());
+                        return 1;
+                    }
+                }
+                if (remote_reused)
+                    std::fprintf(stderr, "strata serve: layer-stage reuse confirmed session=%llu generation=%llu position=%lld\n",
+                                 (unsigned long long)stage_session, (unsigned long long)stage_generation,
+                                 (long long)resume);
+                if (o.layer_stage_reuse) {
+                    const int64_t reused = remote_reused ? resume : 0;
+                    const int64_t replayed = remote_reused ? 0 : layer_stage_common_tokens;
+                    const int64_t fresh = n - (remote_reused ? resume : layer_stage_common_tokens);
+                    std::fprintf(stderr, "strata serve: LAYER_STAGE_REUSE reused_tokens=%lld replayed_tokens=%lld new_tokens=%lld cache=one-active-prefix\n",
+                                 (long long)reused, (long long)replayed, (long long)fresh);
                 }
             }
             // KV streaming: the drafter's ring may hold cells past `resume` from a longer turn; the main layers'
             // host copies and slots are always current (every writer writes both), so they need nothing
-            if (use_mtp && resume > 0 && reread_to <= 0) mtp.kv_restore(resume);
+            if (use_local_mtp && resume > 0 && reread_to <= 0) mtp.kv_restore(resume);
             tr("request", n, geni ? 1 : 0);
-            if (use_mtp) mtp.set_prompt_len(n);
+            if (use_local_mtp) mtp.set_prompt_len(n);
             const int64_t read_from = reread_to > 0 ? 0 : resume;
             conversations.limit_reuse(read_from);
             pp_total = n;
@@ -11366,7 +11644,7 @@ int main(int argc, char** argv) {
                     }();
                     if (logpos != nullptr && !ver.window_logprobs(nxt.data(), T, q, logpos_extra, logpos, e))
                         return false;
-                    if (!ver.commit(T, e) || (use_mtp && !mtp.prefill(ver.final_R_all(), nxt.data(), T, q, e))) return false;
+                    if (!ver.commit(T, e) || (use_local_mtp && !mtp.prefill(ver.final_R_all(), nxt.data(), T, q, e))) return false;
                     q += T;
                     pp_reached = q;   // #471
                     pp_exact = true;
@@ -11646,7 +11924,7 @@ int main(int argc, char** argv) {
             }
             ver.set_sampling(req_sp);
             if (pipe) ver_b.set_sampling(req_sp);   // (reaches the later stage's odd verifier)
-            if (use_mtp) mtp.set_draft_sampling(req_sp);   // STRATA_SPEC_COUPLED=1: sampled drafts (a no-op otherwise)
+            if (use_local_mtp) mtp.set_draft_sampling(req_sp);   // STRATA_SPEC_COUPLED=1: sampled drafts (a no-op otherwise)
             {   // aux_cpus=0|1: where the non-pool, non-host threads run for this request (-1 = the start-up --aux-cpus); moves
                 // threads only.  An enabled placement is swept at every request: it catches threads created since.
                 static const bool aux_start = strata::aux_cpus::enabled();
@@ -11804,7 +12082,8 @@ int main(int argc, char** argv) {
             int64_t p = n - 1;
             int32_t x = (int32_t) ids[(size_t) (n - 1)];
             // (the drafter writes max_t - 1 drafts: 8 rows with --pipeline-windows 2)
-            const size_t DS = (size_t) std::max(S, use_mtp ? mtp.max_t() : 0);
+            const size_t mtp_rows = use_local_mtp ? (size_t)mtp.max_t() : remote_mtp ? (size_t)o.spec : 0;
+            const size_t DS = (size_t) std::max(S, (int)mtp_rows);
             std::vector<int32_t> drafts(DS, 0), window((size_t) S), outv((size_t) S);
             std::vector<float> dprob(DS, 0.0f);
             std::vector<int32_t> sbuf((size_t) S, 0);
@@ -12597,7 +12876,7 @@ int main(int argc, char** argv) {
                 const Clock::time_point tw0 = Clock::now();
                 // STRATA_SPEC_PROB: the MTP drafts' distributions q, judged by rejection sampling (core/spec_prob.hpp);
                 // a suffix window and the lookup chain's tail are point masses and keep the exact-match rule
-                if (use_mtp && mtp.prob() && !from_sfx && T_mtp > 1) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
+                if (use_local_mtp && mtp.prob() && !from_sfx && T_mtp > 1) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
                 if (!ver.run(T, window.data(), p, win_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                     return 1;
@@ -12623,7 +12902,7 @@ int main(int argc, char** argv) {
                 if (chain_n > 0) { ++chain_windows; chain_drafts += chain_n; chain_ok += std::max(0, a - (T_mtp - 1)); }
                 if (!from_sfx && !first_window)
                     for (int d = 0; d < T_mtp - 1 && d < 8 && d <= a; ++d) { ++dp_tested[d]; dp_ok[d] += d < a; }
-                if (strata::core::MtpDrafter::top2_env() && !from_sfx && !first_window && a < T_mtp - 1 && a < 8) {
+                if (use_local_mtp && strata::core::MtpDrafter::top2_env() && !from_sfx && !first_window && a < T_mtp - 1 && a < 8) {
                     ++t2_rej[a];
                     if (mtp.top2(a) == outv[(size_t) a]) ++t2_hit[a];
                 }
@@ -12633,7 +12912,15 @@ int main(int argc, char** argv) {
                 // (--adapt-async 1: the asynchronous tier above instead, ticked before the window)
                 if (!drive.d.usage.empty() && !ajob && ((rounds + 1) % o.adapt_every) == 0)
                     adapt_thr = std::thread([&] { strata::aux_cpus::pin_current_thread(); adapt_ok = adapt(); });
-                if (!ver.commit(a + 1, err)) {
+                bool eos_in_accepted = false;
+                for (int i = 0; i <= a; ++i)
+                    eos_in_accepted = eos_in_accepted ||
+                        std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t)outv[(size_t)i]) != o.eos_ids.end();
+                const bool maxed_after_window = produced_n + (int64_t)a + 1 >= max_new;
+                const bool remote_mtp_draft = remote_mtp && !eos_in_accepted && !maxed_after_window;
+                if (!ver.commit(a + 1, err, remote_mtp_draft, (float)req_spec_min_p,
+                                remote_mtp_draft ? &drafts : nullptr,
+                                remote_mtp_draft ? &dprob : nullptr)) {
                     if (adapt_thr.joinable()) adapt_thr.join();
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
@@ -12667,9 +12954,10 @@ int main(int argc, char** argv) {
                 const Clock::time_point tw2 = Clock::now();
                 // coupled drafts with penalties: the next window's row-0 history (`consumed` holds this window's
                 // commit, outv[a] is its row 0) - the drafts extend it on the device as the verify rows will
-                if (use_mtp && hist_n > 0 && mtp.coupled() && !eos && produced_n < max_new)
+                if (use_local_mtp && hist_n > 0 && mtp.coupled() && !eos && produced_n < max_new)
                     mtp.set_draft_history(consumed.data(), (int64_t) consumed.size(), outv[(size_t) a]);
                 const bool drafted = !use_mtp || eos || produced_n >= max_new ||
+                                     remote_mtp ||
                                      mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p);
                 {
                     const Clock::time_point tw3 = Clock::now();
@@ -12770,6 +13058,11 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: cancelled request keeps its conversation: %lld tokens live\n",
                              (long long) pp_reached);
             }
+            if (layer_stage_mode && o.layer_stage_reuse && cancelled) {
+                // Cancellation may race with a remote verifier/commit acknowledgement. Do not claim that its retained
+                // state has a known prefix; the next request resets both endpoints and replays from token zero.
+                live_ok = false;
+            }
             static const bool state_hash = std::getenv("STRATA_STATE_HASH") != nullptr;
             if (state_hash && !cancelled && o.prompt_cache > 0) {   // every finished request, ckpt=0 too (parity gates)
                 // DEBUG: a fingerprint of every part of the session over the positions it holds ([0, L)), and
@@ -12865,7 +13158,7 @@ int main(int argc, char** argv) {
                     }
                 }
                 uint64_t h_mtp = 1469598103934665603ull;
-                if (use_mtp) {
+                if (use_local_mtp) {
                     const strata::core::QsaState& ms = mtp.kv_state();
                     const int64_t mL = std::min<int64_t>(L, ms.max_cells);
                     for (const auto& [pool, w] : kv_arrays(ms))

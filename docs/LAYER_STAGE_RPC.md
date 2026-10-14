@@ -2,19 +2,21 @@
 
 The optional --layer-stage-client / --layer-stage-server mode splits one native model across two Strata processes.
 The coordinator owns layers 0..K-1; the worker owns K..last, including those layers' recurrent state and KV. The
-coordinator sends FP32 residual rows at prompt-chunk boundaries and verifier-window boundaries. The worker keeps its
-CUDA context, layer weights, expert cache, prefill path, verifier, and session state alive for the life of the process.
-The transport is the bounded native TCP protocol implemented in layer_stage_rpc.cpp; Ray is not in the activation
-data path.
+coordinator sends residual rows at prompt-chunk boundaries and verifier-window boundaries. The activation format is
+negotiated as FP32 (default), BF16, or FP16; token IDs, verifier picks, and MTP drafts remain lossless. The worker
+keeps its CUDA context, layer weights, expert cache, prefill path, verifier, and session state alive for the life of the
+process. The transport is the bounded native TCP protocol implemented in layer_stage_rpc.cpp; Ray is not in the
+activation data path.
 
 This is a prototype for performance and capacity experiments, not a benchmarked speedup. It is deliberately limited
 to one serial text request at a time, a static expert profile, greedy sampling, a native model pack, --spec >= 2,
 and the same explicit fixed --prefill N, model, runtime configuration, and --layer-stage-split K on both PCs. Both
 machines need their own local model files and Strata installation. The worker command is a protocol server, not an
-HTTP generation endpoint. The client remains the API endpoint. Prompt caching and conversation parking are disabled,
-so every request starts at position zero and rereads the complete prompt. MTP, batching, images, per-request sampling,
-penalties, logit bias, cvec overrides, and expert-cache RPC are currently refused. The worker also requires the
-non-finite-logit guard; do not set STRATA_NAN_GUARD=0 on it.
+HTTP generation endpoint. The client remains the API endpoint. Exact-prefix continuation is opt-in; without it,
+every request starts at position zero and rereads the complete prompt. Optional worker-owned native MTP is supported
+for greedy text requests. Batching, images, per-request sampling, penalties, logit bias, cvec overrides, probabilistic
+or coupled draft sampling, and expert-cache RPC are not supported. The worker also requires the non-finite-logit
+guard; do not set STRATA_NAN_GUARD=0 on it.
 
 ## Windows two-PC setup
 
@@ -25,12 +27,12 @@ PowerShell on both PCs for each terminal; use a long random value:
 
     $env:STRATA_RPC_TOKEN = "replace-with-a-long-random-secret"
 
-For the attached Qwen3.8 Flash Next IQ3_XXS setup, this is a complete minimal worker config. Save it on the 5070 Ti as
+For the attached Qwen3.8 Flash Next IQ3_XXS setup, this is a complete baseline worker config. Save it on the 5070 Ti as
 C:\Strata\strata-iq3_xxs-worker.json. Replace paths only if the files live elsewhere; the profile must be the same
 static profile used by the 4090. --prefill 2048 is a fixed chunk shared by both roles. The Ray worker config must not
 put --gpu in its args: Strata would override Ray's CUDA_VISIBLE_DEVICES assignment. With one GPU reserved, the worker
-sees its assigned card as local device zero. The example omits the ordinary
-config's MTP, --spec-min-p, vision, and --kv-resident options because this prototype does not support them. Set
+sees its assigned card as local device zero. The example keeps optional MTP, vision, and --kv-resident settings off.
+Set
 --max-context to the context you intend to test and ensure the selected split fits both GPUs.
 
     {
@@ -63,8 +65,8 @@ while it serves RPC requests.
 
 On the 4090, use the following compatible API config as a starting point. It keeps the host as the API endpoint and
 uses the same model files, fixed prefill chunk, speculative width, context, KV type, profile, and split as the worker.
-Set the address and K to match the worker. Temperature zero is required for the greedy prototype; do not add the
-ordinary config's MTP, --spec-min-p, vision, or conversation reuse settings.
+Set the address and K to match the worker. Temperature zero is required. This baseline keeps optional MTP, reduced
+precision transport, and conversation reuse off.
 
     {
       "exe": "C:\\Strata\\engine\\strata.exe",
@@ -113,14 +115,55 @@ this persistent worker does not use the normal per-request cache loan/refill lif
 experts on the 5070 Ti, but it keeps prompt scratch outside the expert cache. Real-model cache integrity after a
 multi-chunk prefill still needs the validation described below.
 
+## Optional transport, reuse, and MTP features
+
+Add the same options to both roles, then restart both processes:
+
+- `--layer-stage-wire bf16` or `--layer-stage-wire fp16` halves activation bytes on the link versus the FP32 default.
+  BF16 has a wider value range; FP16 can represent smaller values more precisely but rejects overflow. Either format
+  changes activation values and can change model outputs. Start with BF16 on the 1 GbE link and compare tokens against
+  FP32 before relying on it.
+- `--layer-stage-reuse` retains one exact live token prefix at the worker when `--prompt-cache > 0`. A later request
+  reuses it only when the coordinator and worker agree on the full committed token-prefix identity. A mismatch,
+  cancellation, disconnect, or uncertain acknowledgement resets the worker and replays from token zero. This is a
+  single live conversation; checkpoint snapshots and multi-chat parking remain disabled.
+- `--layer-stage-mtp --mtp C:\\Strata-data\\mtp` moves the native MTP drafter to the terminal worker stage. Both PCs
+  need the same MTP directory and MTP options so the connection can verify the model files and draft settings; only
+  the worker loads MTP weights onto the GPU. The worker returns draft tokens and probabilities in the accepted-prefix
+  commit response, so drafting adds no extra network round trip. `--spec-min-p` can cap the draft chain. Both PCs must
+  use greedy sampling. Do not enable `STRATA_SPEC_PROB`, `STRATA_SPEC_COUPLED`, or `--coupled-draft` with remote MTP.
+
+For example, append these matching flags to both the worker and coordinator configs to try reduced wire precision and
+prefix reuse:
+
+    "--layer-stage-wire", "bf16",
+    "--layer-stage-reuse"
+
+To try worker-owned MTP, append these matching flags instead (or combine them with the transport/reuse flags):
+
+    "--mtp", "C:\\Strata-data\\mtp",
+    "--layer-stage-mtp",
+    "--spec-min-p", "0.0"
+
+The MTP directory must exist on both PCs and contain matching files; only the worker uploads its weights to the GPU.
+Any custom draft-vocabulary file must also match. Use `--spec-min-p` values between 0 and 1; a higher threshold can
+shorten the draft chain. These features are independent switches and can be combined, but exact-prefix reuse with MTP
+should be checked with repeated greedy requests before use.
+
+Set `STRATA_LAYER_STAGE_STATS=1` in the coordinator environment to print each RPC operation's transmitted and received
+bytes, elapsed time, cumulative byte totals, and negotiated activation format. These counters help separate network
+time from the worker's compute and prompt work; they do not run a benchmark.
+
 ## What crosses the link
 
-For the reviewed Qwen geometry (n_embd=2560, hc=4), prompt boundaries carry hc*n_embd FP32 values per token:
-40 KiB/token, or 80 MiB for a 2,048-token chunk. The verifier handoff carries (hc*n_embd + n_embd + hc) FP32 values
-per row, 51,216 bytes/row, plus token IDs. The remote suffix computes and retains its own KV; KV tensors are never
-read by the other PC. At 1 GbE, one 80 MiB prefill handoff has a serialization floor around 0.67 seconds at the
-theoretical 125 MB/s, before protocol, copies, waiting, or compute. There is no benchmark yet, and this mode may
-reduce host work or memory pressure while still making prefill slower due to the link.
+For the reviewed Qwen geometry (n_embd=2560, hc=4), prompt boundaries carry hc*n_embd values per token:
+40 KiB/token in FP32 or 20 KiB/token in BF16/FP16, so a 2,048-token chunk is 80 MiB or 40 MiB respectively. The
+verifier handoff carries (hc*n_embd + n_embd + hc) values per row: 51,216 bytes in FP32 or 25,608 bytes in BF16/FP16,
+plus token IDs. The remote suffix computes and retains its own KV; KV tensors are never
+read by the other PC. At 1 GbE, one 80 MiB FP32 prefill handoff has a serialization floor around 0.67 seconds, while
+the 40 MiB BF16/FP16 handoff is about 0.34 seconds, at the theoretical 125 MB/s. Actual time includes protocol, copies,
+waiting, and compute. There is no benchmark yet, and this mode may reduce host work or memory pressure while still
+making prefill slower due to the link.
 
 The smaller existing expert-cache RPC has fewer activation bytes but leaves all model layers and KV on the host. The
 layer-stage mode can also reduce the host's suffix-layer GPU weights, session state, expert cache, and suffix expert

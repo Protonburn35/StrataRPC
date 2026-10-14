@@ -9,10 +9,11 @@ sum per token, reducing return traffic when several remote experts serve one tok
 
 The optional persistent layer-stage path adds `--layer-stage-client`, `--layer-stage-server`, and
 `--layer-stage-split K`. It assigns the remote worker a contiguous suffix of the model, with its own recurrent/KV
-state, and transfers FP32 activations at prompt-chunk and verify-window boundaries. This can reduce host work and
-host-side suffix memory, but sends substantially larger prompt chunks and has no measured speedup yet. It is a separate
-experimental mode with stricter limitations; see [LAYER_STAGE_RPC.md](LAYER_STAGE_RPC.md) for supported settings,
-Windows startup steps, traffic estimates, and validation guidance. The worker uses native TCP; Ray is not required.
+state, and transfers negotiated FP32/BF16/FP16 activations at prompt-chunk and verify-window boundaries. Optional
+exact-prefix reuse and worker-owned native MTP are also available. This can reduce host work and host-side suffix
+memory, but sends substantially larger prompt chunks and has no measured speedup yet. It is a separate experimental
+mode with stricter limitations; see [LAYER_STAGE_RPC.md](LAYER_STAGE_RPC.md) for supported settings, Windows startup
+steps, traffic estimates, and validation guidance. The worker uses native TCP; Ray is not required.
 
 This RPC speaks Strata's expert-kernel protocol. It is not wire-compatible with llama.cpp's ggml RPC backend, which
 serves ggml graph and tensor operations. Strata's expert cache is static for the life of the connection. Both machines

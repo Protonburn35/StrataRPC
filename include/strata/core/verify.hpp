@@ -80,7 +80,8 @@ struct VerifyHits {
 class Verifier {
 public:
     using RemoteStageRun = std::function<bool(int, const int32_t*, int64_t, int32_t*, std::string&)>;
-    using RemoteStageCommit = std::function<bool(int, std::string&)>;
+    using RemoteStageCommit = std::function<bool(int, bool, float, std::vector<int32_t>*, std::vector<float>*,
+                                                 std::string&)>;
     using RemoteStageWait = std::function<bool(std::string&)>;
 
     Verifier() = default;
@@ -188,7 +189,9 @@ public:
     static int64_t handoff_floats(const ModelGeometry& g) { return (int64_t) g.hc * g.n_embd + g.n_embd + g.hc; }
 
     /// Keep the first `n_keep` (1..T) tokens of the last window; advances `ss.ple_prev` by them.
-    bool commit(int n_keep, std::string& err);
+    bool commit(int n_keep, std::string& err, bool remote_mtp_draft = false, float remote_mtp_min_p = 0.0f,
+                std::vector<int32_t>* remote_mtp_tokens = nullptr,
+                std::vector<float>* remote_mtp_probabilities = nullptr);
 
     // ================================ SEVERAL SEQUENCES IN ONE WINDOW ================================
     //

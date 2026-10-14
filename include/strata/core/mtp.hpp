@@ -88,6 +88,9 @@ public:
     /// for the drafter's stream (the caller orders on it: `stream()`).
     bool prefill(const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err,
                  bool sync = true);
+    /// Retain one prompt tail residual until the next token supplies its MTP lookahead ID.
+    bool save_prefill_tail(const float* R_row, std::string& err);
+    const float* prefill_tail() const { return prefill_tail_; }
     /// --pipeline-windows: capture the prefill graphs and size its input records for windows of up to max_t rows now,
     /// so a later prefill(sync = false) of a window neither captures nor allocates (both wait for the device).
     bool prepare_prefill(std::string& err);
@@ -287,6 +290,7 @@ private:
     uint16_t* x_bf16_ = nullptr;
     float* head_logits_ = nullptr;
     float* dummy_inj_ = nullptr;
+    float* prefill_tail_ = nullptr;
     int64_t cap_ = 0, attn_scratch_floats_ = 0;
 };
 

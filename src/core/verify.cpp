@@ -2500,7 +2500,9 @@ bool Verifier::window_logprobs(const int32_t* targets, int T, int64_t pos0, int3
 namespace { bool g_commit_async = false; }
 void Verifier::set_commit_async(bool on) { g_commit_async = on && std::getenv("STRATA_COMMIT_SYNC") == nullptr; }
 
-bool Verifier::commit(int n_keep, std::string& err) {
+bool Verifier::commit(int n_keep, std::string& err, bool remote_mtp_draft, float remote_mtp_min_p,
+                     std::vector<int32_t>* remote_mtp_tokens,
+                     std::vector<float>* remote_mtp_probabilities) {
     const OnDevice on_device(device_);
     if (n_keep < 1 || n_keep > last_t_) { err = "verify: commit count out of range"; return false; }
     const Clock::time_point t0 = Clock::now();
@@ -2532,8 +2534,15 @@ bool Verifier::commit(int n_keep, std::string& err) {
             ss_->ple_prev[1] = last_tokens_[t];
         }
     ms_commit += ms_since(t0);
-    if (next_ != nullptr) return next_->commit(n_keep, err);
-    return remote_stage_commit_ ? remote_stage_commit_(n_keep, err) : true;
+    if (next_ != nullptr)
+        return next_->commit(n_keep, err, remote_mtp_draft, remote_mtp_min_p, remote_mtp_tokens,
+                             remote_mtp_probabilities);
+    if (!remote_stage_commit_) {
+        if (remote_mtp_draft) { err = "verify: remote MTP drafting was requested without a remote layer stage"; return false; }
+        return true;
+    }
+    return remote_stage_commit_(n_keep, remote_mtp_draft, remote_mtp_min_p, remote_mtp_tokens,
+                                remote_mtp_probabilities, err);
 }
 
 bool Verifier::wait_commit(std::string& err) {

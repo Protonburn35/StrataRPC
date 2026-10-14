@@ -1,14 +1,31 @@
 #pragma once
 
+#include "strata/core/layer_stage_codec.hpp"
 #include "strata/core/rpc_transport.hpp"
 
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <string>
 #include <vector>
 
 namespace strata::core {
+
+enum LayerStageCapability : uint32_t {
+    kLayerStageCapabilityBase = 1u,
+    kLayerStageCapabilityReuse = 2u,
+    kLayerStageCapabilityMtp = 4u,
+};
+
+constexpr uint32_t kLayerStageMaxMtpDrafts = 7;
+
+/// Fixed-size reply keeps draft output lossless and makes commit acknowledgement replay deterministic.
+struct LayerStageMtpReply {
+    uint32_t count = 0;
+    std::array<int32_t, kLayerStageMaxMtpDrafts> tokens{};
+    std::array<float, kLayerStageMaxMtpDrafts> probabilities{};
+};
 
 /// Wire-visible identity and limits for one contiguous model stage. Fingerprints are computed by the coordinator from
 /// Strata's existing model/config identity; paths are deliberately absent because the two PCs may store files apart.
@@ -25,7 +42,15 @@ struct LayerStageSpec {
     uint32_t max_verify_rows = 0;
     uint32_t max_prefill_rows = 0;
     uint32_t capabilities = 0;
+    LayerStageWireFormat wire_format = LayerStageWireFormat::fp32;
 };
+
+struct LayerStagePrefixIdentity {
+    uint64_t hash_a = 0, hash_b = 0;
+};
+
+/// Stable identity for the exact committed token prefix, independent of vector capacity or allocator address.
+LayerStagePrefixIdentity layer_stage_prefix_identity(const int32_t* tokens, size_t count);
 
 /// A worker owns its CUDA context, weights, per-layer session state and scratch for the lifetime of this object.
 /// Activation pointers are valid only for the duration of the callback and are never sent as addresses on the wire.
@@ -33,12 +58,14 @@ class LayerStageExecutor {
 public:
     virtual ~LayerStageExecutor() = default;
     virtual bool reset(uint64_t session, uint64_t generation, int64_t position, std::string& err) = 0;
+    virtual bool resume(uint64_t session, uint64_t old_generation, uint64_t new_generation, int64_t position,
+                        std::string& err) = 0;
     virtual bool prefill(uint64_t session, uint64_t generation, uint64_t operation, int64_t position, uint32_t rows,
                          const int64_t* tokens, const float* residual, std::string& err) = 0;
     virtual bool verify(uint64_t session, uint64_t generation, uint64_t operation, int64_t position, uint32_t rows,
                         const int32_t* tokens, const float* handoff, int32_t* picks, std::string& err) = 0;
     virtual bool commit(uint64_t session, uint64_t generation, uint64_t operation, uint32_t keep,
-                        std::string& err) = 0;
+                        bool draft_next, float min_p, LayerStageMtpReply* reply, std::string& err) = 0;
     virtual bool abort(uint64_t session, uint64_t generation, uint64_t operation, std::string& err) = 0;
     virtual bool health(std::string& err) = 0;
 };
@@ -58,15 +85,22 @@ public:
     void set_cancel_flag(const std::atomic<bool>* flag) { cancelled_ = flag; }
     bool connected() const { return socket_ != rpc::kInvalidSocket && !broken_; }
     bool reset(uint64_t session, uint64_t generation, int64_t position, std::string& err);
+    bool resume(uint64_t session, uint64_t generation, int64_t position, LayerStagePrefixIdentity prefix,
+                std::string& err);
     bool prefill(uint64_t session, uint64_t generation, int64_t position, uint32_t rows, const int64_t* tokens,
                  const float* residual, std::string& err);
     bool verify(uint64_t session, uint64_t generation, int64_t position, uint32_t rows, const int32_t* tokens,
                 const float* handoff, int32_t* picks, std::string& err);
-    bool commit(uint64_t session, uint64_t generation, uint32_t keep, std::string& err);
+    bool commit(uint64_t session, uint64_t generation, uint32_t keep, std::string& err) {
+        return commit(session, generation, keep, false, 0.0f, nullptr, err);
+    }
+    bool commit(uint64_t session, uint64_t generation, uint32_t keep, bool draft_next, float min_p,
+                LayerStageMtpReply* reply, std::string& err);
     bool abort(uint64_t session, uint64_t generation, std::string& err);
     bool health(std::string& err);
     uint64_t bytes_sent() const { return bytes_sent_; }
     uint64_t bytes_received() const { return bytes_received_; }
+    LayerStageWireFormat wire_format() const { return spec_.wire_format; }
 
 private:
     bool request(uint16_t type, const uint8_t* metadata, size_t metadata_bytes, const void* body_a,
@@ -79,6 +113,7 @@ private:
     uint64_t next_operation_ = 1;
     uint64_t bytes_sent_ = 0, bytes_received_ = 0;
     bool broken_ = false;
+    std::vector<uint8_t> activation_wire_;
 };
 
 /// One accepted client connection. Reuse the service object after a disconnect to retain the loaded model, but reset
@@ -100,8 +135,10 @@ private:
     std::vector<uint8_t> payload_buffer_;
     std::vector<int64_t> prefill_tokens_;
     std::vector<int32_t> verify_tokens_, verify_picks_;
+    std::vector<float> activation_buffer_;
     uint64_t session_ = 0, generation_ = 0, last_operation_ = 0;
     uint64_t last_request_bytes_ = 0, last_request_hash_a_ = 0, last_request_hash_b_ = 0;
+    std::vector<int32_t> committed_tokens_;
     int64_t position_ = 0;
     uint32_t pending_verify_rows_ = 0;
     uint16_t last_type_ = 0;

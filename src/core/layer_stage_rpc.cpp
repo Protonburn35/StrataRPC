@@ -2,21 +2,29 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstring>
 #include <exception>
 #include <limits>
 #include <utility>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 
 namespace strata::core {
 namespace {
-constexpr uint16_t kVersion = 1;
+constexpr uint16_t kVersion = 3;
 constexpr size_t kHeaderBytes = 24;
 constexpr uint64_t kMaxFrameBytes = 1ull << 31;
 constexpr uint32_t kMaxErrorBytes = 4096;
 constexpr auto kHandshakeTimeout = std::chrono::minutes(10);
 constexpr auto kOperationTimeout = std::chrono::minutes(5);
 
-enum Message : uint16_t { kHello = 1, kReset = 2, kPrefill = 3, kVerify = 4, kCommit = 5, kAbort = 6, kHealth = 7 };
+enum Message : uint16_t {
+    kHello = 1, kReset = 2, kPrefill = 3, kVerify = 4, kCommit = 5, kAbort = 6, kHealth = 7, kResume = 8
+};
+constexpr size_t kMtpReplyBytes = sizeof(uint32_t) + kLayerStageMaxMtpDrafts * sizeof(int32_t) +
+                                  kLayerStageMaxMtpDrafts * sizeof(float);
 
 void put16(uint8_t* p, uint16_t v) {
     p[0] = (uint8_t)v;
@@ -108,19 +116,25 @@ bool activation_float_count(const LayerStageSpec& s, uint32_t rows, bool prefill
 }
 
 bool activation_frame_fits(const LayerStageSpec& s, uint32_t rows, bool prefill) {
-    uint64_t floats = 0, float_bytes = 0, token_bytes = 0;
+    uint64_t floats = 0, activation_bytes = 0, token_bytes = 0;
     const uint64_t token_size = prefill ? sizeof(int64_t) : sizeof(int32_t);
-    constexpr uint64_t metadata_bytes = 36;
-    return activation_float_count(s, rows, prefill, floats) && checked_mul(floats, sizeof(float), float_bytes) &&
+    constexpr uint64_t metadata_bytes = 44;
+    const size_t wire_element_bytes = layer_stage_wire_element_bytes(s.wire_format);
+    return wire_element_bytes != 0 && activation_float_count(s, rows, prefill, floats) &&
+           checked_mul(floats, wire_element_bytes, activation_bytes) &&
            checked_mul(rows, token_size, token_bytes) && metadata_bytes + token_bytes <= kMaxFrameBytes &&
-           float_bytes <= kMaxFrameBytes - metadata_bytes - token_bytes;
+           activation_bytes <= kMaxFrameBytes - metadata_bytes - token_bytes;
 }
 
 bool valid_spec(const LayerStageSpec& s) {
+    constexpr uint32_t known_capabilities = kLayerStageCapabilityBase | kLayerStageCapabilityReuse |
+                                            kLayerStageCapabilityMtp;
     return s.model_fingerprint != 0 && s.config_fingerprint != 0 && s.max_context > 0 &&
            s.max_context <= (uint64_t)std::numeric_limits<int64_t>::max() && s.n_layers > 0 &&
            s.n_embd > 0 && s.n_expert > 0 && s.hc > 0 && s.layer_begin < s.layer_end &&
-           s.layer_end <= s.n_layers && s.max_verify_rows > 0 && s.max_prefill_rows > 0 &&
+           s.layer_end <= s.n_layers && s.max_verify_rows > 0 && s.max_verify_rows <= 8 && s.max_prefill_rows > 0 &&
+           (s.capabilities & kLayerStageCapabilityBase) != 0 && (s.capabilities & ~known_capabilities) == 0 &&
+           layer_stage_wire_element_bytes(s.wire_format) != 0 &&
            activation_frame_fits(s, s.max_verify_rows, false) &&
            activation_frame_fits(s, s.max_prefill_rows, true);
 }
@@ -131,23 +145,93 @@ uint64_t max_operation_payload(const LayerStageSpec& s) {
         !activation_float_count(s, s.max_verify_rows, false, verify_floats)) return 0;
     const uint64_t prefill_tokens = (uint64_t)s.max_prefill_rows * sizeof(int64_t);
     const uint64_t verify_tokens = (uint64_t)s.max_verify_rows * sizeof(int32_t);
-    const uint64_t prefill = 36 + prefill_tokens + prefill_floats * sizeof(float);
-    const uint64_t verify = 36 + verify_tokens + verify_floats * sizeof(float);
-    return std::max<uint64_t>({prefill, verify, 24, 20, 16});
+    const uint64_t wire_bytes = layer_stage_wire_element_bytes(s.wire_format);
+    const uint64_t prefill = 44 + prefill_tokens + prefill_floats * wire_bytes;
+    const uint64_t verify = 44 + verify_tokens + verify_floats * wire_bytes;
+    return std::max<uint64_t>({prefill, verify, 28, 24, 20, 16});
+}
+
+std::vector<uint8_t> encode_mtp_reply(const LayerStageMtpReply& reply) {
+    Writer w;
+    w.u32(reply.count);
+    w.raw(reply.tokens.data(), sizeof(reply.tokens));
+    w.raw(reply.probabilities.data(), sizeof(reply.probabilities));
+    return std::move(w.bytes);
+}
+
+bool decode_mtp_reply(const uint8_t* bytes, size_t count, LayerStageMtpReply& reply, std::string& err) {
+    Reader r{bytes, count, 0};
+    LayerStageMtpReply decoded;
+    if (count != kMtpReplyBytes || !r.u32(decoded.count) || decoded.count > kLayerStageMaxMtpDrafts ||
+        !r.raw(decoded.tokens.data(), sizeof(decoded.tokens)) ||
+        !r.raw(decoded.probabilities.data(), sizeof(decoded.probabilities)) || r.left() != 0) {
+        err = "layer-stage MTP response has an invalid size or draft count";
+        return false;
+    }
+    for (uint32_t i = 0; i < decoded.count; ++i) {
+        if (decoded.tokens[i] < 0 || !std::isfinite(decoded.probabilities[i]) ||
+            decoded.probabilities[i] < 0.0f || decoded.probabilities[i] > 1.0f) {
+            err = "layer-stage MTP response contains an invalid draft token or probability";
+            return false;
+        }
+    }
+    reply = decoded;
+    return true;
+}
+
+bool valid_mtp_reply(const LayerStageMtpReply& reply, uint32_t max_count, std::string& err) {
+    if (reply.count > max_count || reply.count > kLayerStageMaxMtpDrafts) {
+        err = "layer-stage MTP executor returned too many drafts for this window";
+        return false;
+    }
+    for (uint32_t i = 0; i < reply.count; ++i) {
+        if (reply.tokens[i] < 0 || !std::isfinite(reply.probabilities[i]) ||
+            reply.probabilities[i] < 0.0f || reply.probabilities[i] > 1.0f) {
+            err = "layer-stage MTP executor returned an invalid draft token or probability";
+            return false;
+        }
+    }
+    return true;
+}
+
+bool layer_stage_stats_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("STRATA_LAYER_STAGE_STATS");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
+const char* message_name(uint16_t type) {
+    switch (type) {
+        case kReset: return "reset";
+        case kResume: return "resume";
+        case kPrefill: return "prefill";
+        case kVerify: return "verify";
+        case kCommit: return "commit";
+        case kAbort: return "abort";
+        case kHealth: return "health";
+        default: return "unknown";
+    }
 }
 
 void write_spec(Writer& w, const LayerStageSpec& s) {
     w.u64(s.model_fingerprint); w.u64(s.config_fingerprint); w.u64(s.max_context);
     w.u32(s.n_layers); w.u32(s.n_embd); w.u32(s.n_expert); w.u32(s.hc);
     w.u32(s.layer_begin); w.u32(s.layer_end); w.u32(s.max_verify_rows); w.u32(s.max_prefill_rows);
-    w.u32(s.capabilities);
+    w.u32(s.capabilities); w.u32((uint32_t)s.wire_format);
 }
 
 bool read_spec(Reader& r, LayerStageSpec& s) {
     return r.u64(s.model_fingerprint) && r.u64(s.config_fingerprint) && r.u64(s.max_context) &&
            r.u32(s.n_layers) && r.u32(s.n_embd) && r.u32(s.n_expert) && r.u32(s.hc) &&
            r.u32(s.layer_begin) && r.u32(s.layer_end) && r.u32(s.max_verify_rows) &&
-           r.u32(s.max_prefill_rows) && r.u32(s.capabilities);
+           r.u32(s.max_prefill_rows) && r.u32(s.capabilities) && [&] {
+               uint32_t format = 0;
+               if (!r.u32(format) || format > (uint32_t)LayerStageWireFormat::fp16) return false;
+               s.wire_format = (LayerStageWireFormat)format;
+               return true;
+           }();
 }
 
 bool same_spec(const LayerStageSpec& a, const LayerStageSpec& b) {
@@ -155,7 +239,8 @@ bool same_spec(const LayerStageSpec& a, const LayerStageSpec& b) {
            a.max_context == b.max_context && a.n_layers == b.n_layers && a.n_embd == b.n_embd &&
            a.n_expert == b.n_expert && a.hc == b.hc && a.layer_begin == b.layer_begin &&
            a.layer_end == b.layer_end && a.max_verify_rows == b.max_verify_rows &&
-           a.max_prefill_rows == b.max_prefill_rows && a.capabilities == b.capabilities;
+           a.max_prefill_rows == b.max_prefill_rows && a.capabilities == b.capabilities &&
+           a.wire_format == b.wire_format;
 }
 
 bool make_header(uint16_t type, uint64_t operation, uint64_t payload_bytes, std::array<uint8_t, kHeaderBytes>& h,
@@ -185,8 +270,12 @@ bool receive_header(rpc::Socket socket, uint16_t& type, uint64_t& operation, uin
                     const rpc::IoDeadline& deadline, std::string& err) {
     std::array<uint8_t, kHeaderBytes> h{};
     if (!rpc::recv_all(socket, h.data(), h.size(), deadline, err)) return false;
-    if (std::memcmp(h.data(), "STGE", 4) != 0 || get16(h.data() + 4) != kVersion) {
-        err = "layer-stage frame has invalid magic or version";
+    if (std::memcmp(h.data(), "STGE", 4) != 0) {
+        err = "layer-stage frame has invalid magic";
+        return false;
+    }
+    if (get16(h.data() + 4) != kVersion) {
+        err = "incompatible layer-stage protocol version; update both PCs to the same release";
         return false;
     }
     type = get16(h.data() + 6); operation = get64(h.data() + 8); payload_bytes = get64(h.data() + 16);
@@ -293,7 +382,157 @@ bool checked_bytes(uint64_t n, size_t element, size_t& bytes) {
     return true;
 }
 
+uint16_t float_to_bf16(float x) {
+    uint32_t bits = 0;
+    std::memcpy(&bits, &x, sizeof(bits));
+    const uint32_t tie_to_even = 0x7fffu + ((bits >> 16) & 1u);
+    return (uint16_t)((bits + tie_to_even) >> 16);
+}
+
+float bf16_to_float(uint16_t x) {
+    const uint32_t bits = (uint32_t)x << 16;
+    float result = 0.0f;
+    std::memcpy(&result, &bits, sizeof(result));
+    return result;
+}
+
+bool float_to_fp16(float x, uint16_t& out) {
+    if (!std::isfinite(x) || std::fabs(x) > 65504.0f) return false;
+    uint32_t bits = 0;
+    std::memcpy(&bits, &x, sizeof(bits));
+    const uint16_t sign = (uint16_t)((bits >> 16) & 0x8000u);
+    const uint32_t exponent = (bits >> 23) & 0xffu;
+    const uint32_t mantissa = bits & 0x7fffffu;
+    if (exponent == 0) { out = sign; return true; } // FP32 subnormals round below the FP16 subnormal range.
+    int e = (int)exponent - 127;
+    if (e > 15) return false;
+    if (e >= -14) {
+        uint32_t rounded = mantissa + 0xfffu + ((mantissa >> 13) & 1u);
+        int half_e = e + 15;
+        if ((rounded & 0x800000u) != 0) { rounded = 0; ++half_e; }
+        if (half_e >= 31) return false;
+        out = (uint16_t)(sign | ((uint16_t)half_e << 10) | (uint16_t)(rounded >> 13));
+        return true;
+    }
+    if (e < -25) { out = sign; return true; }
+    const uint32_t significand = 0x800000u | mantissa;
+    const unsigned shift = (unsigned)(-e - 1);
+    const uint32_t truncated = significand >> shift;
+    const uint32_t mask = (1u << shift) - 1u;
+    const uint32_t remainder = significand & mask;
+    const uint32_t halfway = 1u << (shift - 1u);
+    const uint32_t rounded = truncated + (remainder > halfway || (remainder == halfway && (truncated & 1u)));
+    out = (uint16_t)(sign | (uint16_t)rounded);
+    return true;
+}
+
+float fp16_to_float(uint16_t x) {
+    const bool negative = (x & 0x8000u) != 0;
+    const uint32_t exponent = (x >> 10) & 0x1fu;
+    const uint32_t mantissa = x & 0x3ffu;
+    float value = exponent == 0 ? std::ldexp((float)mantissa, -24)
+                 : std::ldexp(1.0f + (float)mantissa / 1024.0f, (int)exponent - 15);
+    return negative ? -value : value;
+}
+
+uint16_t get16le(const uint8_t* p) { return (uint16_t)p[0] | (uint16_t)((uint16_t)p[1] << 8); }
+void put16le(uint8_t* p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
+
 } // namespace
+
+LayerStagePrefixIdentity layer_stage_prefix_identity(const int32_t* tokens, size_t count) {
+    LayerStagePrefixIdentity identity{1469598103934665603ull, 0x9e3779b97f4a7c15ull};
+    for (size_t i = 0; i < count; ++i) {
+        const uint32_t value = (uint32_t)tokens[i];
+        for (unsigned shift = 0; shift < 32; shift += 8) {
+            const uint64_t byte = (value >> shift) & 0xffu;
+            identity.hash_a = (identity.hash_a ^ byte) * 1099511628211ull;
+            identity.hash_b ^= byte + 0x517cc1b727220a95ull + (identity.hash_b << 6) + (identity.hash_b >> 2);
+            identity.hash_b = (identity.hash_b ^ (identity.hash_b >> 29)) * 0xbf58476d1ce4e5b9ull;
+        }
+    }
+    identity.hash_a ^= (uint64_t)count;
+    identity.hash_b ^= (uint64_t)count + 0x94d049bb133111ebull;
+    identity.hash_b = (identity.hash_b ^ (identity.hash_b >> 30)) * 0xbf58476d1ce4e5b9ull;
+    identity.hash_b = (identity.hash_b ^ (identity.hash_b >> 27)) * 0x94d049bb133111ebull;
+    identity.hash_b ^= identity.hash_b >> 31;
+    return identity;
+}
+
+bool layer_stage_encode_activations(LayerStageWireFormat format, const float* src, size_t count,
+                                    std::vector<uint8_t>& dst, std::string& err) {
+    const size_t element_bytes = layer_stage_wire_element_bytes(format);
+    if (element_bytes == 0 || (count != 0 && src == nullptr) || count > std::numeric_limits<size_t>::max() / element_bytes) {
+        err = "layer-stage activation encoder received an invalid format, pointer, or element count";
+        dst.clear();
+        return false;
+    }
+    dst.resize(count * element_bytes);
+    if (format == LayerStageWireFormat::fp32) {
+        for (size_t i = 0; i < count; ++i) if (!std::isfinite(src[i])) {
+            err = "layer-stage FP32 activation contains a non-finite value";
+            dst.clear();
+            return false;
+        }
+        if (!dst.empty()) std::memcpy(dst.data(), src, dst.size());
+        return true;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        uint16_t encoded = 0;
+        if (!std::isfinite(src[i])) {
+            err = "layer-stage activation contains a non-finite value";
+            dst.clear();
+            return false;
+        }
+        if (format == LayerStageWireFormat::bf16) {
+            encoded = float_to_bf16(src[i]);
+            if ((encoded & 0x7f80u) == 0x7f80u) {
+                err = "layer-stage BF16 activation overflows to a non-finite value";
+                dst.clear();
+                return false;
+            }
+        } else if (!float_to_fp16(src[i], encoded)) {
+            err = "layer-stage FP16 activation is non-finite or exceeds the finite range 65504";
+            dst.clear();
+            return false;
+        }
+        put16le(dst.data() + i * 2, encoded);
+    }
+    return true;
+}
+
+bool layer_stage_decode_activations(LayerStageWireFormat format, const uint8_t* src, size_t bytes,
+                                    float* dst, size_t count, std::string& err) {
+    const size_t element_bytes = layer_stage_wire_element_bytes(format);
+    if (element_bytes == 0 || count > std::numeric_limits<size_t>::max() / element_bytes ||
+        bytes != count * element_bytes || (bytes != 0 && src == nullptr) || (count != 0 && dst == nullptr)) {
+        err = "layer-stage activation payload has a mismatched format, byte count, or pointer";
+        return false;
+    }
+    if (format == LayerStageWireFormat::fp32) {
+        for (size_t i = 0; i < count; ++i) {
+            float value = 0.0f;
+            std::memcpy(&value, src + i * sizeof(float), sizeof(value));
+            if (!std::isfinite(value)) { err = "layer-stage FP32 activation contains a non-finite value"; return false; }
+        }
+        if (bytes != 0) std::memcpy(dst, src, bytes);
+        return true;
+    }
+    // Validate first so a malformed tail cannot be partially accepted by a caller that reuses its destination buffer.
+    for (size_t i = 0; i < count; ++i) {
+        const uint16_t encoded = get16le(src + i * 2);
+        if ((format == LayerStageWireFormat::bf16 && (encoded & 0x7f80u) == 0x7f80u) ||
+            (format == LayerStageWireFormat::fp16 && (encoded & 0x7c00u) == 0x7c00u)) {
+            err = "layer-stage reduced-precision activation payload contains a non-finite value";
+            return false;
+        }
+    }
+    for (size_t i = 0; i < count; ++i) {
+        const uint16_t encoded = get16le(src + i * 2);
+        dst[i] = format == LayerStageWireFormat::bf16 ? bf16_to_float(encoded) : fp16_to_float(encoded);
+    }
+    return true;
+}
 
 LayerStageClient::~LayerStageClient() { close(); }
 
@@ -347,6 +586,7 @@ bool LayerStageClient::request(uint16_t type, const uint8_t* metadata, size_t me
                                size_t response_bytes, std::string& err) {
     if (!connected()) { err = "layer-stage RPC is disconnected or was invalidated"; return false; }
     const bool health_req = type == kHealth;
+    const auto request_started = std::chrono::steady_clock::now();
     const uint64_t operation = health_req ? 0 : next_operation_;
     const auto deadline = rpc::deadline_after(health_req ? std::chrono::seconds(5) : kOperationTimeout, cancelled_);
     if (metadata_bytes > kMaxFrameBytes || body_a_bytes > kMaxFrameBytes - metadata_bytes ||
@@ -392,6 +632,18 @@ bool LayerStageClient::request(uint16_t type, const uint8_t* metadata, size_t me
     }
     if (parsed == ParsedResponse::rejected) return false;   // a valid rejection is recoverable on this connection
     if (!health_req) ++next_operation_;
+    if (layer_stage_stats_enabled()) {
+        const double elapsed_ms = std::chrono::duration<double, std::milli>(
+                                      std::chrono::steady_clock::now() - request_started).count();
+        std::fprintf(stderr,
+                     "strata layer-stage RPC stats: %s op=%llu tx=%llu B rx=%llu B elapsed=%.2f ms cumulative_tx=%llu B cumulative_rx=%llu B wire=%s\n",
+                     message_name(type), (unsigned long long)operation,
+                     (unsigned long long)(kHeaderBytes + payload_bytes),
+                     (unsigned long long)(kHeaderBytes + response_payload_bytes), elapsed_ms,
+                     (unsigned long long)bytes_sent_, (unsigned long long)bytes_received_,
+                     spec_.wire_format == LayerStageWireFormat::fp32 ? "fp32" :
+                     spec_.wire_format == LayerStageWireFormat::bf16 ? "bf16" : "fp16");
+    }
     return true;
 }
 
@@ -410,6 +662,16 @@ bool LayerStageClient::reset(uint64_t session, uint64_t generation, int64_t posi
     return request(kReset, m.bytes.data(), m.bytes.size(), nullptr, 0, nullptr, 0, nullptr, 0, err);
 }
 
+bool LayerStageClient::resume(uint64_t session, uint64_t generation, int64_t position,
+                              LayerStagePrefixIdentity prefix, std::string& err) {
+    if (!connected()) {
+        err = "layer-stage resume requires the existing worker connection; replay from token zero after reconnect";
+        return false;
+    }
+    Writer m; m.u64(session); m.u64(generation); m.i64(position); m.u64(prefix.hash_a); m.u64(prefix.hash_b);
+    return request(kResume, m.bytes.data(), m.bytes.size(), nullptr, 0, nullptr, 0, nullptr, 0, err);
+}
+
 bool LayerStageClient::prefill(uint64_t session, uint64_t generation, int64_t position, uint32_t rows,
                                const int64_t* tokens, const float* residual, std::string& err) {
     if (rows == 0 || rows > spec_.max_prefill_rows || tokens == nullptr || residual == nullptr) {
@@ -421,13 +683,24 @@ bool LayerStageClient::prefill(uint64_t session, uint64_t generation, int64_t po
         err = "layer-stage prefill shape overflows the protocol range";
         return false;
     }
-    size_t token_bytes = 0, residual_bytes = 0;
-    if (!checked_bytes(rows, sizeof(int64_t), token_bytes) || !checked_bytes(floats, sizeof(float), residual_bytes)) {
+    size_t token_bytes = 0, activation_bytes = 0;
+    if (!checked_bytes(rows, sizeof(int64_t), token_bytes) ||
+        !checked_bytes(floats, layer_stage_wire_element_bytes(spec_.wire_format), activation_bytes)) {
         err = "layer-stage prefill size overflows this host";
         return false;
     }
-    Writer m; m.u64(session); m.u64(generation); m.i64(position); m.u32(rows); m.u64(floats);
-    return request(kPrefill, m.bytes.data(), m.bytes.size(), tokens, token_bytes, residual, residual_bytes,
+    const void* activation_body = residual;
+    if (spec_.wire_format == LayerStageWireFormat::fp32) {
+        for (uint64_t i = 0; i < floats; ++i) if (!std::isfinite(residual[i])) {
+            err = "layer-stage FP32 prefill activation contains a non-finite value";
+            return false;
+        }
+    } else {
+        if (!layer_stage_encode_activations(spec_.wire_format, residual, (size_t)floats, activation_wire_, err)) return false;
+        activation_body = activation_wire_.data();
+    }
+    Writer m; m.u64(session); m.u64(generation); m.i64(position); m.u32(rows); m.u64(floats); m.u64(activation_bytes);
+    return request(kPrefill, m.bytes.data(), m.bytes.size(), tokens, token_bytes, activation_body, activation_bytes,
                    nullptr, 0, err);
 }
 
@@ -442,20 +715,44 @@ bool LayerStageClient::verify(uint64_t session, uint64_t generation, int64_t pos
         err = "layer-stage verify shape overflows the protocol range";
         return false;
     }
-    size_t token_bytes = 0, handoff_bytes = 0, pick_bytes = 0;
-    if (!checked_bytes(rows, sizeof(int32_t), token_bytes) || !checked_bytes(floats, sizeof(float), handoff_bytes) ||
+    size_t token_bytes = 0, activation_bytes = 0, pick_bytes = 0;
+    if (!checked_bytes(rows, sizeof(int32_t), token_bytes) ||
+        !checked_bytes(floats, layer_stage_wire_element_bytes(spec_.wire_format), activation_bytes) ||
         !checked_bytes(rows, sizeof(int32_t), pick_bytes)) {
         err = "layer-stage verify size overflows this host";
         return false;
     }
-    Writer m; m.u64(session); m.u64(generation); m.i64(position); m.u32(rows); m.u64(floats);
-    return request(kVerify, m.bytes.data(), m.bytes.size(), tokens, token_bytes, handoff, handoff_bytes,
+    const void* activation_body = handoff;
+    if (spec_.wire_format == LayerStageWireFormat::fp32) {
+        for (uint64_t i = 0; i < floats; ++i) if (!std::isfinite(handoff[i])) {
+            err = "layer-stage FP32 verifier activation contains a non-finite value";
+            return false;
+        }
+    } else {
+        if (!layer_stage_encode_activations(spec_.wire_format, handoff, (size_t)floats, activation_wire_, err)) return false;
+        activation_body = activation_wire_.data();
+    }
+    Writer m; m.u64(session); m.u64(generation); m.i64(position); m.u32(rows); m.u64(floats); m.u64(activation_bytes);
+    return request(kVerify, m.bytes.data(), m.bytes.size(), tokens, token_bytes, activation_body, activation_bytes,
                    picks, pick_bytes, err);
 }
 
-bool LayerStageClient::commit(uint64_t session, uint64_t generation, uint32_t keep, std::string& err) {
-    Writer m; m.u64(session); m.u64(generation); m.u32(keep);
-    return request(kCommit, m.bytes.data(), m.bytes.size(), nullptr, 0, nullptr, 0, nullptr, 0, err);
+bool LayerStageClient::commit(uint64_t session, uint64_t generation, uint32_t keep, bool draft_next, float min_p,
+                              LayerStageMtpReply* reply, std::string& err) {
+    const bool mtp_enabled = (spec_.capabilities & kLayerStageCapabilityMtp) != 0;
+    if (mtp_enabled != (reply != nullptr) || (draft_next && !mtp_enabled) || !std::isfinite(min_p) ||
+        min_p < 0.0f || min_p > 1.0f) {
+        err = "layer-stage commit MTP response does not match the negotiated capability or minimum probability";
+        return false;
+    }
+    uint32_t min_p_bits = 0;
+    std::memcpy(&min_p_bits, &min_p, sizeof(min_p_bits));
+    Writer m; m.u64(session); m.u64(generation); m.u32(keep); m.u32(draft_next ? 1u : 0u); m.u32(min_p_bits);
+    std::array<uint8_t, kMtpReplyBytes> body{};
+    if (!request(kCommit, m.bytes.data(), m.bytes.size(), nullptr, 0, nullptr, 0,
+                 mtp_enabled ? body.data() : nullptr, mtp_enabled ? body.size() : 0, err)) return false;
+    if (mtp_enabled) return decode_mtp_reply(body.data(), body.size(), *reply, err);
+    return true;
 }
 
 bool LayerStageClient::abort(uint64_t session, uint64_t generation, std::string& err) {
@@ -478,7 +775,7 @@ bool LayerStageServer::dispatch(uint16_t type, uint64_t operation, const uint8_t
     uint64_t session = 0, generation = 0;
     int64_t position = 0;
     uint32_t rows = 0, keep = 0;
-    uint64_t float_count = 0;
+    uint64_t float_count = 0, activation_bytes = 0;
     auto fail = [&](const std::string& why) { err = why; response = response_payload(false, why); return true; };
     if (type == kHealth) {
         if (operation != 0 || payload_bytes != 0) return fail("layer-stage health frame is invalid");
@@ -503,18 +800,37 @@ bool LayerStageServer::dispatch(uint16_t type, uint64_t operation, const uint8_t
             return fail("layer-stage reset generation is not newer than the current session");
         const bool ok = executor_.reset(session, generation, position, err);
         response = response_payload(ok, ok ? std::string() : err);
-        if (!ok) { session_valid_ = false; return true; }
+        if (!ok) { session_valid_ = false; pending_verify_rows_ = 0; committed_tokens_.clear(); return true; }
         session_ = session; generation_ = generation; last_operation_ = operation; last_type_ = type;
         last_request_bytes_ = request.bytes; last_request_hash_a_ = request.a; last_request_hash_b_ = request.b;
-        position_ = position; pending_verify_rows_ = 0;
+        position_ = position; pending_verify_rows_ = 0; committed_tokens_.clear();
         last_response_ = response; session_valid_ = true;
+        return true;
+    }
+    if (type == kResume) {
+        uint64_t hash_a = 0, hash_b = 0;
+        if (!session_valid_ || session != session_ || generation <= generation_ || operation != last_operation_ + 1 ||
+            !r.i64(position) || !r.u64(hash_a) || !r.u64(hash_b) || r.left() != 0 || position < 0 ||
+            position != position_ || pending_verify_rows_ != 0 || (uint64_t)position > spec_.max_context ||
+            committed_tokens_.size() != (size_t)position)
+            return fail("layer-stage resume requires the exact committed position with no verification window pending");
+        const LayerStagePrefixIdentity actual = layer_stage_prefix_identity(committed_tokens_.data(), committed_tokens_.size());
+        if (actual.hash_a != hash_a || actual.hash_b != hash_b)
+            return fail("layer-stage resume token-prefix identity differs; reset and replay the full prompt");
+        if (!executor_.resume(session, generation_, generation, position, err))
+            return fail(err.empty() ? "layer-stage worker refused the resume state" : err);
+        generation_ = generation;
+        response = response_payload(true, std::string());
+        last_operation_ = operation; last_type_ = type; last_response_ = response;
+        last_request_bytes_ = request.bytes; last_request_hash_a_ = request.a; last_request_hash_b_ = request.b;
         return true;
     }
     if (!session_valid_ || session != session_ || generation != generation_ || operation != last_operation_ + 1)
         return fail("layer-stage session is absent, stale, or out of operation order; reset and replay the prompt");
     bool ok = false;
     if (type == kPrefill || type == kVerify) {
-        if (!r.i64(position) || !r.u32(rows) || !r.u64(float_count)) return fail("layer-stage activation metadata is truncated");
+        if (!r.i64(position) || !r.u32(rows) || !r.u64(float_count) || !r.u64(activation_bytes))
+            return fail("layer-stage activation metadata is truncated");
         const bool prefill = type == kPrefill;
         const uint32_t max_rows = prefill ? spec_.max_prefill_rows : spec_.max_verify_rows;
         uint64_t expected_floats = 0;
@@ -528,25 +844,61 @@ bool LayerStageServer::dispatch(uint16_t type, uint64_t operation, const uint8_t
             return fail("layer-stage prefill or verifier window is out of recurrent order");
         const uint64_t token_count = rows;
         const size_t token_size = prefill ? sizeof(int64_t) : sizeof(int32_t);
-        size_t token_bytes = 0, float_bytes = 0;
-        if (!checked_bytes(token_count, token_size, token_bytes) || !checked_bytes(float_count, sizeof(float), float_bytes) ||
-            token_bytes > r.left() || float_bytes != r.left() - token_bytes)
+        size_t token_bytes = 0, expected_activation_bytes = 0;
+        const size_t element_bytes = layer_stage_wire_element_bytes(spec_.wire_format);
+        if (!checked_bytes(token_count, token_size, token_bytes) ||
+            !checked_bytes(float_count, element_bytes, expected_activation_bytes) ||
+            activation_bytes != expected_activation_bytes || token_bytes > r.left() ||
+            expected_activation_bytes != r.left() - token_bytes)
             return fail("layer-stage activation frame has an invalid byte count");
+        const uint8_t* activation_wire = nullptr;
+        const float* activation = nullptr;
         if (prefill) {
             prefill_tokens_.resize(rows);
-            if (!r.raw(prefill_tokens_.data(), token_bytes) || r.left() != float_bytes ||
-                ((uintptr_t)r.remaining() % alignof(float)) != 0)
+            if (!r.raw(prefill_tokens_.data(), token_bytes) || r.left() != expected_activation_bytes)
                 return fail("layer-stage prefill frame is truncated");
-            ok = executor_.prefill(session, generation, operation, position, rows, prefill_tokens_.data(),
-                                   (const float*)r.remaining(), err);
-            if (ok) position_ += rows;
+            for (uint32_t i = 0; i < rows; ++i)
+                if (prefill_tokens_[i] < 0 || prefill_tokens_[i] > std::numeric_limits<int32_t>::max())
+                    return fail("layer-stage prefill contains a token ID outside the committed-prefix range");
+            activation_wire = r.remaining();
+            if (spec_.wire_format == LayerStageWireFormat::fp32) {
+                if (((uintptr_t)activation_wire % alignof(float)) != 0)
+                    return fail("layer-stage FP32 prefill activation is misaligned");
+                activation = (const float*)activation_wire;
+                for (uint64_t i = 0; i < float_count; ++i) if (!std::isfinite(activation[i]))
+                    return fail("layer-stage FP32 prefill activation contains a non-finite value");
+            } else {
+                activation_buffer_.resize((size_t)float_count);
+                if (!layer_stage_decode_activations(spec_.wire_format, activation_wire, expected_activation_bytes,
+                                                     activation_buffer_.data(), activation_buffer_.size(), err))
+                    return fail(err);
+                activation = activation_buffer_.data();
+            }
+            ok = executor_.prefill(session, generation, operation, position, rows, prefill_tokens_.data(), activation, err);
+            if (ok) {
+                for (int64_t token : prefill_tokens_) committed_tokens_.push_back((int32_t)token);
+                position_ += rows;
+            }
         } else {
             verify_tokens_.resize(rows); verify_picks_.resize(rows);
-            if (!r.raw(verify_tokens_.data(), token_bytes) || r.left() != float_bytes ||
-                ((uintptr_t)r.remaining() % alignof(float)) != 0)
+            if (!r.raw(verify_tokens_.data(), token_bytes) || r.left() != expected_activation_bytes)
                 return fail("layer-stage verify frame is truncated");
-            ok = executor_.verify(session, generation, operation, position, rows, verify_tokens_.data(),
-                                  (const float*)r.remaining(), verify_picks_.data(), err);
+            activation_wire = r.remaining();
+            if (spec_.wire_format == LayerStageWireFormat::fp32) {
+                if (((uintptr_t)activation_wire % alignof(float)) != 0)
+                    return fail("layer-stage FP32 verifier activation is misaligned");
+                activation = (const float*)activation_wire;
+                for (uint64_t i = 0; i < float_count; ++i) if (!std::isfinite(activation[i]))
+                    return fail("layer-stage FP32 verifier activation contains a non-finite value");
+            } else {
+                activation_buffer_.resize((size_t)float_count);
+                if (!layer_stage_decode_activations(spec_.wire_format, activation_wire, expected_activation_bytes,
+                                                     activation_buffer_.data(), activation_buffer_.size(), err))
+                    return fail(err);
+                activation = activation_buffer_.data();
+            }
+            ok = executor_.verify(session, generation, operation, position, rows, verify_tokens_.data(), activation,
+                                  verify_picks_.data(), err);
             if (ok) {
                 pending_verify_rows_ = rows;
                 response = response_payload(true, std::string(), verify_picks_.data(),
@@ -554,21 +906,41 @@ bool LayerStageServer::dispatch(uint16_t type, uint64_t operation, const uint8_t
             }
         }
     } else if (type == kCommit) {
-        if (!r.u32(keep) || r.left() != 0 || keep == 0 || keep > pending_verify_rows_ ||
+        uint32_t draft_next_u32 = 0, min_p_bits = 0;
+        if (!r.u32(keep) || !r.u32(draft_next_u32) || !r.u32(min_p_bits) || r.left() != 0 ||
+            draft_next_u32 > 1 || keep == 0 || keep > pending_verify_rows_ ||
             keep > spec_.max_verify_rows || (uint64_t)position_ + keep > spec_.max_context)
             return fail("layer-stage accepted-prefix commit is invalid");
-        ok = executor_.commit(session, generation, operation, keep, err);
-        if (ok) { position_ += keep; pending_verify_rows_ = 0; }
+        const bool mtp_enabled = (spec_.capabilities & kLayerStageCapabilityMtp) != 0;
+        const bool draft_next = draft_next_u32 != 0;
+        float min_p = 0.0f;
+        std::memcpy(&min_p, &min_p_bits, sizeof(min_p));
+        if ((draft_next && !mtp_enabled) || !std::isfinite(min_p) || min_p < 0.0f || min_p > 1.0f)
+            return fail("layer-stage accepted-prefix commit has unsupported MTP fields");
+        LayerStageMtpReply mtp_reply;
+        ok = executor_.commit(session, generation, operation, keep, draft_next, min_p,
+                              mtp_enabled ? &mtp_reply : nullptr, err);
+        if (ok && mtp_enabled && !valid_mtp_reply(mtp_reply, draft_next ? pending_verify_rows_ - 1 : 0, err))
+            ok = false;
+        if (ok) {
+            for (uint32_t i = 0; i < keep; ++i) committed_tokens_.push_back(verify_tokens_[i]);
+            position_ += keep; pending_verify_rows_ = 0;
+            if (mtp_enabled) {
+                const std::vector<uint8_t> body = encode_mtp_reply(mtp_reply);
+                response = response_payload(true, std::string(), body.data(), body.size());
+            }
+        }
     } else if (type == kAbort) {
         if (r.left() != 0) return fail("layer-stage abort frame has unexpected data");
         ok = executor_.abort(session, generation, operation, err);
-        session_valid_ = false; pending_verify_rows_ = 0;
+        session_valid_ = false; pending_verify_rows_ = 0; committed_tokens_.clear();
     } else {
         return fail("layer-stage worker received an unknown operation");
     }
     if (!ok) {
         session_valid_ = false;
         pending_verify_rows_ = 0;
+        committed_tokens_.clear();
         response = response_payload(false, err.empty() ? "layer-stage operation failed" : err);
         return true;
     }
@@ -620,7 +992,9 @@ bool LayerStageServer::serve(rpc::Socket client, std::string& err) {
     const std::string token((const char*)hello.remaining(), token_bytes);
     if (token != token_) { err = "layer-stage authentication failed"; rpc::close(client); return false; }
     if (!valid_spec(actual) || !same_spec(actual, spec_)) {
-        err = "layer-stage model, config, geometry, layer range, or capability differs from the worker";
+        err = actual.wire_format != spec_.wire_format || actual.capabilities != spec_.capabilities
+                  ? "layer-stage wire format or enabled feature flags differ; use matching --layer-stage-* options on both PCs"
+                  : "layer-stage model, config, geometry, or layer range differs from the worker";
         rpc::close(client); return false;
     }
     const auto ack = response_payload(true, std::string());
@@ -635,7 +1009,7 @@ bool LayerStageServer::serve(rpc::Socket client, std::string& err) {
             if (!disconnected) close_error = err;
             break;
         }
-        if (type < kReset || type > kHealth || op_bytes > max_operation_payload(spec_)) {
+        if (type < kReset || type > kResume || op_bytes > max_operation_payload(spec_)) {
             err = "layer-stage worker received an invalid operation frame";
             break;
         }
@@ -663,6 +1037,7 @@ bool LayerStageServer::serve(rpc::Socket client, std::string& err) {
         std::string ignored;
         (void)executor_.abort(session_, generation_, last_operation_ + 1, ignored);
         session_valid_ = false; pending_verify_rows_ = 0;
+        committed_tokens_.clear();
     }
     if (close_error.empty() && err == "RPC connection closed") { err.clear(); return true; }
     if (err.empty()) err = close_error.empty() ? "layer-stage connection ended" : close_error;
