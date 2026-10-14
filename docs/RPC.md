@@ -17,6 +17,11 @@ install is convenient but its dense weights, PLE data, and MTP files are not use
 At connection setup the peers compare per-layer expert blob sizes and hashes of up to eight sampled cached experts;
 that catches a wrong pack quickly but is not a cryptographic proof that every expert matches.
 
+The connect attempt is bounded to five seconds. Model/cache initialization I/O has a ten-minute total deadline, while
+each inference request has a 60-second total I/O deadline shared by its partial reads and writes. The host also polls
+the current request's cancellation flag while waiting on the socket. A timeout, cancellation, disconnect, truncated
+frame, or invalid response closes the connection and fails the request; that socket is not reused for a later frame.
+
 ## Start the server
 
 On the 5070 Ti machine, set the same private token that the client will use, then start the GPU process. The pack path
@@ -81,29 +86,41 @@ for those rows. Prompt prefill still reads and computes its experts on the host.
 the network, so the result depends on how much host CPU and disk time the RPC can hide.
 
 Ethernet still adds a serial dependency at each remote-owned MoE layer. With a five-row verify window (`--spec 4`),
-each layer sends about 50 KiB of FP32 activations. Returning two to four raw expert rows per token adds roughly
-100–200 KiB per layer, or about 7–12 MiB across 48 layers per window. The 1 Gb/s line rate is 125 MB/s before TCP
-overhead. The user observed around 200 Mb/s while a model was active in an earlier setup; that is about 25 MB/s, a
-context-specific observation rather than a benchmark of this RPC. At that rate, raw-row traffic alone would take
-roughly 0.3–0.5 seconds per five-row window if it traversed the link serially.
+each layer sends about 50 KiB of FP32 activations. Returning two to four raw expert rows per computed token row adds
+roughly 100–200 KiB per layer, or about 7–12 MiB across 48 layers per window. These are speculative computation rows;
+they are not necessarily accepted output tokens. The 1 Gb/s line rate is 125 MB/s before TCP overhead. The user
+observed around 200 Mb/s while a model was active in an earlier setup; that is about 25 MB/s, a context-specific
+observation rather than a benchmark of this RPC. At that rate, raw-row traffic alone would take roughly 0.3–0.5
+seconds per five-row window if request and response bytes were serialized across the link.
 
 With `--remote-expert-opt`, the return side is one 50 KiB weighted sum per layer per five-row window. The host still
 sends about 50 KiB per layer, so all 48 layers move about 4.8 MiB in both directions together per window (roughly
-0.96 MiB per accepted token), before protocol overhead. At 25 MB/s that is about 0.2 seconds per window as a
-bandwidth-only floor, or about 25 tokens/s if every byte is serial. If complete expert blocks are assigned to only
-20 layers, the estimate is about 2 MiB per window, or 0.08 seconds at that rate (about 62 tokens/s before compute and
-round-trip latency). The pool overlaps some local CPU work with remote GPU work, so actual totals depend on hit
-coverage and scheduling; these calculations are not speed claims.
+0.96 MiB per computed token row), before protocol overhead. At 25 MB/s that is about 0.2 seconds per window if every
+byte is serialized, or about 25 computed rows/s before GPU work, acceptance, and round-trip latency. If complete expert
+blocks are assigned to only 20 layers, the estimate is about 2 MiB per window, or 0.08 seconds at that rate. The pool
+overlaps some local CPU work with remote GPU work, so actual totals depend on hit coverage and scheduling; these
+calculations are not speed claims. Report accepted output tokens separately from speculative rows to get request
+throughput.
 
 Each selected layer still requires one sequential request/response. For a 20-layer assignment, a 1 ms LAN RTT adds
-about 4 ms per accepted token at a five-row window; all 48 layers would add about 9.6 ms/token. Measure RTT and the
-RPC counters on both PCs. The raw-row arm is useful as a correctness/reference comparison; the reduced-result arm
-and complete-block assignment are the network-conscious experiments.
+about 20 ms per five-row window before overlap; all 48 layers would add about 48 ms per window. Divide that window
+cost by the number of output tokens actually accepted, not by the number of drafted rows. Measure RTT and the RPC
+counters on both PCs. The raw-row arm is useful as a correctness/reference comparison; the reduced-result arm and
+complete-block assignment are the network-conscious experiments.
+
+The prefill and verifier stage boundaries carry different tensors. A verifier row is `hc*n_embd + n_embd + hc`
+FP32 values: for `hc=4` and `n_embd=2560`, that is 12,804 floats or 51,216 bytes per computed row. Five computed
+rows are 256,080 bytes (about 250 KiB), not 100 MiB; at the ideal 125 MB/s line rate that is about 2.05 ms in one
+direction. A hypothetical 2,048-row verifier transfer would be about 100 MiB, but that is not the prompt handoff.
+
+The existing batched prefill boundary uses `T * N * HC * sizeof(float)`, where `N=2560`, `HC=4`, and a standard
+chunk has `T=2048`. That is 83,886,080 bytes (80 MiB): about 0.67 seconds at ideal 125 MB/s, or 3.36 seconds at
+25 MB/s in one direction, before TCP, copies, synchronization, or compute. Directional transfers may overlap in a
+pipeline; a dependent request/response exchange cannot be priced as one full-duplex transfer. These figures describe
+the existing local prefill/verifier handoff shapes, not this expert-cache RPC's traffic.
 
 On a 1 GbE link, a contiguous remote layer stage with its own KV remains the more network-efficient direction for
 decode and long-context capacity: it would exchange the verifier handoff once per stage boundary rather than making
-one request per remote-owned MoE layer. In this model the handoff is 12,804 FP32 values (about 50 KiB/token); a
-2,048-token chunk is about 100 MiB per boundary. That is about 0.84 seconds at the 1 Gb/s line rate, or about
-4.2 seconds at the user's earlier 200 Mb/s observation, before synchronization or compute. A persistent stage must
-also keep QSA/GDN state, KV, PLE history, and speculative commit/rollback state on the remote GPU. This runtime is not
-implemented by the expert-cache RPC modes described above.
+one request per remote-owned MoE layer. A persistent stage must also keep QSA/GDN state, KV, PLE history, and
+speculative commit/rollback state on the remote GPU. This runtime is not implemented by the expert-cache RPC modes
+described above.

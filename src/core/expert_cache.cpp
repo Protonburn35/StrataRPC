@@ -550,6 +550,7 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
     // R4.2g: each layer starts at the bottom of its own range.  Built here rather than lazily so `admit`
     // stays allocation-free on the token path.
     layer_next_.assign((size_t) (n_layers > 0 ? n_layers : 0), 0);
+    layer_ranges_.clear();
     for (int64_t l = 0; l < n_layers; ++l) {
         int64_t lo = 0, hi = 0;
         layer_slot_range(l, lo, hi);
@@ -583,6 +584,7 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
     // #369: each layer's cursor at the bottom of its own range, as open() seeds it - open() above ran on byte-sized
     // "slots", so its seeds are not slot indices
     layer_next_.assign((size_t) (n_layers > 0 ? n_layers : 0), 0);
+    layer_ranges_.clear();
     for (int64_t l = 0; l < n_layers; ++l) {
         int64_t lo = 0, hi = 0;
         layer_slot_range(l, lo, hi);
@@ -617,6 +619,7 @@ void ExpertCache::close() {
     fills_ = 0;
     admitted_ = 0;
     layer_next_.clear();
+    layer_ranges_.clear();
 }
 
 /// R4.2g.  Layer `l` owns `[l*q, (l+1)*q)` with `q = slots_ / n_layers_`; the LAST layer takes whatever is
@@ -625,9 +628,33 @@ void ExpertCache::layer_slot_range(int64_t layer, int64_t& lo, int64_t& hi) cons
     lo = 0;
     hi = 0;
     if (n_layers_ <= 0 || slots_ <= 0 || layer < 0 || layer >= n_layers_) return;
+    if (!layer_ranges_.empty()) {
+        lo = layer_ranges_[(size_t)layer].begin;
+        hi = layer_ranges_[(size_t)layer].end;
+        return;
+    }
     const int64_t q = slots_ / n_layers_;
     lo = layer * q;
     hi = (layer == n_layers_ - 1) ? slots_ : (layer + 1) * q;
+}
+
+bool ExpertCache::set_layer_slot_counts(const std::vector<int64_t>& counts, std::string& err) {
+    std::vector<LayerSlotRange> ranges;
+    int64_t total = 0;
+    if ((int64_t)counts.size() != n_layers_ || !make_layer_slot_ranges(counts, ranges, total, err)) {
+        if (err.empty()) err = "ExpertCache: layer slot counts do not match the model's layer count";
+        return false;
+    }
+    if (total != slots_) {
+        err = "ExpertCache: layer slot counts total " + std::to_string(total) +
+              " but the cache has " + std::to_string(slots_) + " slots";
+        return false;
+    }
+    layer_ranges_ = std::move(ranges);
+    layer_next_.resize((size_t)n_layers_);
+    for (int64_t layer = 0; layer < n_layers_; ++layer)
+        layer_next_[(size_t)layer] = (int32_t)layer_ranges_[(size_t)layer].begin;
+    return true;
 }
 
 int32_t ExpertCache::slot_of(int64_t layer, int64_t expert) const {
@@ -668,7 +695,6 @@ const uint8_t* ExpertCache::device_slot(int32_t slot) const {
 }
 
 bool ExpertCache::fill_slot(int32_t slot, const uint8_t* host_blob, void* stream, std::string& err, int64_t bytes) {
-    const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
     uint8_t* dst = device_slot(slot);
     if (dst == nullptr) {
         err = "ExpertCache::fill_slot: slot " + std::to_string(slot) + " is outside 0.." +
@@ -677,6 +703,13 @@ bool ExpertCache::fill_slot(int32_t slot, const uint8_t* host_blob, void* stream
     }
     if (host_blob == nullptr) {
         err = "ExpertCache::fill_slot: the host blob is null";
+        return false;
+    }
+    const int64_t capacity = off_.empty() ? blob_ : (int64_t)(off_[(size_t)slot + 1] - off_[(size_t)slot]);
+    size_t n = 0;
+    if (!slot_copy_size(capacity, bytes, n, err)) {
+        err = "ExpertCache::fill_slot: " + err + " (slot " + std::to_string(slot) + ", capacity " +
+              std::to_string(capacity) + " B, requested " + std::to_string(bytes) + " B)";
         return false;
     }
     const cudaError_t e = cudaMemcpyAsync(dst, host_blob, n, cudaMemcpyHostToDevice,
@@ -690,7 +723,6 @@ bool ExpertCache::fill_slot(int32_t slot, const uint8_t* host_blob, void* stream
 }
 
 bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes) {
-    const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
     uint8_t* dst = device_slot(slot);
     if (dst == nullptr) {
         err = "ExpertCache::fill_slot_blocking: slot outside the arena";
@@ -698,6 +730,13 @@ bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std
     }
     if (host_blob == nullptr) {
         err = "ExpertCache::fill_slot_blocking: the host blob is null";
+        return false;
+    }
+    const int64_t capacity = off_.empty() ? blob_ : (int64_t)(off_[(size_t)slot + 1] - off_[(size_t)slot]);
+    size_t n = 0;
+    if (!slot_copy_size(capacity, bytes, n, err)) {
+        err = "ExpertCache::fill_slot_blocking: " + err + " (slot " + std::to_string(slot) + ", capacity " +
+              std::to_string(capacity) + " B, requested " + std::to_string(bytes) + " B)";
         return false;
     }
 #if defined(STRATA_USE_HIP)
@@ -721,11 +760,17 @@ bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std
 }
 
 bool ExpertCache::fill_slot_queued(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes) {
-    const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
     uint8_t* dst = device_slot(slot);
     if (dst == nullptr || host_blob == nullptr) {
         err = dst == nullptr ? "ExpertCache::fill_slot_queued: slot outside the arena"
                              : "ExpertCache::fill_slot_queued: the host blob is null";
+        return false;
+    }
+    const int64_t capacity = off_.empty() ? blob_ : (int64_t)(off_[(size_t)slot + 1] - off_[(size_t)slot]);
+    size_t n = 0;
+    if (!slot_copy_size(capacity, bytes, n, err)) {
+        err = "ExpertCache::fill_slot_queued: " + err + " (slot " + std::to_string(slot) + ", capacity " +
+              std::to_string(capacity) + " B, requested " + std::to_string(bytes) + " B)";
         return false;
     }
     const cudaError_t e = cudaMemcpyAsync(dst, host_blob, n, cudaMemcpyHostToDevice, (cudaStream_t) 0);
@@ -747,22 +792,32 @@ bool ExpertCache::sync_queued(std::string& err) {
 }
 
 bool ExpertCache::verify_slot(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes) {
-    const int64_t nb = bytes > 0 && bytes <= blob_ ? bytes : blob_;
     const uint8_t* src = device_slot(slot);
     if (src == nullptr) {
         err = "ExpertCache::verify_slot: slot outside the arena";
         return false;
     }
+    if (host_blob == nullptr) {
+        err = "ExpertCache::verify_slot: the host blob is null";
+        return false;
+    }
+    const int64_t capacity = off_.empty() ? blob_ : (int64_t)(off_[(size_t)slot + 1] - off_[(size_t)slot]);
+    size_t nb = 0;
+    if (!slot_copy_size(capacity, bytes, nb, err)) {
+        err = "ExpertCache::verify_slot: " + err + " (slot " + std::to_string(slot) + ", capacity " +
+              std::to_string(capacity) + " B, requested " + std::to_string(bytes) + " B)";
+        return false;
+    }
     // `cudaMemcpy` and not `cudaMemcpyAsync`: this is a startup check, and a check that can be read before it
     // has happened is not a check.  It also synchronises the fills queued before it, which is what makes the
     // comparison meaningful.
-    std::vector<uint8_t> got((size_t) nb);
-    const cudaError_t e = cudaMemcpy(got.data(), src, (size_t) nb, cudaMemcpyDeviceToHost);
+    std::vector<uint8_t> got(nb);
+    const cudaError_t e = cudaMemcpy(got.data(), src, nb, cudaMemcpyDeviceToHost);
     if (e != cudaSuccess) {
         err = std::string("ExpertCache::verify_slot: ") + cudaGetErrorString(e);
         return false;
     }
-    if (std::memcmp(got.data(), host_blob, (size_t) nb) != 0) {
+    if (std::memcmp(got.data(), host_blob, nb) != 0) {
         size_t first = 0;
         while (first < (size_t) nb && got[first] == host_blob[first]) ++first;
         char buf[256];

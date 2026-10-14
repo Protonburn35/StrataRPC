@@ -53,6 +53,11 @@ public:
         return cache_.slot_of(layer, expert) >= 0;
     }
     bool is_rpc_client() const { return rpc_client_; }
+    const std::vector<uint8_t>& remote_ownership_mask() const { return remote_present_; }
+    /// Bind the current request's cancellation flag. Socket waits poll it and abort the frame promptly.
+    void set_cancel_flag(const std::atomic<bool>* cancelled) {
+        rpc_cancelled_.store(cancelled, std::memory_order_release);
+    }
     bool optimized_decode() const { return remote_opt_ != nullptr; }
     bool finish(float* out, std::string& err);
     int64_t resident() const { return rpc_client_ ? (int64_t)remote_pairs_.size() : cache_.resident(); }
@@ -82,6 +87,7 @@ public:
 
 private:
     friend class RemoteExpertOpt;
+    void invalidate_rpc();
     RemoteExpertOpt* remote_opt_ = nullptr;
     int device_ = -1;
     int64_t n_expert_ = 0;
@@ -118,8 +124,11 @@ private:
     std::vector<int32_t> start_, dst_, tok_, original_row_;
     std::vector<unsigned long long> ptr_;
     bool rpc_client_ = false;
+    bool rpc_broken_ = false;
     bool rpc_pending_ = false;
     rpc::Socket rpc_socket_ = rpc::kInvalidSocket;
+    rpc::IoDeadline rpc_deadline_;
+    std::atomic<const std::atomic<bool>*> rpc_cancelled_{nullptr};
     uint64_t remote_bytes_ = 0;
     uint64_t rpc_sent_bytes_ = 0;
     uint64_t rpc_received_bytes_ = 0;

@@ -20,6 +20,8 @@ namespace {
 constexpr int64_t H = strata::kernels::cpu::H;
 constexpr int64_t FF = strata::kernels::cpu::FF;
 constexpr int64_t CAP = strata::kernels::cpu::MAXT * 10;
+constexpr std::chrono::milliseconds kRpcInitializationTimeout{10 * 60 * 1000};
+constexpr std::chrono::milliseconds kRpcInferenceTimeout{60 * 1000};
 constexpr uint32_t kRpcVersion = 2;
 constexpr uint32_t kRpcMaxPairs = 1000000;
 constexpr uint32_t kRpcMaxMessage = 4096;
@@ -71,31 +73,40 @@ bool check(cudaError_t result, const char* what, std::string& err, int device) {
     return false;
 }
 
-bool send_u32(rpc::Socket s, uint32_t v, std::string& err) { return rpc::send_all(s, &v, sizeof(v), err); }
-bool recv_u32(rpc::Socket s, uint32_t& v, std::string& err) { return rpc::recv_all(s, &v, sizeof(v), err); }
-bool send_u64(rpc::Socket s, uint64_t v, std::string& err) { return rpc::send_all(s, &v, sizeof(v), err); }
-bool recv_u64(rpc::Socket s, uint64_t& v, std::string& err) { return rpc::recv_all(s, &v, sizeof(v), err); }
+bool send_u32(rpc::Socket s, uint32_t v, const rpc::IoDeadline& deadline, std::string& err) {
+    return rpc::send_all(s, &v, sizeof(v), deadline, err);
+}
+bool recv_u32(rpc::Socket s, uint32_t& v, const rpc::IoDeadline& deadline, std::string& err) {
+    return rpc::recv_all(s, &v, sizeof(v), deadline, err);
+}
+bool send_u64(rpc::Socket s, uint64_t v, const rpc::IoDeadline& deadline, std::string& err) {
+    return rpc::send_all(s, &v, sizeof(v), deadline, err);
+}
+bool recv_u64(rpc::Socket s, uint64_t& v, const rpc::IoDeadline& deadline, std::string& err) {
+    return rpc::recv_all(s, &v, sizeof(v), deadline, err);
+}
 
 std::string rpc_token() {
     const char* t = std::getenv("STRATA_RPC_TOKEN");
     return t == nullptr ? std::string() : std::string(t);
 }
 
-bool send_text(rpc::Socket s, const std::string& v, std::string& err) {
+bool send_text(rpc::Socket s, const std::string& v, const rpc::IoDeadline& deadline, std::string& err) {
     if (v.size() > kRpcMaxMessage) { err = "RPC error message is too long"; return false; }
-    return send_u32(s, (uint32_t)v.size(), err) && (v.empty() || rpc::send_all(s, v.data(), v.size(), err));
+    return send_u32(s, (uint32_t)v.size(), deadline, err) &&
+           (v.empty() || rpc::send_all(s, v.data(), v.size(), deadline, err));
 }
 
-bool recv_text(rpc::Socket s, std::string& v, std::string& err) {
+bool recv_text(rpc::Socket s, std::string& v, const rpc::IoDeadline& deadline, std::string& err) {
     uint32_t n = 0;
-    if (!recv_u32(s, n, err)) return false;
+    if (!recv_u32(s, n, deadline, err)) return false;
     if (n > kRpcMaxMessage) { err = "RPC error message exceeds the protocol limit"; return false; }
     v.resize(n);
-    return n == 0 || rpc::recv_all(s, v.data(), n, err);
+    return n == 0 || rpc::recv_all(s, v.data(), n, deadline, err);
 }
 
-bool send_rpc_error(rpc::Socket s, const std::string& message, std::string& err) {
-    return send_u32(s, 1, err) && send_text(s, message, err);
+bool send_rpc_error(rpc::Socket s, const std::string& message, const rpc::IoDeadline& deadline, std::string& err) {
+    return send_u32(s, 1, deadline, err) && send_text(s, message, deadline, err);
 }
 
 uint64_t hash_blob(const uint8_t* p, size_t n) {
@@ -106,6 +117,13 @@ uint64_t hash_blob(const uint8_t* p, size_t n) {
 } // namespace
 
 RemoteExperts::~RemoteExperts() { close(); }
+
+void RemoteExperts::invalidate_rpc() {
+    if (rpc_socket_ != rpc::kInvalidSocket) rpc::close(rpc_socket_);
+    rpc_socket_ = rpc::kInvalidSocket;
+    rpc_pending_ = false;
+    rpc_broken_ = true;
+}
 
 bool RemoteExperts::open_rpc(const std::string& endpoint, int64_t layers, int64_t experts,
                              const std::vector<std::pair<int32_t, int32_t>>& ranked,
@@ -142,32 +160,33 @@ bool RemoteExperts::open_rpc(const std::string& endpoint, int64_t layers, int64_
     rpc_client_ = true;
     n_expert_ = experts;
     if (!rpc::set_nodelay(rpc_socket_, true, err)) { close(); return false; }
+    const rpc::IoDeadline init_deadline = rpc::deadline_after(kRpcInitializationTimeout);
     std::array<char, 8> magic{};
     std::memcpy(magic.data(), kRpcMagic, sizeof(kRpcMagic));
-    bool ok = rpc::send_all(rpc_socket_, magic.data(), magic.size(), err) &&
-              send_u32(rpc_socket_, kRpcVersion, err) &&
-              send_u32(rpc_socket_, (uint32_t)layers, err) &&
-              send_u32(rpc_socket_, (uint32_t)experts, err) &&
-              send_text(rpc_socket_, token, err) &&
-              send_u32(rpc_socket_, (uint32_t)candidates.size(), err);
+    bool ok = rpc::send_all(rpc_socket_, magic.data(), magic.size(), init_deadline, err) &&
+              send_u32(rpc_socket_, kRpcVersion, init_deadline, err) &&
+              send_u32(rpc_socket_, (uint32_t)layers, init_deadline, err) &&
+              send_u32(rpc_socket_, (uint32_t)experts, init_deadline, err) &&
+              send_text(rpc_socket_, token, init_deadline, err) &&
+              send_u32(rpc_socket_, (uint32_t)candidates.size(), init_deadline, err);
     std::vector<RpcPair> wire_pairs;
     wire_pairs.reserve(candidates.size());
     for (const auto& p : candidates) wire_pairs.push_back({(uint32_t)p.first, (uint32_t)p.second});
-    if (ok) ok = rpc::send_all(rpc_socket_, wire_pairs.data(), wire_pairs.size() * sizeof(RpcPair), err);
+    if (ok) ok = rpc::send_all(rpc_socket_, wire_pairs.data(), wire_pairs.size() * sizeof(RpcPair), init_deadline, err);
     std::vector<uint64_t> layer_bytes((size_t)layers);
     for (int64_t l = 0; l < layers; ++l) layer_bytes[(size_t)l] = lay.blob_bytes(l);
-    if (ok) ok = rpc::send_all(rpc_socket_, layer_bytes.data(), layer_bytes.size() * sizeof(uint64_t), err);
+    if (ok) ok = rpc::send_all(rpc_socket_, layer_bytes.data(), layer_bytes.size() * sizeof(uint64_t), init_deadline, err);
     uint32_t status = 0;
-    if (ok) ok = recv_u32(rpc_socket_, status, err);
+    if (ok) ok = recv_u32(rpc_socket_, status, init_deadline, err);
     if (!ok) { close(); return false; }
     if (status != 0) {
         std::string message;
-        if (recv_text(rpc_socket_, message, err)) err = message;
+        if (recv_text(rpc_socket_, message, init_deadline, err)) err = message;
         if (err.empty()) err = "RPC experts: server rejected the model or cache request";
         close(); return false;
     }
     uint32_t count = 0;
-    if (!recv_u32(rpc_socket_, count, err) || !recv_u64(rpc_socket_, remote_bytes_, err) ||
+    if (!recv_u32(rpc_socket_, count, init_deadline, err) || !recv_u64(rpc_socket_, remote_bytes_, init_deadline, err) ||
         count == 0 || count > candidates.size()) {
         if (err.empty()) err = "RPC experts: server returned an invalid resident-pair count";
         close(); return false;
@@ -175,7 +194,7 @@ bool RemoteExperts::open_rpc(const std::string& endpoint, int64_t layers, int64_
     remote_pairs_.reserve(count);
     remote_present_.assign(total, 0);
     std::vector<RpcPair> accepted(count);
-    if (!rpc::recv_all(rpc_socket_, accepted.data(), accepted.size() * sizeof(RpcPair), err)) { close(); return false; }
+    if (!rpc::recv_all(rpc_socket_, accepted.data(), accepted.size() * sizeof(RpcPair), init_deadline, err)) { close(); return false; }
     uint64_t accepted_bytes = 0;
     for (uint32_t i = 0; i < count; ++i) {
         const uint32_t l = accepted[i].layer, e = accepted[i].expert;
@@ -205,14 +224,15 @@ bool RemoteExperts::open_rpc(const std::string& endpoint, int64_t layers, int64_
         close(); return false;
     }
     uint32_t sample_count = 0;
-    if (!recv_u32(rpc_socket_, sample_count, err) || sample_count == 0 || sample_count > 8 || sample_count > count) {
+    if (!recv_u32(rpc_socket_, sample_count, init_deadline, err) || sample_count == 0 || sample_count > 8 || sample_count > count) {
         if (err.empty()) err = "RPC experts: server returned an invalid pack-check sample count";
         close(); return false;
     }
     for (uint32_t i = 0; i < sample_count; ++i) {
         uint32_t l = 0, e = 0;
         uint64_t remote_hash = 0;
-        if (!recv_u32(rpc_socket_, l, err) || !recv_u32(rpc_socket_, e, err) || !recv_u64(rpc_socket_, remote_hash, err)) {
+        if (!recv_u32(rpc_socket_, l, init_deadline, err) || !recv_u32(rpc_socket_, e, init_deadline, err) ||
+            !recv_u64(rpc_socket_, remote_hash, init_deadline, err)) {
             close(); return false;
         }
         if (l >= (uint32_t)layers || e >= (uint32_t)experts || !remote_present_[(size_t)l * (size_t)experts + e]) {
@@ -267,6 +287,8 @@ void RemoteExperts::close() {
     if (rpc_socket_ != rpc::kInvalidSocket) rpc::close(rpc_socket_);
     rpc_socket_ = rpc::kInvalidSocket;
     rpc_pending_ = false;
+    rpc_broken_ = false;
+    rpc_cancelled_.store(nullptr, std::memory_order_release);
     rpc_n_tok_ = 0;
     rpc_reduce_pending_ = false;
     if (device_ >= 0) {
@@ -437,6 +459,10 @@ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int
     struct Timer { double& acc; std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
         ~Timer() { acc += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); } } timer{ms_begin_};
     if (rpc_client_) {
+        if (rpc_broken_ || rpc_socket_ == rpc::kInvalidSocket) {
+            err = "RPC experts: the connection was invalidated after an incomplete or invalid response; restart the request";
+            return false;
+        }
         if (n_tok <= 0 || n_tok > strata::kernels::cpu::MAXT || k != 10 || layer < 0 ||
             (size_t)layer >= layers_present_.size() || rpc_pending_) {
             err = "RPC experts: invalid layer, routing width, window size or request ordering";
@@ -464,16 +490,18 @@ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int
         const size_t x_bytes = (size_t)n_tok * H * sizeof(float);
         const size_t route_bytes = (size_t)n * sizeof(int32_t);
         const size_t weight_bytes = reduce ? (size_t)n * sizeof(float) : 0;
+        rpc_deadline_ = rpc::deadline_after(kRpcInferenceTimeout,
+                                            rpc_cancelled_.load(std::memory_order_acquire));
         // The server must compute only rows assigned to it by this host window. In particular, a normal adaptive
         // host cache may have admitted a remote expert since startup; forwarding its original kind would make the
         // server return an extra row and break the response count/order check.
         for (int64_t i = 0; i < n; ++i) rpc_kind_[(size_t)i] = owned_[(size_t)i] ? -1 : 0;
-        const bool sent = rpc::send_all(rpc_socket_, header, sizeof(header), err) &&
-                          rpc::send_all(rpc_socket_, x, x_bytes, err) &&
-                          rpc::send_all(rpc_socket_, ids, route_bytes, err);
-        if (!sent) return false;
-        if (!rpc::send_all(rpc_socket_, rpc_kind_.data(), route_bytes, err)) return false;
-        if (reduce && !rpc::send_all(rpc_socket_, remote_opt_->weights_, weight_bytes, err)) return false;
+        const bool sent = rpc::send_all(rpc_socket_, header, sizeof(header), rpc_deadline_, err) &&
+                          rpc::send_all(rpc_socket_, x, x_bytes, rpc_deadline_, err) &&
+                          rpc::send_all(rpc_socket_, ids, route_bytes, rpc_deadline_, err) &&
+                          rpc::send_all(rpc_socket_, rpc_kind_.data(), route_bytes, rpc_deadline_, err) &&
+                          (!reduce || rpc::send_all(rpc_socket_, remote_opt_->weights_, weight_bytes, rpc_deadline_, err));
+        if (!sent) { invalidate_rpc(); return false; }
         rpc_sent_bytes_ += sizeof(header) + x_bytes + route_bytes * 2 + weight_bytes;
         rpc_pending_ = true;
         rpc_n_tok_ = (uint32_t)n_tok;
@@ -571,30 +599,32 @@ bool RemoteExperts::finish(float* out, std::string& err) {
         if (!rpc_pending_) return true;
         const auto w0 = std::chrono::steady_clock::now();
         uint32_t status = 0, count = 0;
-        if (!recv_u32(rpc_socket_, status, err)) { rpc_pending_ = false; return false; }
+        err.clear();
+        auto fail = [&](const char* fallback) {
+            if (err.empty()) err = fallback;
+            invalidate_rpc();
+            return false;
+        };
+        if (!recv_u32(rpc_socket_, status, rpc_deadline_, err))
+            return fail("RPC experts: failed while waiting for the remote result status");
         if (status != 0) {
             std::string message;
-            if (recv_text(rpc_socket_, message, err)) err = message;
-            rpc_pending_ = false;
-            if (err.empty()) err = "RPC experts: server failed to compute the routed rows";
-            return false;
+            if (recv_text(rpc_socket_, message, rpc_deadline_, err)) err = "RPC experts: " + message;
+            return fail("RPC experts: server failed to compute the routed rows");
         }
         const uint32_t expected = rpc_reduce_pending_ ? rpc_n_tok_ : (uint32_t)original_row_.size();
-        if (!recv_u32(rpc_socket_, count, err) || count != expected) {
-            rpc_pending_ = false;
-            if (err.empty()) err = "RPC experts: server returned an unexpected result count";
-            return false;
-        }
+        if (!recv_u32(rpc_socket_, count, rpc_deadline_, err))
+            return fail("RPC experts: failed while waiting for the remote result count");
+        if (count != expected) { err = "RPC experts: server returned an unexpected result count"; return fail(""); }
         rpc_out_.resize((size_t)count * H);
         if (rpc_reduce_pending_) {
-            if (!rpc::recv_all(rpc_socket_, rpc_out_.data(), rpc_out_.size() * sizeof(float), err)) {
-                rpc_pending_ = false; return false;
-            }
+            if (!rpc::recv_all(rpc_socket_, rpc_out_.data(), rpc_out_.size() * sizeof(float), rpc_deadline_, err))
+                return fail("RPC experts: incomplete reduced-result frame");
+            if (remote_opt_ == nullptr) { err = "RPC experts: optimized result arrived without an active reducer"; return fail(""); }
             const int token_begin = remote_opt_->token_begin_;
             if ((uint32_t)remote_opt_->tokens_ != rpc_n_tok_) {
                 err = "RPC experts: reduced window size differs from the active verifier window";
-                rpc_pending_ = false;
-                return false;
+                return fail("");
             }
             for (size_t i = 0; i < (size_t)count * H; ++i)
                 remote_opt_->h_sum_[(size_t)token_begin * H + i] += rpc_out_[i];
@@ -603,17 +633,18 @@ bool RemoteExperts::finish(float* out, std::string& err) {
             rpc_received_bytes_ += sizeof(status) + sizeof(count) + rpc_out_.size() * sizeof(float);
         } else {
             rpc_rows_.resize(count);
-            if (!rpc::recv_all(rpc_socket_, rpc_rows_.data(), rpc_rows_.size() * sizeof(uint32_t), err) ||
-                !rpc::recv_all(rpc_socket_, rpc_out_.data(), rpc_out_.size() * sizeof(float), err)) {
-                rpc_pending_ = false; return false;
-            }
+            if (!rpc::recv_all(rpc_socket_, rpc_rows_.data(), rpc_rows_.size() * sizeof(uint32_t), rpc_deadline_, err) ||
+                !rpc::recv_all(rpc_socket_, rpc_out_.data(), rpc_out_.size() * sizeof(float), rpc_deadline_, err))
+                return fail("RPC experts: incomplete raw-result frame");
             for (uint32_t q = 0; q < count; ++q) {
                 const uint32_t row = rpc_rows_[q];
                 if (q >= original_row_.size() || row != (uint32_t)original_row_[q]) {
                     err = "RPC experts: server returned rows in an invalid order";
-                    rpc_pending_ = false;
-                    return false;
+                    return fail("");
                 }
+            }
+            for (uint32_t q = 0; q < count; ++q) {
+                const uint32_t row = rpc_rows_[q];
                 std::memcpy(out + (size_t)row * H, rpc_out_.data() + (size_t)q * H, (size_t)H * sizeof(float));
             }
             rpc_received_bytes_ += sizeof(status) + sizeof(count) + rpc_rows_.size() * sizeof(uint32_t) +
@@ -659,9 +690,10 @@ bool RemoteExperts::serve_rpc(const std::string& endpoint, const std::string& pa
     if (!rpc::accept(listener, client, err)) { rpc::close(listener); return false; }
     rpc::close(listener);
     if (!rpc::set_nodelay(client, true, err)) { rpc::close(client); return false; }
-    auto fail = [&](const std::string& why) {
+    const rpc::IoDeadline init_deadline = rpc::deadline_after(kRpcInitializationTimeout);
+    auto fail = [&](const std::string& why, const rpc::IoDeadline& deadline) {
         std::string ignored;
-        send_rpc_error(client, why, ignored);
+        send_rpc_error(client, why, deadline, ignored);
         rpc::close(client);
         err = why;
         return false;
@@ -669,42 +701,48 @@ bool RemoteExperts::serve_rpc(const std::string& endpoint, const std::string& pa
     std::array<char, 8> magic{};
     uint32_t version = 0, client_layers = 0, client_experts = 0, pair_count = 0;
     std::string client_token;
-    if (!rpc::recv_all(client, magic.data(), magic.size(), err) ||
-        std::memcmp(magic.data(), kRpcMagic, sizeof(kRpcMagic)) != 0 ||
-        !recv_u32(client, version, err) || !recv_u32(client, client_layers, err) ||
-        !recv_u32(client, client_experts, err) || !recv_text(client, client_token, err) ||
-        !recv_u32(client, pair_count, err)) {
+    if (!rpc::recv_all(client, magic.data(), magic.size(), init_deadline, err)) {
         rpc::close(client);
         return false;
     }
-    if (version != kRpcVersion) return fail("RPC server: protocol version mismatch");
-    if (client_token != token) return fail("RPC server: STRATA_RPC_TOKEN authentication failed");
+    if (std::memcmp(magic.data(), kRpcMagic, sizeof(kRpcMagic)) != 0)
+        return fail("RPC server: invalid protocol magic", init_deadline);
+    if (!recv_u32(client, version, init_deadline, err) || !recv_u32(client, client_layers, init_deadline, err) ||
+        !recv_u32(client, client_experts, init_deadline, err) || !recv_text(client, client_token, init_deadline, err) ||
+        !recv_u32(client, pair_count, init_deadline, err)) {
+        rpc::close(client);
+        return false;
+    }
+    if (version != kRpcVersion) return fail("RPC server: protocol version mismatch", init_deadline);
+    if (client_token != token) return fail("RPC server: STRATA_RPC_TOKEN authentication failed", init_deadline);
     if (client_layers != (uint32_t)layers || client_experts != (uint32_t)experts ||
-        pair_count == 0 || pair_count > kRpcMaxPairs) return fail("RPC server: client model geometry or ranking is invalid");
+        pair_count == 0 || pair_count > kRpcMaxPairs)
+        return fail("RPC server: client model geometry or ranking is invalid", init_deadline);
 
     std::vector<std::pair<int32_t, int32_t>> ranked;
     ranked.reserve(pair_count);
     std::vector<uint8_t> pair_seen((size_t)layers * (size_t)experts, 0);
     std::vector<RpcPair> candidates(pair_count);
-    if (!rpc::recv_all(client, candidates.data(), candidates.size() * sizeof(RpcPair), err)) {
+    if (!rpc::recv_all(client, candidates.data(), candidates.size() * sizeof(RpcPair), init_deadline, err)) {
         rpc::close(client); return false;
     }
     for (uint32_t i = 0; i < pair_count; ++i) {
         const uint32_t l = candidates[i].layer, e = candidates[i].expert;
-        if (l >= (uint32_t)layers || e >= (uint32_t)experts) return fail("RPC server: client ranking contains an invalid pair");
+        if (l >= (uint32_t)layers || e >= (uint32_t)experts)
+            return fail("RPC server: client ranking contains an invalid pair", init_deadline);
         const size_t ix = (size_t)l * (size_t)experts + (size_t)e;
-        if (pair_seen[ix]) return fail("RPC server: client ranking contains a duplicate pair");
+        if (pair_seen[ix]) return fail("RPC server: client ranking contains a duplicate pair", init_deadline);
         pair_seen[ix] = 1;
         ranked.emplace_back((int32_t)l, (int32_t)e);
     }
     const auto& lay = strata::kernels::cpu::expert_layout();
     std::vector<uint64_t> client_layer_bytes((size_t)layers);
-    if (!rpc::recv_all(client, client_layer_bytes.data(), client_layer_bytes.size() * sizeof(uint64_t), err)) {
+    if (!rpc::recv_all(client, client_layer_bytes.data(), client_layer_bytes.size() * sizeof(uint64_t), init_deadline, err)) {
         rpc::close(client); return false;
     }
     for (int64_t l = 0; l < layers; ++l) {
         if (client_layer_bytes[(size_t)l] != lay.blob_bytes(l))
-            return fail("RPC server: expert layout differs from the client pack");
+            return fail("RPC server: expert layout differs from the client pack", init_deadline);
     }
 
     ExpertCache primary;
@@ -714,8 +752,9 @@ bool RemoteExperts::serve_rpc(const std::string& endpoint, const std::string& pa
     server_opt.attach(worker);
     if (ranked.size() > (size_t)std::numeric_limits<int>::max() ||
         !worker.open(0, (int)ranked.size(), layers, experts, ranked, primary, source, claimed, err, true))
-        return fail(err.empty() ? "RPC server: GPU could not open the requested cache" : err);
-    if (!server_opt.init(err)) return fail(err.empty() ? "RPC server: weighted reduction buffers could not be allocated" : err);
+        return fail(err.empty() ? "RPC server: GPU could not open the requested cache" : err, init_deadline);
+    if (!server_opt.init(err))
+        return fail(err.empty() ? "RPC server: weighted reduction buffers could not be allocated" : err, init_deadline);
     worker.remote_pairs_.clear();
     for (const auto& p : ranked)
         if (worker.cache_.slot_of(p.first, p.second) >= 0) worker.remote_pairs_.push_back(p);
@@ -728,24 +767,26 @@ bool RemoteExperts::serve_rpc(const std::string& endpoint, const std::string& pa
         const size_t at = i * worker.remote_pairs_.size() / sample_count;
         const auto& pair = worker.remote_pairs_[at];
         const uint8_t* blob = source.blob(pair.first, pair.second);
-        if (blob == nullptr) return fail("RPC server: could not read a pack-check expert");
+        if (blob == nullptr) return fail("RPC server: could not read a pack-check expert", init_deadline);
         samples.emplace_back(at, hash_blob(blob, (size_t)lay.blob_bytes(pair.first)));
     }
-    if (!send_u32(client, 0, err) || !send_u32(client, (uint32_t)worker.remote_pairs_.size(), err) ||
-        !send_u64(client, cache_bytes, err)) {
+    if (!send_u32(client, 0, init_deadline, err) ||
+        !send_u32(client, (uint32_t)worker.remote_pairs_.size(), init_deadline, err) ||
+        !send_u64(client, cache_bytes, init_deadline, err)) {
         rpc::close(client); return false;
     }
     std::vector<RpcPair> accepted;
     accepted.reserve(worker.remote_pairs_.size());
     for (const auto& p : worker.remote_pairs_) accepted.push_back({(uint32_t)p.first, (uint32_t)p.second});
-    if (!rpc::send_all(client, accepted.data(), accepted.size() * sizeof(RpcPair), err)) {
+    if (!rpc::send_all(client, accepted.data(), accepted.size() * sizeof(RpcPair), init_deadline, err)) {
         rpc::close(client); return false;
     }
-    if (!send_u32(client, (uint32_t)samples.size(), err)) { rpc::close(client); return false; }
+    if (!send_u32(client, (uint32_t)samples.size(), init_deadline, err)) { rpc::close(client); return false; }
     for (const auto& sample : samples) {
         const auto& p = worker.remote_pairs_[sample.first];
-        if (!send_u32(client, (uint32_t)p.first, err) || !send_u32(client, (uint32_t)p.second, err) ||
-            !send_u64(client, sample.second, err)) { rpc::close(client); return false; }
+        if (!send_u32(client, (uint32_t)p.first, init_deadline, err) ||
+            !send_u32(client, (uint32_t)p.second, init_deadline, err) ||
+            !send_u64(client, sample.second, init_deadline, err)) { rpc::close(client); return false; }
     }
     std::fprintf(stderr, "strata: RPC expert client connected; cached %zu experts (%.2f GiB) on CUDA0\n",
                  worker.remote_pairs_.size(), (double)cache_bytes / 1073741824.0);
@@ -762,34 +803,42 @@ bool RemoteExperts::serve_rpc(const std::string& endpoint, const std::string& pa
     for (;;) {
         uint32_t header[4]{};
         err.clear();
-        if (!rpc::recv_all(client, header, sizeof(header), err)) {
+        uint8_t first_header_byte = 0;
+        if (!rpc::recv_all(client, &first_header_byte, sizeof(first_header_byte), rpc::wait_forever(), err)) {
             const bool disconnected = err == "RPC connection closed";
             rpc::close(client);
             return disconnected;
         }
+        const rpc::IoDeadline op_deadline = rpc::deadline_after(kRpcInferenceTimeout);
+        reinterpret_cast<uint8_t*>(header)[0] = first_header_byte;
+        if (!rpc::recv_all(client, reinterpret_cast<uint8_t*>(header) + 1, sizeof(header) - 1, op_deadline, err)) {
+            rpc::close(client);
+            return false;
+        }
         const uint32_t type = header[0], layer = header[1], ntok = header[2], k = header[3];
-        if (type != 1 && type != 2) return fail("RPC server: unknown request type");
+        if (type != 1 && type != 2) return fail("RPC server: unknown request type", op_deadline);
         if (layer >= (uint32_t)layers || ntok == 0 || ntok > (uint32_t)strata::kernels::cpu::MAXT || k != 10) {
-            return fail("RPC server: request has an invalid layer or window shape");
+            return fail("RPC server: request has an invalid layer or window shape", op_deadline);
         }
         const size_t n = (size_t)ntok * k;
-        if (!rpc::recv_all(client, x.data(), (size_t)ntok * H * sizeof(float), err) ||
-            !rpc::recv_all(client, ids.data(), n * sizeof(int32_t), err) ||
-            !rpc::recv_all(client, kind.data(), n * sizeof(int32_t), err)) {
+        if (!rpc::recv_all(client, x.data(), (size_t)ntok * H * sizeof(float), op_deadline, err) ||
+            !rpc::recv_all(client, ids.data(), n * sizeof(int32_t), op_deadline, err) ||
+            !rpc::recv_all(client, kind.data(), n * sizeof(int32_t), op_deadline, err)) {
             rpc::close(client); return false;
         }
-        if (type == 2 && !rpc::recv_all(client, weights.data(), n * sizeof(float), err)) {
+        if (type == 2 && !rpc::recv_all(client, weights.data(), n * sizeof(float), op_deadline, err)) {
             rpc::close(client); return false;
         }
         std::fill(out.begin(), out.begin() + n * H, 0.0f);
         if (type == 2) server_opt.begin(weights.data(), 0, (int)ntok);
         if (!worker.begin(layer, x.data(), ids.data(), ntok, k, kind.data(), nullptr, err) ||
-            !worker.finish(out.data(), err)) return fail(err.empty() ? "RPC server: expert computation failed" : err);
+            !worker.finish(out.data(), err))
+            return fail(err.empty() ? "RPC server: expert computation failed" : err, op_deadline);
         if (type == 2) {
             server_opt.end();
             const uint32_t response[2] = {0, ntok};
-            if (!rpc::send_all(client, response, sizeof(response), err) ||
-                !rpc::send_all(client, server_opt.h_sum_, (size_t)ntok * H * sizeof(float), err)) {
+            if (!rpc::send_all(client, response, sizeof(response), op_deadline, err) ||
+                !rpc::send_all(client, server_opt.h_sum_, (size_t)ntok * H * sizeof(float), op_deadline, err)) {
                 rpc::close(client); return false;
             }
         } else {
@@ -803,9 +852,9 @@ bool RemoteExperts::serve_rpc(const std::string& endpoint, const std::string& pa
                 compact.insert(compact.end(), out.data() + i * H, out.data() + (i + 1) * H);
             }
             const uint32_t response[2] = {0, rows};
-            if (!rpc::send_all(client, response, sizeof(response), err) ||
-                !rpc::send_all(client, row_ids.data(), row_ids.size() * sizeof(uint32_t), err) ||
-                !rpc::send_all(client, compact.data(), compact.size() * sizeof(float), err)) {
+            if (!rpc::send_all(client, response, sizeof(response), op_deadline, err) ||
+                !rpc::send_all(client, row_ids.data(), row_ids.size() * sizeof(uint32_t), op_deadline, err) ||
+                !rpc::send_all(client, compact.data(), compact.size() * sizeof(float), op_deadline, err)) {
                 rpc::close(client); return false;
             }
         }

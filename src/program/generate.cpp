@@ -5135,11 +5135,11 @@ int main(int argc, char** argv) {
     }
     // plan v0.3 P6: a native pack's blobs differ per layer, so the same VRAM holds more experts than slots of
     // the largest blob would. The shared cache below sizes slots in profile order.
-    // #369: that list does not match --expert-cache-per-layer. A range is layer * quota + n, so a size cut for
-    // one layer can land in another layer's slot. Every expert in a layer is one size, so the per-layer list is
-    // `quota` copies of that layer's own blob, in layer order. `--expert-cache N` stays the budget of N largest
-    // blobs, and the quota is however many copies of every layer fit in it.
+    // #369: the packed slot list and the per-layer ranges must use one mapping. RPC-owned layers have empty local
+    // ranges; each remaining layer gets `quota` copies of its own blob size. `--expert-cache N` stays the budget
+    // of N largest blobs, and the quota is however many copies of each locally owned layer fit in it.
     std::vector<int64_t> sized_slots;
+    std::vector<int64_t> sized_layer_counts;
     uint64_t per_layer_bytes = 0;
     if (native_pack && o.expert_cache > 0 && o.expert_cache_per_layer) {
         const size_t free_b = strata::core::device_free_bytes();   // the same reading the shared-cache sizing uses
@@ -5157,16 +5157,26 @@ int main(int argc, char** argv) {
         if (q > 0) {
             per_layer_bytes = sum;
             sized_slots.reserve((size_t) q * (size_t) g.n_layers);
+            sized_layer_counts.assign((size_t)g.n_layers, 0);
             for (int64_t l = 0; l < g.n_layers; ++l) {
                 if (rpc_full_layers && rpc_owned_layers[(size_t)l]) continue;
                 const int64_t b = (int64_t) lay.blob_bytes(l);
                 for (int64_t s = 0; s < q; ++s) sized_slots.push_back(b);
+                sized_layer_counts[(size_t)l] = q;
             }
             o.expert_cache = (int) sized_slots.size();
             std::fprintf(stderr, "strata generate: per-layer slots use each layer's blob: %d uniform slots "
                                  "(%.2f GiB) -> %d slots, %lld per layer (%.2f GiB)\n",
                          asked, (double) budget / 1073741824.0, o.expert_cache, (long long) q,
                          (double) ((uint64_t) q * per_layer_bytes) / 1073741824.0);
+        } else {
+            // Do not fall through to a uniform cache here: the exact per-layer ranges cannot be represented by
+            // that fallback, especially when complete RPC-owned layers have no local slots at all.
+            o.expert_cache = 0;
+            sized_slots.clear();
+            sized_layer_counts.clear();
+            std::fprintf(stderr, "strata generate: per-layer expert cache disabled: the local layers do not fit one "
+                                 "expert each in the available cache budget\n");
         }
     } else if (native_pack && o.expert_cache > 0 && !profile.empty()) {
         size_t free_b = 0, total_b = 0;
@@ -5213,17 +5223,26 @@ int main(int argc, char** argv) {
     if (o.expert_cache > 0) {
         // keep the first `keep_bytes` of the cache (the profile's hottest experts first); false when nothing is left
         auto shrink_to = [&](int64_t keep_bytes) -> bool {
-            if (keep_bytes <= 0) { o.expert_cache = 0; sized_slots.clear(); return false; }
+            if (keep_bytes <= 0) {
+                o.expert_cache = 0;
+                sized_slots.clear();
+                sized_layer_counts.clear();
+                return false;
+            }
             if (per_layer_bytes > 0) {
-                // Cutting the list short would put one layer's blob in the next layer's range.
+                // Rebuild all local ranges at the smaller quota. Reintroducing RPC-owned layers here would allocate
+                // unowned slots and shift every layer after them into a different size range.
                 const auto& lay = strata::kernels::cpu::expert_layout();
                 int64_t q = keep_bytes / (int64_t) per_layer_bytes;
                 if (q > g.n_expert) q = g.n_expert;
                 sized_slots.clear();
-                if (q <= 0) { o.expert_cache = 0; return false; }
+                sized_layer_counts.assign((size_t)g.n_layers, 0);
+                if (q <= 0) { o.expert_cache = 0; sized_layer_counts.clear(); return false; }
                 for (int64_t l = 0; l < g.n_layers; ++l) {
+                    if (rpc_full_layers && rpc_owned_layers[(size_t)l]) continue;
                     const int64_t b = (int64_t) lay.blob_bytes(l);
                     for (int64_t s = 0; s < q; ++s) sized_slots.push_back(b);
+                    sized_layer_counts[(size_t)l] = q;
                 }
                 o.expert_cache = (int) sized_slots.size();
                 return true;
@@ -5265,6 +5284,11 @@ int main(int argc, char** argv) {
                 ok = sized_slots.empty()
                     ? xcache.open(o.expert_cache, g.n_layers, g.n_expert, (int64_t) strata::kernels::cpu::expert_layout().max_blob, err)
                     : xcache.open_sized(sized_slots, g.n_layers, g.n_expert, err);
+            }
+            if (ok && !sized_layer_counts.empty() && !xcache.set_layer_slot_counts(sized_layer_counts, err)) {
+                xcache.close();
+                std::fprintf(stderr, "strata generate: expert-cache layer layout is invalid: %s\n", err.c_str());
+                return 1;
             }
             if (!ok) {
                 // Issue #60: on Windows a device allocation is also charged to the system commit (RAM + page file),
@@ -5721,6 +5745,20 @@ int main(int argc, char** argv) {
             ok = cudaMemcpy(routers[(size_t) l].data(), w->data, (size_t) w->bytes, cudaMemcpyDeviceToHost) == cudaSuccess;
         }
         const char* kv = std::getenv("STRATA_LOOKAHEAD_K");
+        std::vector<uint8_t> remote_owned;
+        for (int r = 0; r < drive.d.remote_count && ok; ++r) {
+            const auto* helper = drive.d.remote[r];
+            if (helper == nullptr || !helper->is_rpc_client()) continue;
+            const auto& mask = helper->remote_ownership_mask();
+            if (mask.size() != (size_t)g.n_layers * (size_t)g.n_expert) {
+                ok = false;
+                err = "RPC remote-ownership mask does not match the loaded model";
+                break;
+            }
+            if (remote_owned.empty()) remote_owned.assign(mask.size(), 0);
+            for (size_t i = 0; i < mask.size(); ++i) remote_owned[i] |= mask[i];
+        }
+        if (ok && !remote_owned.empty()) lookahead.set_remote_ownership(std::move(remote_owned));
         if (ok && lookahead.start(std::move(routers), g.n_embd, g.n_expert, kv ? std::atoi(kv) : 10, srcp, err, fs_ahead || la_stats)) {
             drive.d.lookahead = &lookahead;
             if (la_stats) lookahead.enable_stats(g.n_layers);
@@ -10031,6 +10069,15 @@ int main(int argc, char** argv) {
                 }
             }
             stop_req.store(false);   // a STOP that arrived between requests is stale
+            struct RpcCancelBinding {
+                strata::core::RemoteExperts** helpers;
+                int count;
+                ~RpcCancelBinding() {
+                    for (int i = 0; i < count; ++i) if (helpers[i] != nullptr) helpers[i]->set_cancel_flag(nullptr);
+                }
+            } rpc_cancel_binding{drive.d.remote, drive.d.remote_count};
+            for (int i = 0; i < drive.d.remote_count; ++i)
+                if (drive.d.remote[i] != nullptr) drive.d.remote[i]->set_cancel_flag(&stop_req);
             err.clear();
             // Disk sessions: SAVE <path> | RESTORE <path>, between requests (the path runs to the end of the line,
             // UTF-8).  The file holds what a parked conversation holds (conversation_file.hpp).  Answers: SAVED /

@@ -1,5 +1,6 @@
 // src/core/expert_source.cpp - the adapter.  See the header for the three clauses of the contract.
 #include "strata/core/expert_source.hpp"
+#include "strata/core/remote_ownership.hpp"
 #include "strata/core/foresight_swap.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/platform/aux_cpus.hpp"
@@ -2186,6 +2187,10 @@ bool RouterLookahead::start(std::vector<std::vector<uint16_t>> routers, int64_t 
     if (n_embd % 8 != 0) { err = "RouterLookahead: n_embd is not a multiple of 8"; return false; }
     for (const auto& r : routers)
         if (r.size() != (size_t) (n_embd * n_expert)) { err = "RouterLookahead: a router of another shape"; return false; }
+    if (!remote_owned_.empty() && remote_owned_.size() != routers.size() * (size_t)n_expert) {
+        err = "RouterLookahead: remote-ownership mask has another model shape";
+        return false;
+    }
     routers_ = std::move(routers);
     n_embd_ = n_embd;
     n_expert_ = n_expert;
@@ -2237,6 +2242,7 @@ void RouterLookahead::stats_score(int64_t layer, const int32_t* ids, int64_t n, 
     for (int64_t i = 0; i < n; ++i) {
         const int32_t e = ids[i];
         if (e < 0 || e >= n_expert_) continue;
+        if (is_remote_owned(remote_owned_, n_expert_, layer, e)) continue;
         if (host_res != nullptr && host_res[(size_t) (layer * n_expert_ + e)] >= 0) continue;
         act[(size_t) (e >> 6)] |= 1ull << (e & 63);
     }
@@ -2257,6 +2263,7 @@ void RouterLookahead::stats_score(int64_t layer, const int32_t* ids, int64_t n, 
         for (int64_t i = 0; i < n; ++i) {
             const int32_t e = ids[i];
             if (e < 0 || e >= n_expert_) continue;
+            if (is_remote_owned(remote_owned_, n_expert_, layer, e)) continue;
             if (host_res != nullptr && host_res[(size_t) (layer * n_expert_ + e)] >= 0) continue;
             if (std::find(order_miss.begin(), order_miss.end(), e) == order_miss.end()) order_miss.push_back(e);
         }
@@ -2371,15 +2378,19 @@ void RouterLookahead::run() {
         for (int64_t t = 0; t < nt; ++t) {
             const float* lt = logits.data() + (size_t) (t * n_expert_);
             for (int64_t e = 0; e < n_expert_; ++e) order[(size_t) e] = (int32_t) e;
-            std::partial_sort(order.begin(), order.begin() + kmax, order.end(),
-                              [&](int32_t a, int32_t b) { return lt[(size_t) a] > lt[(size_t) b]; });
-            for (int j = 0; j < kmax; ++j) {
+            // Rank the full row so a remotely-owned expert does not consume one of the local warm candidates.
+            std::sort(order.begin(), order.end(),
+                      [&](int32_t a, int32_t b) { return lt[(size_t) a] > lt[(size_t) b]; });
+            int local_rank = 0;
+            for (int j = 0; j < n_expert_ && local_rank < kmax; ++j) {
                 const int64_t e = order[(size_t) j];
+                if (is_remote_owned(remote_owned_, n_expert_, layer, e)) continue;
+                const int rank = local_rank++;
                 if (host_res != nullptr && host_res[(size_t) (layer * n_expert_ + e)] >= 0) continue;   // on the GPU
-                if (j < k_ && std::find(want.begin(), want.end(), e) == want.end()) want.push_back(e);
+                if (rank < k_ && std::find(want.begin(), want.end(), e) == want.end()) want.push_back(e);
                 if (stats_on_ && dj == 0)
                     for (int s = 0; s < 3; ++s)
-                        if (j < ks[s]) sm[(size_t) (s * words_ + (e >> 6))] |= 1ull << (e & 63);
+                        if (rank < ks[s]) sm[(size_t) (s * words_ + (e >> 6))] |= 1ull << (e & 63);
             }
         }
         if (stats_on_ && dj == 0) {
@@ -2388,14 +2399,17 @@ void RouterLookahead::run() {
             for (int64_t t = 0; t < nt; ++t) {
                 const float* lt = logits.data() + (size_t) (t * n_expert_);
                 for (int64_t e = 0; e < n_expert_; ++e) order[(size_t) e] = (int32_t) e;
-                std::partial_sort(order.begin(), order.begin() + k_, order.end(),
-                                  [&](int32_t a, int32_t b) { return lt[(size_t) a] > lt[(size_t) b]; });
-                for (int j = 0; j < k_; ++j) {
+                std::sort(order.begin(), order.end(),
+                          [&](int32_t a, int32_t b) { return lt[(size_t) a] > lt[(size_t) b]; });
+                int local_rank = 0;
+                for (int j = 0; j < n_expert_ && local_rank < k_; ++j) {
                     const int32_t e = order[(size_t) j];
+                    if (is_remote_owned(remote_owned_, n_expert_, layer, e)) continue;
+                    const int rank = local_rank++;
                     if (host_res != nullptr && host_res[(size_t) (layer * n_expert_ + e)] >= 0) continue;
                     auto it = std::find_if(votes.begin(), votes.end(), [&](const auto& v) { return v.second == e; });
-                    if (it == votes.end()) votes.emplace_back(64 - j, e);
-                    else it->first += 64 - j;
+                    if (it == votes.end()) votes.emplace_back(64 - rank, e);
+                    else it->first += 64 - rank;
                 }
             }
             std::sort(votes.begin(), votes.end(), [](const auto& a, const auto& b) { return a.first > b.first; });

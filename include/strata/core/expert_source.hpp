@@ -252,6 +252,8 @@ public:
     /// `routers[l]`: layer l's ffn_gate_inp as BF16 bits, n_expert rows of n_embd.
     bool start(std::vector<std::vector<uint16_t>> routers, int64_t n_embd, int64_t n_expert, int k, ExpertSource* src,
                std::string& err, bool allow_cold_source = false);
+    /// Exclude accepted RPC-owned pairs from file lookahead. Set before start; the immutable mask is safe for the worker.
+    void set_remote_ownership(std::vector<uint8_t> mask) { remote_owned_ = std::move(mask); }
     /// One prefetch design (#1348): the predicted experts that no cache holds also go to the Foresight swap space
     /// (ForesightSwap::predict), which copies them to VRAM ahead of the layer.  nullptr detaches it (waits for a
     /// prediction in progress), so the swap space can be destroyed first.
@@ -276,6 +278,7 @@ public:
 private:
     void run();
     std::vector<std::vector<uint16_t>> routers_;
+    std::vector<uint8_t> remote_owned_;
     int64_t n_embd_ = 0, n_expert_ = 0;
     int k_ = 10;
     int depth_ = 1;

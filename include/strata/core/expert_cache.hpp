@@ -28,6 +28,7 @@
 #include <string>
 #include <vector>
 
+#include "strata/core/expert_cache_layout.hpp"
 #include "strata/core/vmm.hpp"
 
 namespace strata::core {
@@ -171,6 +172,9 @@ public:
     bool per_layer_admission() const { return per_layer_; }
     /// The slot range layer `l` may admit into under per-layer admission.  Exposed so a test can check it.
     void layer_slot_range(int64_t layer, int64_t& lo, int64_t& hi) const;
+    /// Replace the default equal partition with exact global-layer slot counts. Empty counts reserve no local slots.
+    /// Used by whole-layer RPC placement so admission and the packed slot list share the same mapping.
+    bool set_layer_slot_counts(const std::vector<int64_t>& counts, std::string& err);
 
     /// The device address of one slot.
     uint8_t* device_slot(int32_t slot);
@@ -238,6 +242,7 @@ private:
     /// pre-existing path is untouched.
     bool per_layer_ = false;
     std::vector<int32_t> layer_next_;   ///< [n_layers] -> that layer's next free slot
+    std::vector<LayerSlotRange> layer_ranges_; ///< optional exact ranges, including empty remote-owned layers
     std::vector<uint64_t> off_;         ///< plan v0.3 P6: slot offsets (slots + 1 entries) when sized
     int64_t admitted_ = 0;
 };
