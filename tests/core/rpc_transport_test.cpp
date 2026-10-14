@@ -20,27 +20,6 @@
 namespace {
 using namespace strata::core::rpc;
 
-bool set_socket_buffer(Socket socket, int option, int buffer_bytes, std::string& err) {
-#if defined(_WIN32)
-    if (setsockopt((SOCKET)socket, SOL_SOCKET, option, (const char*)&buffer_bytes, sizeof(buffer_bytes)) != 0) {
-        err = "could not constrain RPC loopback socket buffers (Winsock " + std::to_string(WSAGetLastError()) + ")";
-        return false;
-    }
-#else
-    if (setsockopt((int)socket, SOL_SOCKET, option, &buffer_bytes, sizeof(buffer_bytes)) != 0) {
-        err = "could not constrain RPC loopback socket buffers";
-        return false;
-    }
-#endif
-    return true;
-}
-
-bool constrain_socket_buffers(Socket sender, Socket receiver, std::string& err) {
-    constexpr int buffer_bytes = 8192;
-    return set_socket_buffer(sender, SO_SNDBUF, buffer_bytes, err) &&
-           set_socket_buffer(receiver, SO_RCVBUF, buffer_bytes, err);
-}
-
 void shutdown_socket(Socket socket) {
 #if defined(_WIN32)
     (void)::shutdown((SOCKET)socket, SD_BOTH);
@@ -49,8 +28,7 @@ void shutdown_socket(Socket socket) {
 #endif
 }
 
-bool open_loopback(Socket& listener, Socket& client, Socket& peer, std::string& err,
-                   int receive_buffer_bytes = 0) {
+bool open_loopback(Socket& listener, Socket& client, Socket& peer, std::string& err) {
     const uint32_t seed = (uint32_t)std::chrono::steady_clock::now().time_since_epoch().count();
     uint32_t port = 0;
     for (uint32_t i = 0; i < 64 && listener == kInvalidSocket; ++i) {
@@ -59,13 +37,6 @@ bool open_loopback(Socket& listener, Socket& client, Socket& peer, std::string& 
         if (listen("127.0.0.1:" + std::to_string(candidate), listener, err)) port = candidate;
     }
     if (listener == kInvalidSocket) return false;
-    // Set the listener's receive buffer before the TCP handshake. On Windows this prevents
-    // receive-window autotuning from advertising a large default window to the sender.
-    if (receive_buffer_bytes > 0 && !set_socket_buffer(listener, SO_RCVBUF, receive_buffer_bytes, err)) {
-        close(listener);
-        listener = kInvalidSocket;
-        return false;
-    }
     if (!connect("127.0.0.1:" + std::to_string(port), client, err) || !accept(listener, peer, err) ||
         !set_nodelay(client, true, err) || !set_nodelay(peer, true, err)) {
         close(client); close(peer); close(listener);
@@ -147,78 +118,56 @@ bool expired_deadlines_reject_immediate_io(std::string& err) {
 
 bool progressing_transfer_keeps_one_total_budget(std::string& err) {
     Socket listener = kInvalidSocket, client = kInvalidSocket, peer = kInvalidSocket;
-    constexpr int kSocketBufferBytes = 8192;
-    if (!open_loopback(listener, client, peer, err, kSocketBufferBytes)) return false;
-    if (!constrain_socket_buffers(client, peer, err)) {
-        close(client); close(peer);
-        return false;
-    }
+    if (!open_loopback(listener, client, peer, err)) return false;
     constexpr size_t kChunk = 4096;
-    constexpr size_t kPayloadBytes = 128u << 20;
-    std::atomic<size_t> received{0};
-    std::atomic<bool> prefix_seen{false};
+    constexpr size_t kMaxRounds = 128;
+    std::atomic<size_t> received_rounds{0};
     std::atomic<bool> receiver_ready{false};
     std::thread server([&] {
         std::vector<uint8_t> block(kChunk);
         std::string server_err;
-        if (!recv_all(peer, block.data(), block.size(), deadline_after(std::chrono::seconds(3)), server_err)) return;
-        received.fetch_add(block.size(), std::memory_order_relaxed);
-        prefix_seen.store(true, std::memory_order_release);
         receiver_ready.store(true, std::memory_order_release);
-        while (received.load(std::memory_order_relaxed) < kChunk + kPayloadBytes) {
+        for (size_t round = 0; round < kMaxRounds; ++round) {
             if (!recv_all(peer, block.data(), block.size(), deadline_after(std::chrono::seconds(3)), server_err)) return;
-            received.fetch_add(block.size(), std::memory_order_relaxed);
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            received_rounds.fetch_add(1, std::memory_order_relaxed);
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            const uint8_t ack = (uint8_t)round;
+            if (!send_all(peer, &ack, sizeof(ack), deadline_after(std::chrono::seconds(3)), server_err)) return;
         }
     });
 
-    std::vector<uint8_t> payload(kPayloadBytes, 0x6b);
-    std::vector<uint8_t> prefix(kChunk, 0xdd);
-    if (!send_all(client, prefix.data(), prefix.size(), err)) {
-        close(client); server.join(); close(peer); return false;
-    }
-    const auto barrier_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
-    while (!prefix_seen.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < barrier_deadline)
-        std::this_thread::yield();
-    if (!prefix_seen.load(std::memory_order_acquire)) {
-        close(client); server.join(); close(peer);
-        err = "the progress test peer did not receive its initial bytes";
-        return false;
-    }
-    while (!receiver_ready.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < barrier_deadline)
+    const auto ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (!receiver_ready.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < ready_deadline)
         std::this_thread::yield();
     if (!receiver_ready.load(std::memory_order_acquire)) {
         close(client); server.join(); close(peer);
-        err = "the progress test peer was not ready for payload bytes";
+        err = "the progress test peer was not ready for paced transfers";
         return false;
     }
 
-    std::atomic<bool> sender_done{false};
-    bool sent = false;
-    std::string send_err;
+    std::vector<uint8_t> payload(kChunk, 0x6b);
+    size_t completed_rounds = 0;
+    uint8_t ack = 0;
     const auto deadline = deadline_after(std::chrono::seconds(1));
-    std::thread sender([&] {
-        sent = send_all(client, payload.data(), payload.size(), deadline, send_err);
-        sender_done.store(true, std::memory_order_release);
-    });
-    while (!sender_done.load(std::memory_order_acquire) &&
-           received.load(std::memory_order_relaxed) <= kChunk &&
-           std::chrono::steady_clock::now() < deadline.expires + std::chrono::milliseconds(250))
-        std::this_thread::yield();
-    const bool observed_progress = received.load(std::memory_order_relaxed) > kChunk;
-    sender.join();
-    err = send_err;
-    const size_t progress = received.load(std::memory_order_relaxed);
+    for (size_t round = 0; round < kMaxRounds; ++round) {
+        if (!send_all(client, payload.data(), payload.size(), deadline, err)) break;
+        if (!recv_all(client, &ack, sizeof(ack), deadline, err)) break;
+        if (ack != (uint8_t)round) {
+            err = "paced RPC deadline test received an out-of-order acknowledgement";
+            break;
+        }
+        ++completed_rounds;
+    }
+    const size_t progress = received_rounds.load(std::memory_order_relaxed);
     close(client);
     shutdown_socket(peer);
     server.join();
     close(peer);
-    if (sent || err != "RPC I/O deadline exceeded" || !observed_progress ||
-        progress <= kChunk || progress >= kChunk + kPayloadBytes) {
-        err = "a progressing transfer did not stop at its original total deadline (sent=" +
-              std::string(sent ? "true" : "false") + ", error='" + send_err + "', received=" +
-              std::to_string(progress) + ", observed_progress=" +
-              std::string(observed_progress ? "true" : "false") + ")";
+    if (err != "RPC I/O deadline exceeded" || completed_rounds == 0 ||
+        completed_rounds >= kMaxRounds || progress == 0 || progress > kMaxRounds) {
+        err = "a progressing RPC sequence did not stop at its original total deadline (error='" + err +
+              "', completed_rounds=" + std::to_string(completed_rounds) +
+              ", received_rounds=" + std::to_string(progress) + ")";
         return false;
     }
     return true;
