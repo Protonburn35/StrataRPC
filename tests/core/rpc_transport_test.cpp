@@ -8,8 +8,35 @@
 #include <thread>
 #include <vector>
 
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <winsock2.h>
+#else
+#include <sys/socket.h>
+#endif
+
 namespace {
 using namespace strata::core::rpc;
+
+bool constrain_socket_buffers(Socket sender, Socket receiver, std::string& err) {
+    int buffer_bytes = 8192;
+#if defined(_WIN32)
+    if (setsockopt((SOCKET)sender, SOL_SOCKET, SO_SNDBUF, (const char*)&buffer_bytes, sizeof(buffer_bytes)) != 0 ||
+        setsockopt((SOCKET)receiver, SOL_SOCKET, SO_RCVBUF, (const char*)&buffer_bytes, sizeof(buffer_bytes)) != 0) {
+        err = "could not constrain RPC loopback socket buffers (Winsock " + std::to_string(WSAGetLastError()) + ")";
+        return false;
+    }
+#else
+    if (setsockopt((int)sender, SOL_SOCKET, SO_SNDBUF, &buffer_bytes, sizeof(buffer_bytes)) != 0 ||
+        setsockopt((int)receiver, SOL_SOCKET, SO_RCVBUF, &buffer_bytes, sizeof(buffer_bytes)) != 0) {
+        err = "could not constrain RPC loopback socket buffers";
+        return false;
+    }
+#endif
+    return true;
+}
 
 bool open_loopback(Socket& listener, Socket& client, Socket& peer, std::string& err) {
     const uint32_t seed = (uint32_t)std::chrono::steady_clock::now().time_since_epoch().count();
@@ -102,20 +129,26 @@ bool expired_deadlines_reject_immediate_io(std::string& err) {
 bool progressing_transfer_keeps_one_total_budget(std::string& err) {
     Socket listener = kInvalidSocket, client = kInvalidSocket, peer = kInvalidSocket;
     if (!open_loopback(listener, client, peer, err)) return false;
+    if (!constrain_socket_buffers(client, peer, err)) {
+        close(client); close(peer);
+        return false;
+    }
     constexpr size_t kChunk = 4096;
     constexpr size_t kPayloadBytes = 8u << 20;
     std::atomic<size_t> received{0};
     std::atomic<bool> prefix_seen{false};
+    std::atomic<bool> receiver_ready{false};
     std::thread server([&] {
         std::vector<uint8_t> block(kChunk);
         std::string server_err;
         if (!recv_all(peer, block.data(), block.size(), deadline_after(std::chrono::seconds(3)), server_err)) return;
         received.fetch_add(block.size(), std::memory_order_relaxed);
         prefix_seen.store(true, std::memory_order_release);
+        receiver_ready.store(true, std::memory_order_release);
         while (received.load(std::memory_order_relaxed) < kChunk + kPayloadBytes) {
             if (!recv_all(peer, block.data(), block.size(), deadline_after(std::chrono::seconds(3)), server_err)) return;
             received.fetch_add(block.size(), std::memory_order_relaxed);
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
     });
 
@@ -132,13 +165,39 @@ bool progressing_transfer_keeps_one_total_budget(std::string& err) {
         err = "the progress test peer did not receive its initial bytes";
         return false;
     }
-    const bool sent = send_all(client, payload.data(), payload.size(), deadline_after(std::chrono::milliseconds(100)), err);
+    while (!receiver_ready.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < barrier_deadline)
+        std::this_thread::yield();
+    if (!receiver_ready.load(std::memory_order_acquire)) {
+        close(client); server.join(); close(peer);
+        err = "the progress test peer was not ready for payload bytes";
+        return false;
+    }
+
+    std::atomic<bool> sender_done{false};
+    bool sent = false;
+    std::string send_err;
+    const auto deadline = deadline_after(std::chrono::seconds(1));
+    std::thread sender([&] {
+        sent = send_all(client, payload.data(), payload.size(), deadline, send_err);
+        sender_done.store(true, std::memory_order_release);
+    });
+    while (!sender_done.load(std::memory_order_acquire) &&
+           received.load(std::memory_order_relaxed) <= kChunk &&
+           std::chrono::steady_clock::now() < deadline.expires + std::chrono::milliseconds(250))
+        std::this_thread::yield();
+    const bool observed_progress = received.load(std::memory_order_relaxed) > kChunk;
+    sender.join();
+    err = send_err;
     const size_t progress = received.load(std::memory_order_relaxed);
     close(client);
     server.join();
     close(peer);
-    if (sent || err != "RPC I/O deadline exceeded" || progress <= kChunk || progress >= kChunk + kPayloadBytes) {
-        err = "a progressing transfer did not stop at its original total deadline";
+    if (sent || err != "RPC I/O deadline exceeded" || !observed_progress ||
+        progress <= kChunk || progress >= kChunk + kPayloadBytes) {
+        err = "a progressing transfer did not stop at its original total deadline (sent=" +
+              std::string(sent ? "true" : "false") + ", error='" + send_err + "', received=" +
+              std::to_string(progress) + ", observed_progress=" +
+              std::string(observed_progress ? "true" : "false") + ")";
         return false;
     }
     return true;
