@@ -1187,7 +1187,7 @@ public:
         if (mtp_ != nullptr) {
             const strata::core::OnDevice on_mtp(mtp_->device());
             if (!mtp_->idle(err)) return false;
-            strata::kernels::qsa_state_zero(mtp_->kv_state_rw(), geometry_, stream_);
+            strata::core::qsa_state_zero(mtp_->kv_state_rw(), geometry_, stream_);
         }
         strata::core::session_zero(session_, geometry_, nullptr, stream_);
         if (cudaStreamSynchronize(stream_) != cudaSuccess) { err = "layer-stage session reset failed"; return false; }
@@ -1318,7 +1318,7 @@ public:
         if (mtp_ != nullptr) {
             const strata::core::OnDevice on_mtp(mtp_->device());
             if (!mtp_->idle(err)) return false;
-            strata::kernels::qsa_state_zero(mtp_->kv_state_rw(), geometry_, stream_);
+            strata::core::qsa_state_zero(mtp_->kv_state_rw(), geometry_, stream_);
         }
         strata::core::session_zero(session_, geometry_, nullptr, stream_);
         if (cudaStreamSynchronize(stream_) != cudaSuccess) { err = "layer-stage session abort failed"; return false; }
@@ -11385,7 +11385,7 @@ int main(int argc, char** argv) {
                     return 1;
                 }
                 bool remote_reused = false;
-                const bool exact_live_resume = o.layer_stage_reuse && from_live && live_ok && !cancelled && !nf_hit &&
+                const bool exact_live_resume = o.layer_stage_reuse && from_live && live_ok &&
                                                resume == (int64_t)live.size() && resume > 0;
                 if (exact_live_resume) {
                     ++stage_generation;
