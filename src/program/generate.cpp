@@ -8017,7 +8017,7 @@ int main(int argc, char** argv) {
             } else {
                 ver.set_stage(local_layer_begin, -1, stage_handoff.device, nullptr);
                 stage_executor = std::make_unique<ModelLayerStageExecutor>(ss, g, ver, sp, drive, stage_handoff,
-                                                                           main_cs, (uint32_t) o.spec);
+                                                                           main_stream, (uint32_t) o.spec);
             }
         }
         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
