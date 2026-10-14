@@ -76,6 +76,7 @@ jobs:
         shell: pwsh
         run: |
           python tools/package_rpc_windows.py --exe build-rpc/strata.exe --out dist --cuda-version 13.2.2 --archs 89,120
+          python tests/test_rpc_windows_package.py dist/strata-rpc-windows-x64.zip
           $asset = "dist/strata-rpc-windows-x64.zip"
           $hash = (Get-FileHash $asset -Algorithm SHA256).Hash.ToLowerInvariant()
           "$hash  strata-rpc-windows-x64.zip" | Set-Content "$asset.sha256" -Encoding ascii

@@ -129,6 +129,7 @@ the existing local prefill/verifier handoff shapes, not this expert-cache RPC's 
 On a 1 GbE link, a contiguous remote layer stage with its own KV remains the more network-efficient direction for
 decode and long-context capacity: it would exchange the verifier handoff once per stage boundary rather than making
 one request per remote-owned MoE layer. A persistent stage must also keep QSA/GDN state, KV, PLE history, and
-speculative commit/rollback state on the remote GPU. The experimental native protocol/API is documented in
-[LAYER_STAGE_RPC.md](LAYER_STAGE_RPC.md); it is not yet connected to `strata.exe` or an in-tree model-owning executor,
-so it is not a runnable layer split. It has no Ray adapter. The usable mode in this document remains expert-cache RPC.
+speculative commit/rollback state on the remote GPU. The native layer-stage worker and coordinator are implemented as an optional Strata mode; see
+[LAYER_STAGE_RPC.md](LAYER_STAGE_RPC.md) for its supported configuration, Windows setup, network costs, and validation
+limits. Its optional Ray supervisor manages the worker process only. The mode remains experimental and has no measured
+speedup.

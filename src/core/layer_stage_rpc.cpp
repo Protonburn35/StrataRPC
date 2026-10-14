@@ -194,6 +194,45 @@ bool receive_header(rpc::Socket socket, uint16_t& type, uint64_t& operation, uin
     return true;
 }
 
+bool receive_operation_header(rpc::Socket socket, uint16_t& type, uint64_t& operation, uint64_t& payload_bytes,
+                              std::chrono::milliseconds timeout, rpc::IoDeadline& deadline, std::string& err) {
+    std::array<uint8_t, kHeaderBytes> h{};
+    // A connected authenticated worker may sit idle between requests. Only after its first byte arrives do we start
+    // the bounded total deadline for this operation's remaining header, payload, execution, and reply.
+    if (!rpc::recv_all(socket, h.data(), 1, rpc::wait_forever(), err)) return false;
+    deadline = rpc::deadline_after(timeout);
+    if (!rpc::recv_all(socket, h.data() + 1, h.size() - 1, deadline, err)) return false;
+    if (std::memcmp(h.data(), "STGE", 4) != 0 || get16(h.data() + 4) != kVersion) {
+        err = "layer-stage frame has invalid magic or version";
+        return false;
+    }
+    type = get16(h.data() + 6); operation = get64(h.data() + 8); payload_bytes = get64(h.data() + 16);
+    if (payload_bytes > kMaxFrameBytes) { err = "layer-stage frame exceeds the protocol limit"; return false; }
+    return true;
+}
+
+struct RequestFingerprint {
+    uint64_t bytes = 0;
+    uint64_t a = 1469598103934665603ull;
+    uint64_t b = 0x9e3779b97f4a7c15ull;
+};
+
+RequestFingerprint fingerprint_request(const uint8_t* data, size_t bytes) {
+    RequestFingerprint f;
+    f.bytes = (uint64_t)bytes;
+    for (size_t i = 0; i < bytes; ++i) {
+        const uint64_t v = data[i];
+        f.a = (f.a ^ v) * 1099511628211ull;
+        f.b ^= v + 0x517cc1b727220a95ull + (f.b << 6) + (f.b >> 2);
+        f.b = (f.b ^ (f.b >> 29)) * 0xbf58476d1ce4e5b9ull;
+    }
+    f.b ^= f.bytes + 0x94d049bb133111ebull;
+    f.b = (f.b ^ (f.b >> 30)) * 0xbf58476d1ce4e5b9ull;
+    f.b = (f.b ^ (f.b >> 27)) * 0x94d049bb133111ebull;
+    f.b ^= f.b >> 31;
+    return f;
+}
+
 std::vector<uint8_t> response_payload(bool ok, const std::string& message, const void* body = nullptr,
                                       size_t body_bytes = 0) {
     const size_t n = std::min<size_t>(message.size(), kMaxErrorBytes);
@@ -211,23 +250,41 @@ bool send_response(rpc::Socket socket, uint16_t type, uint64_t op, const std::ve
                       deadline, err);
 }
 
-bool parse_response(Reader& r, void* response, size_t response_bytes, std::string& err) {
+enum class ParsedResponse { success, rejected, malformed };
+
+ParsedResponse parse_response(Reader& r, void* response, size_t response_bytes, std::string& err) {
     uint32_t status = 0, message_bytes = 0;
     if (!r.u32(status) || !r.u32(message_bytes) || message_bytes > kMaxErrorBytes || message_bytes > r.left()) {
         err = "layer-stage response has an invalid status frame";
-        return false;
+        return ParsedResponse::malformed;
+    }
+    if (status > 1) {
+        err = "layer-stage response uses an undefined status code";
+        return ParsedResponse::malformed;
     }
     std::string message((const char*)r.remaining(), message_bytes);
     r.at += message_bytes;
     if (status != 0) {
+        if (r.left() != 0) {
+            err = "layer-stage rejection response contains an unexpected body";
+            return ParsedResponse::malformed;
+        }
         err = message.empty() ? "layer-stage worker rejected the operation" : message;
-        return false;
+        return ParsedResponse::rejected;
     }
-    if (r.left() != response_bytes) {
+    if (message_bytes != 0) {
+        err = "layer-stage success response contains an unexpected message";
+        return ParsedResponse::malformed;
+    }
+    if (r.left() != response_bytes || (response_bytes != 0 && response == nullptr)) {
         err = "layer-stage response has an unexpected payload size";
-        return false;
+        return ParsedResponse::malformed;
     }
-    return r.raw(response, response_bytes);
+    if (!r.raw(response, response_bytes)) {
+        err = "layer-stage success response body is truncated";
+        return ParsedResponse::malformed;
+    }
+    return ParsedResponse::success;
 }
 
 bool checked_bytes(uint64_t n, size_t element, size_t& bytes) {
@@ -247,16 +304,18 @@ bool LayerStageClient::connect(const std::string& endpoint, const std::string& t
         err = "layer-stage RPC needs a valid stage identity, IEEE-754 FP32 support, and a nonempty token";
         return false;
     }
-    if (!rpc::connect(endpoint, socket_, rpc::deadline_after(std::chrono::seconds(5)), err)) return false;
-    if (!rpc::set_nodelay(socket_, true, err)) { close(); return false; }
+    endpoint_ = endpoint;
+    token_ = token;
     spec_ = expected;
+    if (!rpc::connect(endpoint_, socket_, rpc::deadline_after(std::chrono::seconds(5), cancelled_), err)) return false;
+    if (!rpc::set_nodelay(socket_, true, err)) { close(); return false; }
     Writer hello;
-    write_spec(hello, expected);
+    write_spec(hello, spec_);
     hello.u32(native_endian_marker());
     hello.u32(native_float_marker());
     hello.u32((uint32_t)token.size());
     hello.raw(token.data(), token.size());
-    const auto deadline = rpc::deadline_after(kHandshakeTimeout);
+    const auto deadline = rpc::deadline_after(kHandshakeTimeout, cancelled_);
     if (!send_frame(socket_, kHello, 0, hello.bytes.data(), hello.bytes.size(), nullptr, 0, deadline, err)) {
         close(); return false;
     }
@@ -269,7 +328,7 @@ bool LayerStageClient::connect(const std::string& endpoint, const std::string& t
         close(); return false;
     }
     Reader reader{ack.data(), ack.size(), 0};
-    if (!parse_response(reader, nullptr, 0, err)) { close(); return false; }
+    if (parse_response(reader, nullptr, 0, err) != ParsedResponse::success) { close(); return false; }
     broken_ = false;
     next_operation_ = 1;
     bytes_sent_ = bytes_received_ = 0;
@@ -289,7 +348,7 @@ bool LayerStageClient::request(uint16_t type, const uint8_t* metadata, size_t me
     if (!connected()) { err = "layer-stage RPC is disconnected or was invalidated"; return false; }
     const bool health_req = type == kHealth;
     const uint64_t operation = health_req ? 0 : next_operation_;
-    const auto deadline = rpc::deadline_after(health_req ? std::chrono::seconds(5) : kOperationTimeout);
+    const auto deadline = rpc::deadline_after(health_req ? std::chrono::seconds(5) : kOperationTimeout, cancelled_);
     if (metadata_bytes > kMaxFrameBytes || body_a_bytes > kMaxFrameBytes - metadata_bytes ||
         body_b_bytes > kMaxFrameBytes - metadata_bytes - body_a_bytes) {
         err = "layer-stage frame exceeds the protocol limit";
@@ -325,12 +384,27 @@ bool LayerStageClient::request(uint16_t type, const uint8_t* metadata, size_t me
     }
     bytes_received_ += kHeaderBytes + response_payload_bytes;
     Reader reader{frame.data(), frame.size(), 0};
-    const bool ok = parse_response(reader, response, response_bytes, err);
-    if (ok && !health_req) ++next_operation_;
-    return ok;
+    const ParsedResponse parsed = parse_response(reader, response, response_bytes, err);
+    if (parsed == ParsedResponse::malformed) {
+        broken_ = true;
+        rpc::close(socket_); socket_ = rpc::kInvalidSocket;
+        return false;
+    }
+    if (parsed == ParsedResponse::rejected) return false;   // a valid rejection is recoverable on this connection
+    if (!health_req) ++next_operation_;
+    return true;
 }
 
 bool LayerStageClient::reset(uint64_t session, uint64_t generation, int64_t position, std::string& err) {
+    if (!connected()) {
+        if (endpoint_.empty() || token_.empty()) {
+            err = "layer-stage RPC is disconnected and has no saved worker endpoint";
+            return false;
+        }
+        const std::string endpoint = endpoint_, token = token_;
+        const LayerStageSpec expected = spec_;
+        if (!connect(endpoint, token, expected, err)) return false;
+    }
     next_operation_ = 1;
     Writer m; m.u64(session); m.u64(generation); m.i64(position);
     return request(kReset, m.bytes.data(), m.bytes.size(), nullptr, 0, nullptr, 0, nullptr, 0, err);
@@ -393,8 +467,10 @@ bool LayerStageClient::health(std::string& err) {
     return request(kHealth, nullptr, 0, nullptr, 0, nullptr, 0, nullptr, 0, err);
 }
 
-LayerStageServer::LayerStageServer(std::string token, LayerStageSpec expected, LayerStageExecutor& executor)
-    : token_(std::move(token)), spec_(expected), executor_(executor) {}
+LayerStageServer::LayerStageServer(std::string token, LayerStageSpec expected, LayerStageExecutor& executor,
+                                   std::chrono::milliseconds operation_timeout)
+    : token_(std::move(token)), spec_(expected), executor_(executor),
+      operation_timeout_(operation_timeout.count() > 0 ? operation_timeout : std::chrono::milliseconds(1)) {}
 
 bool LayerStageServer::dispatch(uint16_t type, uint64_t operation, const uint8_t* payload, size_t payload_bytes,
                                 std::vector<uint8_t>& response, std::string& err) {
@@ -412,20 +488,24 @@ bool LayerStageServer::dispatch(uint16_t type, uint64_t operation, const uint8_t
     }
     if (operation == 0) return fail("layer-stage state-changing operation has ID zero");
     if (payload_bytes < 16 || !r.u64(session) || !r.u64(generation)) return fail("layer-stage operation metadata is truncated");
+    const RequestFingerprint request = fingerprint_request(payload, payload_bytes);
     if (operation == last_operation_ && type == last_type_ && session == session_ && generation == generation_) {
+        if (request.bytes != last_request_bytes_ || request.a != last_request_hash_a_ || request.b != last_request_hash_b_)
+            return fail("layer-stage operation ID was reused with a different request payload");
         response = last_response_;
-        return true; // replay the prior acknowledgement/result without applying state changes twice
+        return true; // replay the prior acknowledgement/result only for an identical request
     }
     if (type == kReset) {
-        if (operation != 1 || !r.i64(position) || r.left() != 0 || session == 0 || generation == 0 || position < 0 ||
+        if (operation != 1 || !r.i64(position) || r.left() != 0 || session == 0 || generation == 0 || position != 0 ||
             (uint64_t)position > spec_.max_context)
-            return fail("layer-stage reset metadata is invalid");
+            return fail("layer-stage reset must start a fresh session at position zero");
         if (session == session_ && generation <= generation_)
             return fail("layer-stage reset generation is not newer than the current session");
         const bool ok = executor_.reset(session, generation, position, err);
         response = response_payload(ok, ok ? std::string() : err);
         if (!ok) { session_valid_ = false; return true; }
         session_ = session; generation_ = generation; last_operation_ = operation; last_type_ = type;
+        last_request_bytes_ = request.bytes; last_request_hash_a_ = request.a; last_request_hash_b_ = request.b;
         position_ = position; pending_verify_rows_ = 0;
         last_response_ = response; session_valid_ = true;
         return true;
@@ -494,10 +574,17 @@ bool LayerStageServer::dispatch(uint16_t type, uint64_t operation, const uint8_t
     }
     if (response.empty()) response = response_payload(true, std::string());
     last_operation_ = operation; last_type_ = type; last_response_ = response;
+    last_request_bytes_ = request.bytes; last_request_hash_a_ = request.a; last_request_hash_b_ = request.b;
     return true;
 }
 
 bool LayerStageServer::serve(rpc::Socket client, std::string& err) {
+    // Replay acknowledgements belong to one TCP connection. Keep the last session identity for generation checks, but
+    // never let a new connection receive an acknowledgement for state that was aborted at disconnect.
+    last_operation_ = 0;
+    last_type_ = 0;
+    last_response_.clear();
+    last_request_bytes_ = last_request_hash_a_ = last_request_hash_b_ = 0;
     if (client == rpc::kInvalidSocket || token_.empty() || token_.size() > kMaxErrorBytes || !valid_spec(spec_) ||
         native_float_marker() == 0) {
         err = "layer-stage server was configured with invalid identity, token, or connection";
@@ -541,13 +628,13 @@ bool LayerStageServer::serve(rpc::Socket client, std::string& err) {
 
     for (;;) {
         uint64_t op_bytes = 0;
+        rpc::IoDeadline deadline;
         err.clear();
-        if (!receive_header(client, type, operation, op_bytes, rpc::wait_forever(), err)) {
+        if (!receive_operation_header(client, type, operation, op_bytes, operation_timeout_, deadline, err)) {
             const bool disconnected = err == "RPC connection closed";
             if (!disconnected) close_error = err;
             break;
         }
-        const rpc::IoDeadline deadline = rpc::deadline_after(kOperationTimeout);
         if (type < kReset || type > kHealth || op_bytes > max_operation_payload(spec_)) {
             err = "layer-stage worker received an invalid operation frame";
             break;

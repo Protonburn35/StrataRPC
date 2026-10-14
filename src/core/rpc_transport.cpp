@@ -63,19 +63,24 @@ bool set_nonblocking(NativeSocket s) {
 }
 #endif
 
+bool check_io_state(const IoDeadline& deadline, std::string& err) {
+    if (deadline.cancelled != nullptr && deadline.cancelled->load(std::memory_order_relaxed)) {
+        err = "RPC operation cancelled";
+        return false;
+    }
+    if (deadline.bounded && std::chrono::steady_clock::now() >= deadline.expires) {
+        err = "RPC I/O deadline exceeded";
+        return false;
+    }
+    return true;
+}
+
 bool wait_ready(Socket socket, bool writing, const IoDeadline& deadline, std::string& err) {
     for (;;) {
-        if (deadline.cancelled != nullptr && deadline.cancelled->load(std::memory_order_relaxed)) {
-            err = "RPC operation cancelled";
-            return false;
-        }
+        if (!check_io_state(deadline, err)) return false;
         int wait_ms = -1;
         if (deadline.bounded) {
             const auto now = std::chrono::steady_clock::now();
-            if (now >= deadline.expires) {
-                err = "RPC I/O deadline exceeded";
-                return false;
-            }
             auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline.expires - now).count();
             if (remaining <= 0) remaining = 1;
             wait_ms = (int)std::min<int64_t>(remaining, deadline.cancelled == nullptr ? INT_MAX : 100);
@@ -284,10 +289,7 @@ bool send_all(Socket socket, const void* data, size_t bytes, std::string& err) {
 bool send_all(Socket socket, const void* data, size_t bytes, const IoDeadline& deadline, std::string& err) {
     const char* p = (const char*)data;
     while (bytes) {
-        if (deadline.cancelled != nullptr && deadline.cancelled->load(std::memory_order_relaxed)) {
-            err = "RPC operation cancelled";
-            return false;
-        }
+        if (!check_io_state(deadline, err)) return false;
         const int chunk = (int)std::min<size_t>(bytes, (size_t)INT_MAX);
 #if defined(_WIN32)
         const int n = ::send(native(socket), p, chunk, 0);
@@ -301,6 +303,9 @@ bool send_all(Socket socket, const void* data, size_t bytes, const IoDeadline& d
         }
         if (n <= 0) { err = socket_error("RPC send failed"); return false; }
         p += n; bytes -= (size_t)n;
+        // A nonblocking socket can make repeated immediate progress without ever entering wait_ready(). Keep the
+        // caller's deadline total across the whole frame, including the final successful write.
+        if (!check_io_state(deadline, err)) return false;
     }
     return true;
 }
@@ -312,10 +317,7 @@ bool recv_all(Socket socket, void* data, size_t bytes, std::string& err) {
 bool recv_all(Socket socket, void* data, size_t bytes, const IoDeadline& deadline, std::string& err) {
     char* p = (char*)data;
     while (bytes) {
-        if (deadline.cancelled != nullptr && deadline.cancelled->load(std::memory_order_relaxed)) {
-            err = "RPC operation cancelled";
-            return false;
-        }
+        if (!check_io_state(deadline, err)) return false;
         const int chunk = (int)std::min<size_t>(bytes, (size_t)INT_MAX);
 #if defined(_WIN32)
         const int n = ::recv(native(socket), p, chunk, 0);
@@ -329,6 +331,7 @@ bool recv_all(Socket socket, void* data, size_t bytes, const IoDeadline& deadlin
         }
         if (n <= 0) { err = n == 0 ? "RPC connection closed" : socket_error("RPC receive failed"); return false; }
         p += n; bytes -= (size_t)n;
+        if (!check_io_state(deadline, err)) return false;
     }
     return true;
 }

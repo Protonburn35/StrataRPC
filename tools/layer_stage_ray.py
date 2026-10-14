@@ -24,6 +24,16 @@ def worker_command(config: dict, bind: str, split: int) -> list[str]:
         raise ValueError('worker config needs a string "exe" and string-list "args"')
     if any(x in args for x in ("--layer-stage-client", "--layer-stage-server", "--layer-stage-split")):
         raise ValueError("remove layer-stage flags from the worker config; the Ray launcher adds the server flags")
+    if any(arg == "--gpu" or arg.startswith("--gpu=") for arg in args):
+        raise ValueError("remove --gpu from worker args; Strata would override Ray's CUDA_VISIBLE_DEVICES assignment")
+    configured_gpu = config.get("gpu")
+    if configured_gpu is not None:
+        try:
+            local_gpu = int(configured_gpu)
+        except (TypeError, ValueError) as exc:
+            raise ValueError('worker config "gpu" must be local visible index 0') from exc
+        if local_gpu != 0:
+            raise ValueError("Ray assigned one visible GPU; worker config gpu must be local index 0")
     run_args = list(args)
     if "--serve" not in run_args:
         run_args.insert(0, "--serve")
@@ -35,6 +45,14 @@ def worker_environment(config: dict, token: str, inherited: dict[str, str] | Non
     configured = config.get("env") or {}
     if not isinstance(configured, dict):
         raise ValueError('worker config "env" must be an object')
+    if any(str(k).upper() == "CUDA_VISIBLE_DEVICES" for k in configured):
+        raise ValueError('worker config "env" cannot override Ray-assigned CUDA_VISIBLE_DEVICES')
+    visible = env.get("CUDA_VISIBLE_DEVICES")
+    if visible is None or not visible.strip() or visible.strip() == "-1":
+        raise ValueError("Ray did not assign a visible CUDA device to the layer-stage actor")
+    visible_devices = [part.strip() for part in visible.strip().split(",")]
+    if len(visible_devices) != 1 or not visible_devices[0]:
+        raise ValueError(f"Ray assigned {len(visible_devices)} CUDA devices; the worker actor requires exactly one")
     env.update({str(k): str(v) for k, v in configured.items()})
     lib_dirs = config.get("lib_dirs") or []
     if not isinstance(lib_dirs, list) or any(not isinstance(p, str) for p in lib_dirs):
@@ -44,6 +62,14 @@ def worker_environment(config: dict, token: str, inherited: dict[str, str] | Non
         env[key] = os.pathsep.join([*lib_dirs, env.get(key, "")]).rstrip(os.pathsep)
     env["STRATA_RPC_TOKEN"] = token
     return env
+
+
+def ray_get_bounded(ray, ref, timeout: float, operation: str):
+    """Wait before get: Ray's get timeout does not bound every placement/startup state consistently."""
+    ready, _ = ray.wait([ref], timeout=max(0.0, timeout), num_returns=1)
+    if not ready:
+        raise TimeoutError(f"timed out waiting for Ray {operation}")
+    return ray.get(ref)
 
 
 def worker_node_id(nodes: list[dict], address: str) -> str:
@@ -61,6 +87,8 @@ def make_worker_actor(ray):
             self.lines = deque(maxlen=2000)
             self.line_count = 0
             self.lock = threading.Lock()
+            self.proc_lock = threading.Lock()
+            self.stop_lock = threading.Lock()
             self.ready = threading.Event()
             self.reader = None
 
@@ -70,14 +98,16 @@ def make_worker_actor(ray):
             command = worker_command(config, bind, split)
             env = worker_environment(config, token)
             cwd = config.get("cwd")
-            self.proc = subprocess.Popen(command, cwd=cwd, env=env, stdout=subprocess.PIPE,
-                                         stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
-                                         bufsize=1)
+            with self.proc_lock:
+                self.proc = subprocess.Popen(command, cwd=cwd, env=env, stdout=subprocess.PIPE,
+                                             stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
+                                             bufsize=1)
+                proc = self.proc
 
             def read_output():
-                assert self.proc is not None and self.proc.stdout is not None
+                assert proc.stdout is not None
                 try:
-                    for raw in self.proc.stdout:
+                    for raw in proc.stdout:
                         line = raw.rstrip("\r\n")
                         with self.lock:
                             self.lines.append(line)
@@ -88,20 +118,24 @@ def make_worker_actor(ray):
                     self.ready.set()
 
             self.reader = threading.Thread(target=read_output, name="strata-stage-worker-output", daemon=True)
-            self.reader.start()
-            deadline = time.monotonic() + timeout
-            while not self.ready.wait(0.25):
-                if self.proc.poll() is not None:
-                    raise RuntimeError("Strata worker exited before LAYER_STAGE_READY")
-                if time.monotonic() >= deadline:
-                    raise TimeoutError(f"Strata worker did not become ready in {timeout:.0f} seconds")
-            if self.proc.poll() is not None:
-                raise RuntimeError("Strata worker exited during startup")
-            with self.lock:
-                ready = any(line.startswith("LAYER_STAGE_READY ") for line in self.lines)
-            if not ready:
-                raise RuntimeError("Strata worker output closed before LAYER_STAGE_READY")
-            return True
+            try:
+                self.reader.start()
+                deadline = time.monotonic() + timeout
+                while not self.ready.wait(min(0.25, max(0.0, deadline - time.monotonic()))):
+                    if proc.poll() is not None:
+                        raise RuntimeError("Strata worker exited before LAYER_STAGE_READY")
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(f"Strata worker did not become ready in {timeout:.0f} seconds")
+                if proc.poll() is not None:
+                    raise RuntimeError("Strata worker exited during startup")
+                with self.lock:
+                    ready = any(line.startswith("LAYER_STAGE_READY ") for line in self.lines)
+                if not ready:
+                    raise RuntimeError("Strata worker output closed before LAYER_STAGE_READY")
+                return True
+            except BaseException:
+                self.stop()
+                raise
 
         def tail(self, start: int = 0):
             with self.lock:
@@ -112,15 +146,27 @@ def make_worker_actor(ray):
             return lines[offset:], total, None if self.proc is None else self.proc.poll()
 
         def stop(self):
-            proc = self.proc
-            if proc is None or proc.poll() is not None:
-                return
-            proc.terminate()
-            try:
-                proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=10)
+            with self.stop_lock:
+                with self.proc_lock:
+                    proc = self.proc
+                if proc is None:
+                    return
+                if proc.poll() is None:
+                    try:
+                        proc.terminate()
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        try:
+                            proc.wait(timeout=5)
+                        except subprocess.TimeoutExpired as exc:
+                            raise RuntimeError("Strata worker did not exit after terminate and kill") from exc
+                reader = self.reader
+                if reader is not None and reader.is_alive() and reader is not threading.current_thread():
+                    reader.join(timeout=2)
+                if reader is not None and reader.is_alive() and proc.stdout is not None:
+                    proc.stdout.close()
+                    reader.join(timeout=1)
 
     return LayerStageWorker
 
@@ -153,6 +199,8 @@ def main() -> int:
         return 2
 
     ray.init(address=args.ray_address)
+    ready_timeout = args.ready_timeout
+    startup_deadline = time.monotonic() + ready_timeout
     actor = None
     start_ref = None
     try:
@@ -161,21 +209,27 @@ def main() -> int:
         actor = actor_type.options(
             scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=node_id, soft=False)
         ).remote()
-        start_ref = actor.start.remote(args.worker_config, args.bind, args.split, token, args.ready_timeout)
+        # This deadline includes actor placement and GPU resource scheduling, not just worker model loading.
+        start_ref = actor.start.remote(args.worker_config, args.bind, args.split, token, ready_timeout)
         offset = 0
+        tail_ref = actor.tail.remote(offset)
         while True:
-            ready, _ = ray.wait([start_ref], timeout=5.0)
-            try:
-                lines, offset, code = ray.get(actor.tail.remote(offset))
-                for line in lines:
-                    print(f"[5070 Ti] {line}", flush=True)
-            except Exception:
-                code = None
-            if code is not None and not ready:
-                raise RuntimeError(f"Strata worker exited during startup with code {code}")
-            if ready:
-                ray.get(start_ref)
+            remaining = startup_deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"Ray actor placement and worker startup exceeded {ready_timeout:.0f} seconds")
+            ready, _ = ray.wait([start_ref, tail_ref], timeout=min(2.0, remaining), num_returns=1)
+            if not ready:
+                continue
+            ref = ready[0]
+            value = ray.get(ref)  # ray.wait has established completion; this does not wait on placement or execution.
+            if ref == start_ref:
                 break
+            lines, offset, code = value
+            for line in lines:
+                print(f"[5070 Ti] {line}", flush=True)
+            if code is not None:
+                raise RuntimeError(f"Strata worker exited during startup with code {code}")
+            tail_ref = actor.tail.remote(offset)  # never queue more than one tail call.
         host = args.advertise_ip or args.worker_node_ip
         port = args.bind.rsplit(":", 1)[1]
         print("\nStrata layer-stage worker is ready. Add these arguments to the 4090 run config:", flush=True)
@@ -184,8 +238,13 @@ def main() -> int:
         print("The 4090 API process still runs Strata normally. Keep this supervisor running; Ctrl+C stops the worker.",
               flush=True)
         while True:
-            time.sleep(5)
-            lines, offset, code = ray.get(actor.tail.remote(offset))
+            if tail_ref is None:
+                tail_ref = actor.tail.remote(offset)
+            try:
+                lines, offset, code = ray_get_bounded(ray, tail_ref, 5.0, "worker monitor")
+            except TimeoutError:
+                continue  # polling delay, not evidence that the worker or actor failed; keep one tail future.
+            tail_ref = None
             for line in lines:
                 print(f"[5070 Ti] {line}", flush=True)
             if code is not None:
@@ -194,21 +253,18 @@ def main() -> int:
         print("Stopping the remote Strata layer-stage worker...", flush=True)
     except Exception as e:
         print(f"Ray layer-stage worker failed: {e}", file=sys.stderr)
-        if actor is not None:
-            try:
-                lines, _, _ = ray.get(actor.tail.remote(0), timeout=5)
-                for line in lines[-60:]:
-                    print(f"[5070 Ti] {line}", file=sys.stderr)
-            except Exception:
-                pass
         return 1
     finally:
         if actor is not None:
             try:
-                ray.get(actor.stop.remote(), timeout=15)
-            except Exception:
-                pass
-        ray.shutdown()
+                ray_get_bounded(ray, actor.stop.remote(), 15.0, "worker shutdown")
+            except Exception as e:
+                print(f"Warning: bounded worker cleanup did not complete: {e}", file=sys.stderr)
+        shutdown_thread = threading.Thread(target=ray.shutdown, name="ray-shutdown", daemon=True)
+        shutdown_thread.start()
+        shutdown_thread.join(timeout=5)
+        if shutdown_thread.is_alive():
+            print("Warning: Ray shutdown exceeded 5 seconds; worker stop was already bounded separately", file=sys.stderr)
     return 0
 
 

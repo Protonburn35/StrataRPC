@@ -74,6 +74,75 @@ bool partial_or_stalled_peer(bool send_prefix, bool cancel, bool disconnect, std
     }
     return true;
 }
+
+bool expired_deadlines_reject_immediate_io(std::string& err) {
+    Socket listener = kInvalidSocket, client = kInvalidSocket, peer = kInvalidSocket;
+    if (!open_loopback(listener, client, peer, err)) return false;
+    const uint32_t buffered = 0x12345678u;
+    if (!send_all(peer, &buffered, sizeof(buffered), err)) {
+        close(client); close(peer); return false;
+    }
+    IoDeadline expired{std::chrono::steady_clock::now() - std::chrono::milliseconds(1), nullptr, true};
+    uint32_t received = 0;
+    if (recv_all(client, &received, sizeof(received), expired, err) || err != "RPC I/O deadline exceeded") {
+        close(client); close(peer);
+        err = "an expired deadline accepted bytes that were already buffered";
+        return false;
+    }
+    err.clear();
+    if (send_all(client, &buffered, sizeof(buffered), expired, err) || err != "RPC I/O deadline exceeded") {
+        close(client); close(peer);
+        err = "an expired deadline accepted an immediately writable socket";
+        return false;
+    }
+    close(client); close(peer);
+    return true;
+}
+
+bool progressing_transfer_keeps_one_total_budget(std::string& err) {
+    Socket listener = kInvalidSocket, client = kInvalidSocket, peer = kInvalidSocket;
+    if (!open_loopback(listener, client, peer, err)) return false;
+    constexpr size_t kChunk = 4096;
+    constexpr size_t kPayloadBytes = 8u << 20;
+    std::atomic<size_t> received{0};
+    std::atomic<bool> prefix_seen{false};
+    std::thread server([&] {
+        std::vector<uint8_t> block(kChunk);
+        std::string server_err;
+        if (!recv_all(peer, block.data(), block.size(), deadline_after(std::chrono::seconds(3)), server_err)) return;
+        received.fetch_add(block.size(), std::memory_order_relaxed);
+        prefix_seen.store(true, std::memory_order_release);
+        while (received.load(std::memory_order_relaxed) < kChunk + kPayloadBytes) {
+            if (!recv_all(peer, block.data(), block.size(), deadline_after(std::chrono::seconds(3)), server_err)) return;
+            received.fetch_add(block.size(), std::memory_order_relaxed);
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+    });
+
+    std::vector<uint8_t> payload(kPayloadBytes, 0x6b);
+    std::vector<uint8_t> prefix(kChunk, 0xdd);
+    if (!send_all(client, prefix.data(), prefix.size(), err)) {
+        close(client); server.join(); close(peer); return false;
+    }
+    const auto barrier_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (!prefix_seen.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < barrier_deadline)
+        std::this_thread::yield();
+    if (!prefix_seen.load(std::memory_order_acquire)) {
+        close(client); server.join(); close(peer);
+        err = "the progress test peer did not receive its initial bytes";
+        return false;
+    }
+    const bool sent = send_all(client, payload.data(), payload.size(), deadline_after(std::chrono::milliseconds(100)), err);
+    const size_t progress = received.load(std::memory_order_relaxed);
+    close(client);
+    server.join();
+    close(peer);
+    if (sent || err != "RPC I/O deadline exceeded" || progress <= kChunk || progress >= kChunk + kPayloadBytes) {
+        err = "a progressing transfer did not stop at its original total deadline";
+        return false;
+    }
+    return true;
+}
 } // namespace
 
 int main() {
@@ -130,7 +199,9 @@ int main() {
     if (!partial_or_stalled_peer(false, false, false, err) ||
         !partial_or_stalled_peer(true, false, false, err) ||
         !partial_or_stalled_peer(true, false, true, err) ||
-        !partial_or_stalled_peer(true, true, false, err)) {
+        !partial_or_stalled_peer(true, true, false, err) ||
+        !expired_deadlines_reject_immediate_io(err) ||
+        !progressing_transfer_keeps_one_total_budget(err)) {
         std::fprintf(stderr, "RPC bounded I/O regression failed: %s\n", err.c_str());
         return 1;
     }

@@ -1163,7 +1163,10 @@ public:
           handoff_(handoff), stream_(stream), max_verify_rows_(max_verify_rows) {}
 
     bool reset(uint64_t session, uint64_t generation, int64_t position, std::string& err) override {
-        if (session == 0 || generation == 0 || position < 0) { err = "layer-stage reset has invalid session metadata"; return false; }
+        if (session == 0 || generation == 0 || position != 0) {
+            err = "layer-stage reset requires a new session at position zero";
+            return false;
+        }
         if (!verifier_.wait_commit(err)) return false;
         strata::core::session_zero(session_, geometry_, nullptr, stream_);
         if (cudaStreamSynchronize(stream_) != cudaSuccess) { err = "layer-stage session reset failed"; return false; }
@@ -1196,6 +1199,12 @@ public:
         drive_.d.fail = nullptr;
         if (!verifier_.run((int) rows, tokens, position, &drive_pool_multi, &drive_, picks, err) || drive_.d.failed) {
             if (err.empty()) err = drive_.d.fail != nullptr ? drive_.d.fail : "layer-stage expert dispatch failed";
+            valid_ = false;
+            return false;
+        }
+        const int nonfinite_row = verifier_.nonfinite_row();
+        if (nonfinite_row >= 0) {
+            err = "layer-stage worker rejected non-finite logits at verifier row " + std::to_string(nonfinite_row);
             valid_ = false;
             return false;
         }
@@ -2559,6 +2568,14 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: layer-stage RPC needs an explicit fixed --prefill CHUNK on both PCs\n");
             return 2;
         }
+        if (layer_stage_server) {
+            // Prefill's scratch may overlap the expert cache only while a request has explicitly lent those slots.
+            // The persistent stage worker runs its own prompt callback outside the normal request-loop loan/refill
+            // lifecycle, so it must own separate prompt buffers for the process lifetime.
+            o.no_prefill_borrow = true;
+            std::fprintf(stderr, "strata generate: layer-stage worker keeps prefill buffers outside the expert cache; "
+                                 "cache borrowing is disabled for worker safety\n");
+        }
         // The worker is a single persistent sequence. Prompt/conversation checkpoints would require remote state
         // snapshots, so every request starts from an empty state and rereads its complete prompt.
         o.prompt_cache = 0;
@@ -2569,6 +2586,10 @@ int main(int argc, char** argv) {
     bool split_own_auto = false;   // #340: the split keeps own prompt buffers by its rule (not --no-prefill-borrow)
     if (o.mmap_experts && !o.shared_expert_arena.empty()) {
         std::fprintf(stderr, "strata generate: --shared-expert-arena backs the resident arena and cannot be used with --mmap-experts\n");
+        return 2;
+    }
+    if (layer_stage_server && !strata::core::Verifier::nan_guard_on()) {
+        std::fprintf(stderr, "strata generate: layer-stage worker requires non-finite logit checking; remove STRATA_NAN_GUARD=0\n");
         return 2;
     }
     if (o.resident_cpu_experts && (!o.mmap_experts || o.expert_profile.empty())) {
@@ -5176,10 +5197,13 @@ int main(int argc, char** argv) {
     // and gives that cache the difference.  A recommendation to try, so it is not the default.
     auto owned_prefill_mib = [&]() -> int64_t {
         if (!(o.prefill_chunk > 0 && !pf_borrow)) return 0;
-        static const bool exact = [] { const char* v = std::getenv("STRATA_OWNED_PRICE"); return v != nullptr && std::string(v) == "exact"; }();
+        static const bool exact_env = [] { const char* v = std::getenv("STRATA_OWNED_PRICE"); return v != nullptr && std::string(v) == "exact"; }();
+        const bool exact = layer_stage_server || exact_env;
         if (!exact) return 160 + (o.prefill_chunk * 680) / 1024;
         const int64_t mib = ((int64_t) strata::prefill::Prefill::bytes_needed_owned(g, ss, o.prefill_chunk, srcp != nullptr) + (1 << 20) - 1) >> 20;
-        std::fprintf(stderr, "strata generate: STRATA_OWNED_PRICE=exact: the prompt path's own buffers for a %lld-token chunk: %lld MiB (the 0.1.39 rule: %lld MiB)\n",
+        std::fprintf(stderr, "strata generate: %s: the prompt path's own buffers for a %lld-token chunk: %lld MiB "
+                             "(the 0.1.39 rule: %lld MiB)\n",
+                     layer_stage_server ? "layer-stage worker exact prefill reserve" : "STRATA_OWNED_PRICE=exact",
                      (long long) o.prefill_chunk, (long long) mib, (long long) (160 + (o.prefill_chunk * 680) / 1024));
         return mib + 64;   // a margin for the allocator
     };
@@ -5299,7 +5323,7 @@ int main(int argc, char** argv) {
                          (long long) session_mib, (long long) o.max_context, (long long) (mtp_bind >> 20),
                          reserve_tip.c_str());
         }
-    } else if (multi_gpu && o.expert_cache > 0) {
+    } else if ((multi_gpu || layer_stage_server) && o.expert_cache > 0) {
         // an explicit cache size leaves room for the prompt path's buffers and the reserve, or the first prompt
         // fails with "device buffers ... do not fit" (with borrowing - the default with a profile - the path lends
         // slots instead and `prefill_mib` is 0, so only the reserve is checked)
@@ -5310,9 +5334,10 @@ int main(int argc, char** argv) {
         const int64_t fit = std::max<int64_t>(((int64_t) free_b - reserve) / (int64_t) strata::kernels::cpu::expert_layout().max_blob, 0);
         if (o.expert_cache > fit) {
             // a WARNING that names the knob: the user asked for this size, and gets fewer slots
-            std::fprintf(stderr, "strata generate: WARNING: layer split: --expert-cache %d leaves no room for the "
+            std::fprintf(stderr, "strata generate: WARNING: %s: --expert-cache %d leaves no room for the "
                                  "prompt path's buffers (%lld MiB) and the %d MiB reserve on CUDA0: %lld slots instead "
-                                 "(a smaller --vram-reserve-mib leaves more of them)\n", o.expert_cache,
+                                 "(a smaller --vram-reserve-mib leaves more of them)\n",
+                         layer_stage_server ? "layer-stage worker" : "layer split", o.expert_cache,
                          (long long) prefill_mib, o.vram_reserve_mib, (long long) fit);
             o.expert_cache = (int) fit;
         }
@@ -5330,7 +5355,8 @@ int main(int argc, char** argv) {
         const auto& lay = strata::kernels::cpu::expert_layout();
         const int asked = o.expert_cache;
         const uint64_t budget = (uint64_t) asked * lay.max_blob;
-        size_t free_room = free_b > ((size_t) o.vram_reserve_mib << 20) ? free_b - ((size_t) o.vram_reserve_mib << 20) : 0;
+        const size_t keep_free = ((size_t) (o.vram_reserve_mib + owned_prefill_mib()) << 20) + (size_t) pipe_first;
+        size_t free_room = free_b > keep_free ? free_b - keep_free : 0;
         const uint64_t cap = std::min<uint64_t>(budget, (uint64_t) free_room);
         uint64_t sum = 0;
         for (int64_t l = 0; l < g.n_layers; ++l)
@@ -5368,7 +5394,7 @@ int main(int argc, char** argv) {
         const auto& lay = strata::kernels::cpu::expert_layout();
         const uint64_t budget = (uint64_t) o.expert_cache * lay.max_blob;   // what the uniform sizing granted
         uint64_t used = 0;
-        const size_t keep_free = ((size_t) o.vram_reserve_mib << 20) + (size_t) pipe_first;
+        const size_t keep_free = ((size_t) (o.vram_reserve_mib + owned_prefill_mib()) << 20) + (size_t) pipe_first;
         size_t free_room = free_b > keep_free ? free_b - keep_free : 0;
         const uint64_t cap = std::min<uint64_t>(budget, (uint64_t) free_room);
         for (const auto& pr : profile) {
@@ -10379,12 +10405,15 @@ int main(int argc, char** argv) {
             struct RpcCancelBinding {
                 strata::core::RemoteExperts** helpers;
                 int count;
+                strata::core::LayerStageClient* stage_client;
                 ~RpcCancelBinding() {
                     for (int i = 0; i < count; ++i) if (helpers[i] != nullptr) helpers[i]->set_cancel_flag(nullptr);
+                    if (stage_client != nullptr) stage_client->set_cancel_flag(nullptr);
                 }
-            } rpc_cancel_binding{drive.d.remote, drive.d.remote_count};
+            } rpc_cancel_binding{drive.d.remote, drive.d.remote_count, layer_stage_client ? &stage_client : nullptr};
             for (int i = 0; i < drive.d.remote_count; ++i)
                 if (drive.d.remote[i] != nullptr) drive.d.remote[i]->set_cancel_flag(&stop_req);
+            if (layer_stage_client) stage_client.set_cancel_flag(&stop_req);
             err.clear();
             // Disk sessions: SAVE <path> | RESTORE <path>, between requests (the path runs to the end of the line,
             // UTF-8).  The file holds what a parked conversation holds (conversation_file.hpp).  Answers: SAVED /

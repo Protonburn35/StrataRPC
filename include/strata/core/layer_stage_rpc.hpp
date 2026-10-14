@@ -2,6 +2,8 @@
 
 #include "strata/core/rpc_transport.hpp"
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -53,6 +55,7 @@ public:
     bool connect(const std::string& endpoint, const std::string& token, const LayerStageSpec& expected,
                  std::string& err);
     void close();
+    void set_cancel_flag(const std::atomic<bool>* flag) { cancelled_ = flag; }
     bool connected() const { return socket_ != rpc::kInvalidSocket && !broken_; }
     bool reset(uint64_t session, uint64_t generation, int64_t position, std::string& err);
     bool prefill(uint64_t session, uint64_t generation, int64_t position, uint32_t rows, const int64_t* tokens,
@@ -71,6 +74,8 @@ private:
                  size_t response_bytes, std::string& err);
     rpc::Socket socket_ = rpc::kInvalidSocket;
     LayerStageSpec spec_{};
+    std::string endpoint_, token_;
+    const std::atomic<bool>* cancelled_ = nullptr;
     uint64_t next_operation_ = 1;
     uint64_t bytes_sent_ = 0, bytes_received_ = 0;
     bool broken_ = false;
@@ -81,7 +86,8 @@ private:
 /// only once; its executor decides how an interrupted session is discarded or replayed.
 class LayerStageServer {
 public:
-    LayerStageServer(std::string token, LayerStageSpec expected, LayerStageExecutor& executor);
+    LayerStageServer(std::string token, LayerStageSpec expected, LayerStageExecutor& executor,
+                     std::chrono::milliseconds operation_timeout = std::chrono::minutes(5));
     bool serve(rpc::Socket client, std::string& err);
 
 private:
@@ -90,10 +96,12 @@ private:
     std::string token_;
     LayerStageSpec spec_{};
     LayerStageExecutor& executor_;
+    std::chrono::milliseconds operation_timeout_;
     std::vector<uint8_t> payload_buffer_;
     std::vector<int64_t> prefill_tokens_;
     std::vector<int32_t> verify_tokens_, verify_picks_;
     uint64_t session_ = 0, generation_ = 0, last_operation_ = 0;
+    uint64_t last_request_bytes_ = 0, last_request_hash_a_ = 0, last_request_hash_b_ = 0;
     int64_t position_ = 0;
     uint32_t pending_verify_rows_ = 0;
     uint16_t last_type_ = 0;
