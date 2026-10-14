@@ -20,17 +20,14 @@
 namespace {
 using namespace strata::core::rpc;
 
-bool constrain_socket_buffers(Socket sender, Socket receiver, std::string& err) {
-    int buffer_bytes = 8192;
+bool set_socket_buffer(Socket socket, int option, int buffer_bytes, std::string& err) {
 #if defined(_WIN32)
-    if (setsockopt((SOCKET)sender, SOL_SOCKET, SO_SNDBUF, (const char*)&buffer_bytes, sizeof(buffer_bytes)) != 0 ||
-        setsockopt((SOCKET)receiver, SOL_SOCKET, SO_RCVBUF, (const char*)&buffer_bytes, sizeof(buffer_bytes)) != 0) {
+    if (setsockopt((SOCKET)socket, SOL_SOCKET, option, (const char*)&buffer_bytes, sizeof(buffer_bytes)) != 0) {
         err = "could not constrain RPC loopback socket buffers (Winsock " + std::to_string(WSAGetLastError()) + ")";
         return false;
     }
 #else
-    if (setsockopt((int)sender, SOL_SOCKET, SO_SNDBUF, &buffer_bytes, sizeof(buffer_bytes)) != 0 ||
-        setsockopt((int)receiver, SOL_SOCKET, SO_RCVBUF, &buffer_bytes, sizeof(buffer_bytes)) != 0) {
+    if (setsockopt((int)socket, SOL_SOCKET, option, &buffer_bytes, sizeof(buffer_bytes)) != 0) {
         err = "could not constrain RPC loopback socket buffers";
         return false;
     }
@@ -38,7 +35,14 @@ bool constrain_socket_buffers(Socket sender, Socket receiver, std::string& err) 
     return true;
 }
 
-bool open_loopback(Socket& listener, Socket& client, Socket& peer, std::string& err) {
+bool constrain_socket_buffers(Socket sender, Socket receiver, std::string& err) {
+    constexpr int buffer_bytes = 8192;
+    return set_socket_buffer(sender, SO_SNDBUF, buffer_bytes, err) &&
+           set_socket_buffer(receiver, SO_RCVBUF, buffer_bytes, err);
+}
+
+bool open_loopback(Socket& listener, Socket& client, Socket& peer, std::string& err,
+                   int receive_buffer_bytes = 0) {
     const uint32_t seed = (uint32_t)std::chrono::steady_clock::now().time_since_epoch().count();
     uint32_t port = 0;
     for (uint32_t i = 0; i < 64 && listener == kInvalidSocket; ++i) {
@@ -47,6 +51,13 @@ bool open_loopback(Socket& listener, Socket& client, Socket& peer, std::string& 
         if (listen("127.0.0.1:" + std::to_string(candidate), listener, err)) port = candidate;
     }
     if (listener == kInvalidSocket) return false;
+    // Set the listener's receive buffer before the TCP handshake. On Windows this prevents
+    // receive-window autotuning from advertising a large default window to the sender.
+    if (receive_buffer_bytes > 0 && !set_socket_buffer(listener, SO_RCVBUF, receive_buffer_bytes, err)) {
+        close(listener);
+        listener = kInvalidSocket;
+        return false;
+    }
     if (!connect("127.0.0.1:" + std::to_string(port), client, err) || !accept(listener, peer, err) ||
         !set_nodelay(client, true, err) || !set_nodelay(peer, true, err)) {
         close(client); close(peer); close(listener);
@@ -128,13 +139,14 @@ bool expired_deadlines_reject_immediate_io(std::string& err) {
 
 bool progressing_transfer_keeps_one_total_budget(std::string& err) {
     Socket listener = kInvalidSocket, client = kInvalidSocket, peer = kInvalidSocket;
-    if (!open_loopback(listener, client, peer, err)) return false;
+    constexpr int kSocketBufferBytes = 8192;
+    if (!open_loopback(listener, client, peer, err, kSocketBufferBytes)) return false;
     if (!constrain_socket_buffers(client, peer, err)) {
         close(client); close(peer);
         return false;
     }
     constexpr size_t kChunk = 4096;
-    constexpr size_t kPayloadBytes = 8u << 20;
+    constexpr size_t kPayloadBytes = 32u << 20;
     std::atomic<size_t> received{0};
     std::atomic<bool> prefix_seen{false};
     std::atomic<bool> receiver_ready{false};
