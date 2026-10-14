@@ -580,7 +580,12 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     }
     if (le_ < 0) le_ = g.n_layers;
     if (lb_ < 0 || lb_ >= le_ || le_ > g.n_layers || (lb_ > 0 && hand_in_ == nullptr) ||
-        (le_ < g.n_layers && hand_out_ == nullptr)) {
+        (le_ < g.n_layers && hand_out_ == nullptr) ||
+        (le_ < g.n_layers && next_ == nullptr && !remote_stage_run_) ||
+        (le_ == g.n_layers && (next_ != nullptr || remote_stage_run_)) ||
+        (next_ != nullptr && remote_stage_run_) ||
+        (static_cast<bool>(remote_stage_run_) != static_cast<bool>(remote_stage_commit_)) ||
+        (remote_stage_wait_ && !remote_stage_run_)) {
         err = "verify: the stage's layer range or its hand-off buffers are wrong";
         return false;
     }
@@ -2304,7 +2309,8 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     // the drafts were. Exact: a rejected row's draw is discarded, and no kept decision depends on a reused draw.
     if (le_ < g.n_layers) {   // a layer split's earlier stage: the hand-off is written (synced above)
         ++windows;
-        return next_ == nullptr || next_->run(T, tokens, pos0, pool, next_user_, out, err);
+        if (next_ != nullptr) return next_->run(T, tokens, pos0, pool, next_user_, out, err);
+        return remote_stage_run_ ? remote_stage_run_(T, tokens, pos0, out, err) : true;
     }
     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
     if (head_sampling_ && (sampled || hist_d_ != nullptr || sampling_.logit_bias != nullptr)) {
@@ -2526,7 +2532,8 @@ bool Verifier::commit(int n_keep, std::string& err) {
             ss_->ple_prev[1] = last_tokens_[t];
         }
     ms_commit += ms_since(t0);
-    return next_ == nullptr || next_->commit(n_keep, err);
+    if (next_ != nullptr) return next_->commit(n_keep, err);
+    return remote_stage_commit_ ? remote_stage_commit_(n_keep, err) : true;
 }
 
 bool Verifier::wait_commit(std::string& err) {
@@ -2536,7 +2543,8 @@ bool Verifier::wait_commit(std::string& err) {
         const cudaError_t se = cudaEventSynchronize(commit_done_);
         if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
     }
-    return next_ == nullptr || next_->wait_commit(err);
+    if (next_ != nullptr) return next_->wait_commit(err);
+    return remote_stage_wait_ ? remote_stage_wait_(err) : true;
 }
 
 

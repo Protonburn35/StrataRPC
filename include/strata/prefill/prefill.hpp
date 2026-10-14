@@ -46,6 +46,7 @@ namespace strata::prefill {
 
 class Prefill {
 public:
+    using RemoteStageChunk = std::function<bool(const int64_t*, int64_t, int64_t, const float*, std::string&)>;
     /// E-9: the draft layer's K/V for prompt cells [cell0, cell0 + n) from their final residual rows `R_rows`
     /// (device) and `next_tokens` (host: the token at cell+1), in batches through this path's GEMMs and its idle
     /// scratch - call it from on_chunk.  false with `err` empty: not applicable here (a ring or hybrid K/V, another
@@ -160,6 +161,11 @@ public:
     void set_stage(int64_t layer_begin, int64_t layer_end, Prefill* next) {
         stage_lb_ = layer_begin; stage_le_ = layer_end; next_ = next;
     }
+    /// Use a persistent process stage after this one. The callback receives one completed chunk's host FP32 residual
+    /// and its token/position metadata; the stage keeps its recurrent state and acknowledges before buffer reuse.
+    void set_remote_stage(RemoteStageChunk chunk) { remote_stage_chunk_ = std::move(chunk); }
+    /// Input rows for a remote worker's current prefill chunk. The pointer is host memory held through run().
+    void set_stage_input(const float* rows) { hand_in_ = rows; }
 
     /// LAYER SPLIT: `helper` is another stage's prompt path (another GPU).  A prompt of one chunk runs the stages one
     /// after the other, so while this stage reads it the helper's GPU idles: it then streams a share of this stage's
@@ -197,6 +203,7 @@ private:
 
     int64_t stage_lb_ = 0, stage_le_ = -1;
     Prefill* next_ = nullptr;
+    RemoteStageChunk remote_stage_chunk_;
     Prefill* helper_ = nullptr;         ///< set_stage_helper
     bool single_chunk_ = false;         ///< a later stage: the prompt is one chunk (set by the stage before)
     bool bind_stage_helper(int64_t T);  // binds the helper's buffers for a one-chunk prompt of T tokens

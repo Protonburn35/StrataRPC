@@ -22,6 +22,7 @@
 #pragma once
 
 #include <cstdio>
+#include <functional>
 
 #include "strata/core/expert_source.hpp"
 #include "strata/core/layer.hpp"
@@ -35,6 +36,7 @@
 #include <map>
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace strata::core {
@@ -77,6 +79,10 @@ struct VerifyHits {
 
 class Verifier {
 public:
+    using RemoteStageRun = std::function<bool(int, const int32_t*, int64_t, int32_t*, std::string&)>;
+    using RemoteStageCommit = std::function<bool(int, std::string&)>;
+    using RemoteStageWait = std::function<bool(std::string&)>;
+
     Verifier() = default;
     ~Verifier();
     Verifier(const Verifier&) = delete;
@@ -173,6 +179,11 @@ public:
     /// The next stage: `run` and `commit` continue into it (its pool calls get `next_user`); sampling settings
     /// and `final_R` are the last stage's.
     void set_next(Verifier* next, void* next_user) { next_ = next; next_user_ = next_user; }
+    /// A persistent process stage replaces `next_` across a network boundary. The callback owns activation transport
+    /// and the final stage's output; it is configured before init so a partial local stage cannot silently end a pass.
+    void set_remote_stage(RemoteStageRun run, RemoteStageCommit commit, RemoteStageWait wait = {}) {
+        remote_stage_run_ = std::move(run); remote_stage_commit_ = std::move(commit); remote_stage_wait_ = std::move(wait);
+    }
     /// floats per token in a hand-off buffer
     static int64_t handoff_floats(const ModelGeometry& g) { return (int64_t) g.hc * g.n_embd + g.n_embd + g.hc; }
 
@@ -413,6 +424,9 @@ private:
     float* hand_out_ = nullptr;
     Verifier* next_ = nullptr;
     void* next_user_ = nullptr;
+    RemoteStageRun remote_stage_run_;
+    RemoteStageCommit remote_stage_commit_;
+    RemoteStageWait remote_stage_wait_;
     bool ple_stage() const { return lb_ <= 1 && 1 < le_; }   ///< holds layer 1, where the PLE block runs
     void stage_inputs(int T, const int32_t* tokens, int64_t pos0);
     bool staged_ = false;

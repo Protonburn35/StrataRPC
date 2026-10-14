@@ -1068,13 +1068,15 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     }
     cudaGetDevice(&m.device);
     if (stage_le_ < 0) stage_le_ = g.n_layers;
-    if (stage_lb_ < 0 || stage_lb_ >= stage_le_ || stage_le_ > g.n_layers || (stage_le_ < g.n_layers) != (next_ != nullptr)) {
+    const bool has_successor = next_ != nullptr || static_cast<bool>(remote_stage_chunk_);
+    if (stage_lb_ < 0 || stage_lb_ >= stage_le_ || stage_le_ > g.n_layers ||
+        (stage_le_ < g.n_layers) != has_successor || (next_ != nullptr && remote_stage_chunk_)) {
         err = "prefill: the stage's layer range is wrong";
         return false;
     }
     // the CPU share's staged-chunk limit, before the ring is sized below (a caller that sizes loans first armed it)
     arm_cpu_share(cpu_pool_ != nullptr);
-    for (int b = 0; next_ != nullptr && b < 2; ++b)
+    for (int b = 0; has_successor && b < 2; ++b)
         if (!m.hand[b] && cudaHostAlloc((void**) &m.hand[b], (size_t) chunk * D * 4, cudaHostAllocPortable) != cudaSuccess) {
             err = "prefill: the layer split's hand-off buffers";
             return false;
@@ -4047,7 +4049,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         stats_.tokens += T;
         core::progress_at("reading the prompt (batched): finishing the chunk from token", p0);
         pt.mark(kPfStart, cs);
-        if (next_ != nullptr) {
+        if (next_ != nullptr || remote_stage_chunk_) {
             // The current hand-off slot was used two chunks ago.
             float* h = m.hand[hand_buf_];
             if (cudaMemcpyAsync(h, m.R, (size_t) T * D * 4, cudaMemcpyDeviceToHost, m.cs) != cudaSuccess ||
@@ -4060,12 +4062,19 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             if (on_stage_chunk && !on_stage_chunk(p0 + T, err)) return false;
             if (next_run_.valid() && !next_run_.get()) { err = next_err_; return false; }
             next_err_.clear();
-            next_->hand_in_ = h;
-            next_->single_chunk_ = single_chunk;
-            next_run_ = std::async(std::launch::async, [this, tokens, c0, T, p0] {
-                strata::aux_cpus::pin_current_thread();
-                return next_->run_impl(tokens + c0, T, p0, next_err_);
-            });
+            if (next_ != nullptr) {
+                next_->hand_in_ = h;
+                next_->single_chunk_ = single_chunk;
+                next_run_ = std::async(std::launch::async, [this, tokens, c0, T, p0] {
+                    strata::aux_cpus::pin_current_thread();
+                    return next_->run_impl(tokens + c0, T, p0, next_err_);
+                });
+            } else {
+                next_run_ = std::async(std::launch::async, [this, tokens, c0, T, p0, h] {
+                    strata::aux_cpus::pin_current_thread();
+                    return remote_stage_chunk_(tokens + c0, T, p0, h, next_err_);
+                });
+            }
             hand_buf_ ^= 1;
             continue;   // the last stage reports the chunk (on_chunk)
         }
