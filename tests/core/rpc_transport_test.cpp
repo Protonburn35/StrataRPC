@@ -41,6 +41,14 @@ bool constrain_socket_buffers(Socket sender, Socket receiver, std::string& err) 
            set_socket_buffer(receiver, SO_RCVBUF, buffer_bytes, err);
 }
 
+void shutdown_socket(Socket socket) {
+#if defined(_WIN32)
+    (void)::shutdown((SOCKET)socket, SD_BOTH);
+#else
+    (void)::shutdown((int)socket, SHUT_RDWR);
+#endif
+}
+
 bool open_loopback(Socket& listener, Socket& client, Socket& peer, std::string& err,
                    int receive_buffer_bytes = 0) {
     const uint32_t seed = (uint32_t)std::chrono::steady_clock::now().time_since_epoch().count();
@@ -146,7 +154,7 @@ bool progressing_transfer_keeps_one_total_budget(std::string& err) {
         return false;
     }
     constexpr size_t kChunk = 4096;
-    constexpr size_t kPayloadBytes = 32u << 20;
+    constexpr size_t kPayloadBytes = 128u << 20;
     std::atomic<size_t> received{0};
     std::atomic<bool> prefix_seen{false};
     std::atomic<bool> receiver_ready{false};
@@ -202,6 +210,7 @@ bool progressing_transfer_keeps_one_total_budget(std::string& err) {
     err = send_err;
     const size_t progress = received.load(std::memory_order_relaxed);
     close(client);
+    shutdown_socket(peer);
     server.join();
     close(peer);
     if (sent || err != "RPC I/O deadline exceeded" || !observed_progress ||
