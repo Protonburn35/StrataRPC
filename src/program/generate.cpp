@@ -1237,6 +1237,11 @@ public:
                 const int32_t* tokens, const float* handoff, int32_t* picks, std::string& err) override {
         if (!matches(session, generation, position, err) || pending_ != 0 || tokens == nullptr || handoff == nullptr ||
             picks == nullptr || rows > max_verify_rows_) return false;
+        if (drive_.d.plan == nullptr) {
+            err = "layer-stage worker has no GPU expert-plan sink";
+            valid_ = false;
+            return false;
+        }
         if (mtp_ != nullptr && pending_mtp_cell_ >= 0) {
             if (pending_mtp_cell_ + 1 != position || tokens[0] < 0) {
                 err = "layer-stage MTP prompt lookahead does not match the first verifier position";
@@ -8114,6 +8119,9 @@ int main(int argc, char** argv) {
                 split_drive.cache_slot_off[st] = drive.d.cache_slot_off;
                 split_drive.pcie_num[st] = pcie_num_of(o.pcie_frac);
             }
+            // Verifier::init validates a partial stage's successor. Wire the complete local chain before any
+            // stage is initialized; later stages may themselves be nonterminal when there are 3+ stages.
+            for (int st = 0; st + 1 < n_stages; ++st) stage_ver(st).set_next(&stage_ver(st + 1), &split_drive);
             for (int st = 1; st < n_stages; ++st) {
                 bool ok_s = false;
                 if (split_same) {
@@ -8143,7 +8151,6 @@ int main(int argc, char** argv) {
                     return 1;
                 }
             }
-            for (int st = 0; st + 1 < n_stages; ++st) stage_ver(st).set_next(&stage_ver(st + 1), &split_drive);
             std::string plan_s = "0-" + std::to_string(split_at[0] - 1) + " (CUDA0)";
             for (int st = 1; st < n_stages; ++st)
                 plan_s += ", " + std::to_string(split_at[(size_t) st - 1]) + "-" + std::to_string(split_drive.end[st] - 1) +
@@ -8172,6 +8179,13 @@ int main(int argc, char** argv) {
                 const bool last = st + 1 == n_stages;
                 gs.ver_b.set_stage(split_at[(size_t) st - 1], last ? -1 : split_at[(size_t) st], hand_b[(size_t) st - 1],
                                    last ? nullptr : hand_b[(size_t) st]);
+            }
+            // As for the even stages, finalize the odd pipeline topology before init checks each stage.
+            for (int st = 0; st + 1 < n_stages; ++st)
+                stage_ver_p(st, 1).set_next(&stage_ver_p(st + 1, 1), &split_drive_b);
+            for (int st = 1; st < n_stages; ++st) {
+                GpuStage& gs = *stages[(size_t) st - 1];
+                const bool last = st + 1 == n_stages;
                 const strata::core::OnDevice on(gs.dev);
                 strata::core::VerifyHits vs;
                 vs.d_res = gs.d_res;
@@ -8197,11 +8211,10 @@ int main(int argc, char** argv) {
                                      "%s (raise --vram-reserve-mib by ~200, or --pipeline-windows 0)\n", err.c_str());
                 return 1;
             }
-            // the setters reach the later stages; the pipeline never chains run/commit
-            for (int st = 0; st + 1 < n_stages; ++st) stage_ver_p(st, 1).set_next(&stage_ver_p(st + 1, 1), &split_drive_b);
         }
         ver.set_remote_expert_opt(remote_opt.get());
         std::unique_ptr<ModelLayerStageExecutor> stage_executor;
+        int remote_mtp_draft_count = 0;
         if (layer_stage_mode) {
             const size_t handoff_bytes = (size_t) strata::kernels::kVerifyMaxT *
                                          (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
@@ -8222,16 +8235,20 @@ int main(int argc, char** argv) {
                         strata::core::LayerStageMtpReply* reply_ptr = o.layer_stage_mtp ? &reply : nullptr;
                         if (!stage_client.commit(stage_session, stage_generation, (uint32_t) keep, draft_next,
                                                  min_p, reply_ptr, e)) return false;
+                        remote_mtp_draft_count = 0;
                         if (draft_next) {
                             if (draft_tokens == nullptr || draft_probabilities == nullptr) {
                                 e = "layer-stage MTP commit has no destination for the draft reply";
                                 return false;
                             }
+                            if (reply.count > draft_tokens->size() || reply.count > draft_probabilities->size()) {
+                                e = "layer-stage MTP reply exceeds the coordinator's draft buffers";
+                                return false;
+                            }
                             std::fill(draft_tokens->begin(), draft_tokens->end(), 0);
                             std::fill(draft_probabilities->begin(), draft_probabilities->end(), 0.0f);
-                            const size_t count = std::min<size_t>(reply.count,
-                                std::min(draft_tokens->size(), draft_probabilities->size()));
-                            for (size_t i = 0; i < count; ++i) {
+                            remote_mtp_draft_count = (int) reply.count;
+                            for (size_t i = 0; i < reply.count; ++i) {
                                 (*draft_tokens)[i] = reply.tokens[i];
                                 (*draft_probabilities)[i] = reply.probabilities[i];
                             }
@@ -8253,6 +8270,10 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
             return 1;
         }
+        // The layer-stage worker enters its accept loop below, before the normal request-loop setup. Bind the
+        // expert planner now so cached GPU rows are published before the verifier waits on its plan doorbell.
+        drive.d.plan = ver.plan_sink();
+        drive.d.pcie_num = std::max(0, std::min(256, (int) (o.pcie_frac * 256.0 + 0.5)));
         if (layer_stage_server) {
             // The coordinator sends token IDs and activations, not its sampler state. Until sampling state is part of
             // the wire contract, the remote terminal stage must be deterministic greedy with neutral penalties.
@@ -12788,9 +12809,11 @@ int main(int argc, char** argv) {
             }
             while (!pl_ran && !cancelled && produced_n < max_new) {
                 int T = use_mtp ? S_mtp : 1;   // no --mtp: one token a round unless a lookup draft fires
+                if (remote_mtp) T = std::min(T, remote_mtp_draft_count + 1);
                 if (use_mtp && req_spec_min_p > 0.0) {
                     T = 1;
-                    while (T < S_mtp && dprob[(size_t) T - 1] >= (float) req_spec_min_p) ++T;
+                    while (T < S_mtp && (!remote_mtp || T <= remote_mtp_draft_count) &&
+                           dprob[(size_t) T - 1] >= (float) req_spec_min_p) ++T;
                 }
                 if (first_window) T = 1;
                 // a repeat of earlier context (prompt lookup) where the MTP's own first guess agrees: the policy takes it

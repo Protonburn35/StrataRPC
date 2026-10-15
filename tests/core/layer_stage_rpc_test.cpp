@@ -60,7 +60,7 @@ public:
             err = "fake stage received invalid MTP commit fields"; return false;
         }
         if (reply != nullptr) {
-            reply->count = draft_next ? std::min<uint32_t>(pending_ - 1, kLayerStageMaxMtpDrafts) : 0;
+            reply->count = draft_next ? std::min<uint32_t>(mtp_draft_count, kLayerStageMaxMtpDrafts) : 0;
             for (uint32_t i = 0; i < reply->count; ++i) {
                 reply->tokens[i] = last_verify_token_ + 10 + (int32_t)i;
                 reply->probabilities[i] = 0.75f - (float)i * 0.1f;
@@ -72,6 +72,7 @@ public:
     bool health(std::string&) override { ++health_checks; return true; }
 
     int resets = 0, resumes = 0, prefills = 0, verifies = 0, commits = 0, aborts = 0, health_checks = 0;
+    uint32_t mtp_draft_count = 2;
     std::atomic<int> prefill_delay_ms{0}, verify_delay_ms{0};
 private:
     uint64_t session_ = 0, generation_ = 0;
@@ -597,6 +598,7 @@ bool test_mtp_commit_response(const LayerStageSpec& base, std::string& err) {
     uint32_t port = 0;
     if (!open_listener(listener, port, err)) return false;
     FakeStage executor;
+    executor.mtp_draft_count = 3;
     LayerStageServer service("test-token", spec, executor);
     bool server_ok = false;
     std::string server_err;
@@ -611,19 +613,27 @@ bool test_mtp_commit_response(const LayerStageSpec& base, std::string& err) {
     bool ok = client.connect("127.0.0.1:" + std::to_string(port), "test-token", spec, err);
     const int64_t prompt = 10;
     const float residual[16] = {0.25f};
-    const int32_t tokens[3] = {20, 21, 22};
-    std::vector<float> handoff(3 * (size_t)(spec.hc * spec.n_embd + spec.n_embd + spec.hc), 0.0f);
+    const int32_t tokens[1] = {20};
+    std::vector<float> handoff((size_t)(spec.hc * spec.n_embd + spec.n_embd + spec.hc), 0.0f);
     handoff[0] = -0.5f;
-    int32_t picks[3]{};
+    int32_t picks[1]{};
     LayerStageMtpReply reply;
     if (ok) ok = client.reset(42, 1, 0, err) && client.prefill(42, 1, 0, 1, &prompt, residual, err) &&
-                 client.verify(42, 1, 1, 3, tokens, handoff.data(), picks, err) &&
-                 client.commit(42, 1, 2, true, 0.1f, &reply, err) && client.abort(42, 1, err);
+                 client.verify(42, 1, 1, 1, tokens, handoff.data(), picks, err) &&
+                 client.commit(42, 1, 1, true, 0.1f, &reply, err);
+    const int32_t next_tokens[4] = {21, 30, 31, 32};
+    std::vector<float> next_handoff(4 * (size_t)(spec.hc * spec.n_embd + spec.n_embd + spec.hc), 0.0f);
+    next_handoff[0] = -0.5f;
+    int32_t next_picks[4]{};
+    LayerStageMtpReply empty_reply;
+    if (ok) ok = client.verify(42, 1, 2, 4, next_tokens, next_handoff.data(), next_picks, err) &&
+                 client.commit(42, 1, 4, false, 0.0f, &empty_reply, err) && client.abort(42, 1, err);
     client.close();
     server.join();
-    if (!ok || !server_ok || !server_err.empty() || reply.count != 2 || reply.tokens[0] != 30 ||
-        reply.tokens[1] != 31 || std::fabs(reply.probabilities[0] - 0.75f) > 1e-6f ||
-        std::fabs(reply.probabilities[1] - 0.65f) > 1e-6f || executor.commits != 1) {
+    if (!ok || !server_ok || !server_err.empty() || reply.count != 3 || reply.tokens[0] != 30 ||
+        reply.tokens[1] != 31 || reply.tokens[2] != 32 || std::fabs(reply.probabilities[0] - 0.75f) > 1e-6f ||
+        std::fabs(reply.probabilities[1] - 0.65f) > 1e-6f || std::fabs(reply.probabilities[2] - 0.55f) > 1e-6f ||
+        empty_reply.count != 0 || executor.verifies != 2 || executor.commits != 2) {
         if (err.empty()) err = server_err.empty() ? "remote MTP commit response failed" : server_err;
         return false;
     }

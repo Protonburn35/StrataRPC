@@ -178,7 +178,7 @@ public:
         lb_ = layer_begin; le_ = layer_end; hand_in_ = handoff_in; hand_out_ = handoff_out;
     }
     /// The next stage: `run` and `commit` continue into it (its pool calls get `next_user`); sampling settings
-    /// and `final_R` are the last stage's.
+    /// and `final_R` are the last stage's. Set the complete stage chain before initializing any partial stage.
     void set_next(Verifier* next, void* next_user) { next_ = next; next_user_ = next_user; }
     /// A persistent process stage replaces `next_` across a network boundary. The callback owns activation transport
     /// and the final stage's output; it is configured before init so a partial local stage cannot silently end a pass.

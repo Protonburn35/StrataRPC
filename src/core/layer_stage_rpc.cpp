@@ -920,7 +920,10 @@ bool LayerStageServer::dispatch(uint16_t type, uint64_t operation, const uint8_t
         LayerStageMtpReply mtp_reply;
         ok = executor_.commit(session, generation, operation, keep, draft_next, min_p,
                               mtp_enabled ? &mtp_reply : nullptr, err);
-        if (ok && mtp_enabled && !valid_mtp_reply(mtp_reply, draft_next ? pending_verify_rows_ - 1 : 0, err))
+        // Draft capacity is negotiated for the next verify window. The current window may be shorter
+        // (the first decode verify has one row), and MTP can still draft up to max_verify_rows - 1 tokens.
+        const uint32_t max_drafts = draft_next ? spec_.max_verify_rows - 1 : 0;
+        if (ok && mtp_enabled && !valid_mtp_reply(mtp_reply, max_drafts, err))
             ok = false;
         if (ok) {
             for (uint32_t i = 0; i < keep; ++i) committed_tokens_.push_back(verify_tokens_[i]);
