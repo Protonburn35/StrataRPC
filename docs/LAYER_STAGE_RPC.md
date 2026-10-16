@@ -19,12 +19,14 @@ for each request. Batching, images, penalties, logit bias, cvec overrides, proba
 and expert-cache RPC are not supported. The worker also requires the non-finite-logit
 guard; do not set STRATA_NAN_GUARD=0 on it.
 
-## Exp25 upgrade and sampling
+## Exp26 upgrade and sampling
 
-Replace the release engine files on **both PCs** and restart both processes. Exp25 uses layer-stage protocol 4;
+Replace the release engine files on **both PCs** and restart both processes. Exp26 uses layer-stage protocol 4;
 older peers cannot connect to it. Existing model files, prepared packs, RPC token, split, FP16 KV settings, and
 Python/API installation can stay in place. Keep `--layer-stage-reuse` on both roles to enable the checkpoint fix.
 This release also fixes a coordinator flag that previously forced even exact live continuations to replay.
+Worker MTP catches up prompt/decode windows that do not request a draft, retains their last residual, and rebuilds
+the final MTP cell with the actual next token on resume. This avoids holes or stale lookahead in the draft cache.
 
 Temperature is a host/API request setting; there is no worker JSON temperature to keep in sync. For example, put
 this top-level object in the **host** run JSON for defaults (request values override it):

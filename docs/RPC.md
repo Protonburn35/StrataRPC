@@ -1,10 +1,10 @@
 # StrataRPC (experimental)
 
-Exp25 fixes layer-stage prefix reuse and enables per-request temperature, top-k, top-p, min-p, and seed on the
+Exp26 fixes layer-stage prefix reuse and enables per-request temperature, top-k, top-p, min-p, and seed on the
 worker. Upgrade the engine on **both PCs**: layer-stage protocol 4 is incompatible with earlier releases. Keep
 `--layer-stage-reuse` enabled for coordinated prompt/decode checkpoints. Temperature 0 remains the default; set
 temperature 1 in the host API request or host JSON sampling defaults. See
-[LAYER_STAGE_RPC.md](LAYER_STAGE_RPC.md#exp25-upgrade-and-sampling) for upgrade steps and limitations.
+[LAYER_STAGE_RPC.md](LAYER_STAGE_RPC.md#exp26-upgrade-and-sampling) for upgrade steps and limitations.
 
 ## Expert-cache RPC
 

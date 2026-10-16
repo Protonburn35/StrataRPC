@@ -1220,7 +1220,6 @@ public:
             const auto& saved = found->second;
             if (!strata::core::conversation_checkpoint_restore(saved.state, session_, geometry_, err)) return false;
             if (mtp_ != nullptr) {
-                mtp_->kv_restore(position);
                 if (!saved.mtp_tail.empty()) {
                     const strata::core::OnDevice on_mtp(mtp_->device());
                     if (cudaMemcpy(mtp_->prefill_tail_rw(), saved.mtp_tail.data(), saved.mtp_tail.size() * sizeof(float),
@@ -1231,6 +1230,13 @@ public:
                 mtp_->set_prompt_len(0);
             }
             pending_mtp_cell_ = saved.pending_mtp_cell;
+        }
+        if (mtp_ != nullptr) {
+            // Drafts may have overwritten ring slots beyond the committed prefix even on an exact live resume.
+            mtp_->kv_restore(position);
+            // The next request can change the token AFTER this prefix. Rebuild its last MTP cell with that token,
+            // rather than retaining a cell paired with the previous request's sampled lookahead.
+            pending_mtp_cell_ = position > 0 ? position - 1 : -1;
         }
         checkpoints_.erase(checkpoints_.upper_bound(position), checkpoints_.end());
         position_ = position;
@@ -1263,8 +1269,8 @@ public:
         SavedCheckpoint saved;
         saved.state.ids = tokens;
         if (!strata::core::conversation_checkpoint_save(saved.state, session_, geometry_, err)) return false;
-        saved.pending_mtp_cell = pending_mtp_cell_;
-        if (mtp_ != nullptr && pending_mtp_cell_ >= 0) {
+        saved.pending_mtp_cell = mtp_ != nullptr ? position - 1 : -1;
+        if (mtp_ != nullptr) {
             const strata::core::OnDevice on_mtp(mtp_->device());
             saved.mtp_tail.resize((size_t)geometry_.hc * (size_t)geometry_.n_embd);
             if (cudaMemcpy(saved.mtp_tail.data(), mtp_->prefill_tail(), saved.mtp_tail.size() * sizeof(float),
@@ -1374,6 +1380,19 @@ public:
                 reply->tokens[(size_t)i] = drafts[(size_t)i];
                 reply->probabilities[(size_t)i] = probabilities[(size_t)i];
             }
+        }
+        if (mtp_ != nullptr) {
+            // A prompt read through verify windows, or the last decode window, requests no draft. Catch up the
+            // known MTP cells using the committed INPUT tokens (the prompt need not equal the verifier's picks).
+            // Keep the last residual until the next prefill/verify supplies its actual lookahead token.
+            if (!draft_next && keep > 1 &&
+                !mtp_->prefill(verifier_.final_R_all(), last_verify_tokens_.data() + 1, keep - 1,
+                               last_verify_position_, err)) { valid_ = false; return false; }
+            const size_t row_floats = (size_t)geometry_.hc * (size_t)geometry_.n_embd;
+            if (!mtp_->save_prefill_tail(verifier_.final_R_all() + (keep - 1) * row_floats, err)) {
+                valid_ = false; return false;
+            }
+            if (!draft_next) pending_mtp_cell_ = position_ - 1;
         }
         last_verify_rows_ = 0;
         last_verify_tokens_.clear();
