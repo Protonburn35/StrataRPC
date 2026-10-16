@@ -9,14 +9,40 @@ process. The transport is the bounded native TCP protocol implemented in layer_s
 activation data path.
 
 This is a prototype for performance and capacity experiments, not a benchmarked speedup. It is deliberately limited
-to one serial text request at a time, a static expert profile, greedy sampling, a native model pack, --spec >= 2,
+to one serial text request at a time, a static expert profile, a native model pack, --spec >= 2,
 and the same explicit fixed --prefill N, model, runtime configuration, and --layer-stage-split K on both PCs. Both
 machines need their own local model files and Strata installation. The worker command is a protocol server, not an
-HTTP generation endpoint. The client remains the API endpoint. Exact-prefix continuation is opt-in; without it,
+HTTP generation endpoint. The client remains the API endpoint. Prefix continuation is opt-in; without it,
 every request starts at position zero and rereads the complete prompt. Optional worker-owned native MTP is supported
-for greedy text requests. Batching, images, per-request sampling, penalties, logit bias, cvec overrides, probabilistic
-or coupled draft sampling, and expert-cache RPC are not supported. The worker also requires the non-finite-logit
+for greedy and sampled text requests. Temperature, top-k, top-p, min-p, and seed are applied on the terminal worker
+for each request. Batching, images, penalties, logit bias, cvec overrides, probabilistic or coupled draft sampling,
+and expert-cache RPC are not supported. The worker also requires the non-finite-logit
 guard; do not set STRATA_NAN_GUARD=0 on it.
+
+## Exp25 upgrade and sampling
+
+Replace the release engine files on **both PCs** and restart both processes. Exp25 uses layer-stage protocol 4;
+older peers cannot connect to it. Existing model files, prepared packs, RPC token, split, FP16 KV settings, and
+Python/API installation can stay in place. Keep `--layer-stage-reuse` on both roles to enable the checkpoint fix.
+This release also fixes a coordinator flag that previously forced even exact live continuations to replay.
+
+Temperature is a host/API request setting; there is no worker JSON temperature to keep in sync. For example, put
+this top-level object in the **host** run JSON for defaults (request values override it):
+
+```json
+"sampling": { "temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0 }
+```
+
+Use `"temperature": 0` for greedy output. A nonzero request `seed` selects repeatable per-position sampling;
+seed zero retains Strata's existing random-seed behavior. Top-k retains the existing sampler limit of 64 candidates.
+Sampler settings are a small control message once per request; vocabulary logits stay on the worker.
+
+After the first completed turn, look for `LAYER_STAGE_REUSE reused_tokens=...` in the host log. A positive count
+means both stages agreed to reuse that many tokens. `replayed_tokens` counts matching tokens after the retained
+checkpoint; `new_tokens` counts the changed/appended suffix. Reasoning stripped by a frontend can still require
+replaying the answer from the stable prompt checkpoint. Checkpoints add CPU memory and synchronization overhead;
+there is no measured two-GPU speed claim for this change. Automated TCP tests cover checkpoint rewind, branch
+invalidation, sampling updates, and end-of-output commit bounds; GPU numerical equivalence needs a model run.
 
 ## Windows two-PC setup
 
@@ -107,8 +133,8 @@ mismatch refuses the connection. The RPC secret is sent over plaintext TCP, so u
 expose this port to the public internet.
 
 Layer-stage mode rejects vision even for text-only requests. The API wrapper forwards per-request sampling fields to
-the engine, which returns a clear ERR for sampling changes, penalties, logit bias, minimum-probability filtering,
-images, or cvec overrides the remote worker cannot yet apply consistently.
+the engine. Temperature 1 is supported, as are top-k, top-p, min-p, and a seed. Penalties, logit bias, images, and
+cvec overrides still return an ERR. Temperature 0 remains the default when the request has no sampling settings.
 
 The worker reserves its owned prefill scratch before sizing the expert cache and disables cache borrowing, because
 this persistent worker does not use the normal per-request cache loan/refill lifecycle. That can leave fewer resident
@@ -123,15 +149,22 @@ Add the same options to both roles, then restart both processes:
   BF16 has a wider value range; FP16 can represent smaller values more precisely but rejects overflow. Either format
   changes activation values and can change model outputs. Start with BF16 on the 1 GbE link and compare tokens against
   FP32 before relying on it.
-- `--layer-stage-reuse` retains one exact live token prefix at the worker when `--prompt-cache > 0`. A later request
-  reuses it only when the coordinator and worker agree on the full committed token-prefix identity. A mismatch,
-  cancellation, disconnect, or uncertain acknowledgement resets the worker and replays from token zero. This is a
-  single live conversation; checkpoint snapshots and multi-chat parking remain disabled.
+- `--layer-stage-reuse` retains the live conversation and coordinated checkpoints on both PCs. A later request
+  resumes the longest retained prefix whose tokens match. Prompt checkpoints include the stable turn boundary;
+  a rolling decode checkpoint is saved about every 1,024 generated tokens. This also permits reuse when a client
+  removes reasoning text or changes the end of the previous answer, although tokens after the matching checkpoint
+  must be read again. `--prompt-cache` is bounded to 3–8 slots in this mode, with a minimum of three even if the
+  config previously requested one. Snapshots use system RAM for recurrent state and indexer tails; existing KV
+  pools remain in place. No KV cache is transferred over Ethernet. Retention and token identities are checked on
+  both stages. A refused resume resets both stages and replays the prompt. Disconnects/cancellation invalidate the
+  remote session. This is one active conversation; multi-chat parking remains disabled.
 - `--layer-stage-mtp --mtp C:\\Strata-data\\mtp` moves the native MTP drafter to the terminal worker stage. Both PCs
   need the same MTP directory and MTP options so the connection can verify the model files and draft settings; only
   the worker loads MTP weights onto the GPU. The worker returns draft tokens and probabilities in the accepted-prefix
-  commit response, so drafting adds no extra network round trip. `--spec-min-p` can cap the draft chain. Both PCs must
-  use greedy sampling. Do not enable `STRATA_SPEC_PROB`, `STRATA_SPEC_COUPLED`, or `--coupled-draft` with remote MTP.
+  commit response, so drafting adds no extra network round trip. `--spec-min-p` can cap the draft chain. Drafts stay
+  greedy, while the target verifier can sample at temperature 1 (or other supported values). Drafts are accepted
+  only when they match the target sample; higher temperatures can reduce acceptance and output throughput. Do not
+  enable `STRATA_SPEC_PROB`, `STRATA_SPEC_COUPLED`, or `--coupled-draft` with remote MTP.
 
 For example, append these matching flags to both the worker and coordinator configs to try reduced wire precision and
 prefix reuse:
@@ -172,8 +205,9 @@ measure host faults and disk reads before attributing a speedup to that effect.
 
 ## Protocol and safety
 
-The protocol is single-session per connection, ordered, authenticated, and bounded. It includes reset, prompt prefill,
-verify, accepted-prefix commit, abort, and health operations. Duplicate operations replay their response only when the
+The protocol is single-session per connection, ordered, authenticated, and bounded. It includes reset, sampling,
+checkpoint, resume, prompt prefill, verify, accepted-prefix commit, abort, and health operations. A checkpoint is
+acknowledged only at a committed position, and rewinding discards checkpoints beyond that position. Duplicate operations replay their response only when the
 full request identity matches; replay state is scoped to one connection. A disconnect aborts and clears the worker's
 active session. The worker accepts clients sequentially; do not run multiple coordinators against one worker process.
 

@@ -1,4 +1,12 @@
-# Expert-cache RPC (experimental)
+# StrataRPC (experimental)
+
+Exp25 fixes layer-stage prefix reuse and enables per-request temperature, top-k, top-p, min-p, and seed on the
+worker. Upgrade the engine on **both PCs**: layer-stage protocol 4 is incompatible with earlier releases. Keep
+`--layer-stage-reuse` enabled for coordinated prompt/decode checkpoints. Temperature 0 remains the default; set
+temperature 1 in the host API request or host JSON sampling defaults. See
+[LAYER_STAGE_RPC.md](LAYER_STAGE_RPC.md#exp25-upgrade-and-sampling) for upgrade steps and limitations.
+
+## Expert-cache RPC
 
 Strata's RPC helper lets a host use a second Strata process as an expert-cache tier. The server loads the same expert
 pack on its local GPU, accepts one client, and fills its available VRAM with the highest-ranked pairs the host does not
@@ -10,7 +18,7 @@ sum per token, reducing return traffic when several remote experts serve one tok
 The optional persistent layer-stage path adds `--layer-stage-client`, `--layer-stage-server`, and
 `--layer-stage-split K`. It assigns the remote worker a contiguous suffix of the model, with its own recurrent/KV
 state, and transfers negotiated FP32/BF16/FP16 activations at prompt-chunk and verify-window boundaries. Optional
-exact-prefix reuse and worker-owned native MTP are also available. This can reduce host work and host-side suffix
+checkpoint/live-prefix reuse, per-request sampling, and worker-owned native MTP are also available. This can reduce host work and host-side suffix
 memory, but sends substantially larger prompt chunks and has no measured speedup yet. It is a separate experimental
 mode with stricter limitations; see [LAYER_STAGE_RPC.md](LAYER_STAGE_RPC.md) for supported settings, Windows startup
 steps, traffic estimates, and validation guidance. The worker uses native TCP; Ray is not required.

@@ -16,9 +16,24 @@ enum LayerStageCapability : uint32_t {
     kLayerStageCapabilityBase = 1u,
     kLayerStageCapabilityReuse = 2u,
     kLayerStageCapabilityMtp = 4u,
+    kLayerStageCapabilitySampling = 8u,
 };
 
+constexpr uint16_t kLayerStageProtocolVersion = 4;
 constexpr uint32_t kLayerStageMaxMtpDrafts = 7;
+constexpr uint32_t kLayerStageMaxCheckpoints = 8;
+
+/// Per-request settings, sampled on the terminal worker. Draws are keyed by seed and absolute token position.
+/// No device pointers, vocabulary logits, or mutable RNG state cross the connection.
+struct LayerStageSampling {
+    float temperature = 0.0f, top_p = 1.0f, min_p = 0.0f;
+    int32_t top_k = 0;
+    uint64_t seed = 0;
+};
+bool layer_stage_valid_sampling(const LayerStageSampling& sampling);
+/// Commit only inputs whose outputs will be emitted; discarded speculative tokens must not enter the live prefix.
+uint32_t layer_stage_output_commit_count(const int32_t* picks, uint32_t accepted, int64_t remaining,
+                                        const std::vector<int64_t>& eos_ids);
 
 /// Fixed-size reply keeps draft output lossless and makes commit acknowledgement replay deterministic.
 struct LayerStageMtpReply {
@@ -60,6 +75,10 @@ public:
     virtual bool reset(uint64_t session, uint64_t generation, int64_t position, std::string& err) = 0;
     virtual bool resume(uint64_t session, uint64_t old_generation, uint64_t new_generation, int64_t position,
                         std::string& err) = 0;
+    virtual bool set_sampling(const LayerStageSampling& sampling, std::string& err) = 0;
+    /// Save only running state; the existing KV prefix remains resident. Retention is chosen by the coordinator.
+    virtual bool checkpoint(int64_t position, const std::vector<int32_t>& tokens,
+                            const std::vector<int64_t>& retained, std::string& err) = 0;
     virtual bool prefill(uint64_t session, uint64_t generation, uint64_t operation, int64_t position, uint32_t rows,
                          const int64_t* tokens, const float* residual, std::string& err) = 0;
     virtual bool verify(uint64_t session, uint64_t generation, uint64_t operation, int64_t position, uint32_t rows,
@@ -87,6 +106,9 @@ public:
     bool reset(uint64_t session, uint64_t generation, int64_t position, std::string& err);
     bool resume(uint64_t session, uint64_t generation, int64_t position, LayerStagePrefixIdentity prefix,
                 std::string& err);
+    bool set_sampling(uint64_t session, uint64_t generation, const LayerStageSampling& sampling, std::string& err);
+    bool checkpoint(uint64_t session, uint64_t generation, int64_t position, LayerStagePrefixIdentity prefix,
+                    const std::vector<int64_t>& retained, std::string& err);
     bool prefill(uint64_t session, uint64_t generation, int64_t position, uint32_t rows, const int64_t* tokens,
                  const float* residual, std::string& err);
     bool verify(uint64_t session, uint64_t generation, int64_t position, uint32_t rows, const int32_t* tokens,
@@ -139,6 +161,7 @@ private:
     uint64_t session_ = 0, generation_ = 0, last_operation_ = 0;
     uint64_t last_request_bytes_ = 0, last_request_hash_a_ = 0, last_request_hash_b_ = 0;
     std::vector<int32_t> committed_tokens_;
+    std::vector<int64_t> checkpoint_positions_;
     int64_t position_ = 0;
     uint32_t pending_verify_rows_ = 0;
     uint16_t last_type_ = 0;

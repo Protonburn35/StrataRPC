@@ -19,18 +19,33 @@ using namespace strata::core;
 class FakeStage final : public LayerStageExecutor {
 public:
     bool reset(uint64_t session, uint64_t generation, int64_t position, std::string&) override {
+        checkpoints.clear();
         session_ = session; generation_ = generation; position_ = position; pending_ = 0; ++resets; return true;
     }
     bool resume(uint64_t session, uint64_t old_generation, uint64_t new_generation, int64_t position,
                 std::string& err) override {
         if (session != session_ || old_generation != generation_ || new_generation <= old_generation ||
-            position != position_ || pending_ != 0) {
+            (position != position_ && std::find(checkpoints.begin(), checkpoints.end(), position) == checkpoints.end()) ||
+            pending_ != 0) {
             err = "fake stage rejected a stale resume";
             return false;
         }
         generation_ = new_generation;
+        position_ = position;
+        checkpoints.erase(std::remove_if(checkpoints.begin(), checkpoints.end(),
+                                         [&](int64_t at) { return at > position; }), checkpoints.end());
         ++resumes;
         return true;
+    }
+    bool set_sampling(const LayerStageSampling& value, std::string&) override {
+        sampling = value; ++sampling_updates; return true;
+    }
+    bool checkpoint(int64_t position, const std::vector<int32_t>& tokens,
+                    const std::vector<int64_t>& retained, std::string& err) override {
+        if (position != position_ || tokens.size() != (size_t)position || pending_ != 0) {
+            err = "fake checkpoint was not at the committed position"; return false;
+        }
+        checkpoints = retained; ++checkpoint_saves; return true;
     }
     bool prefill(uint64_t session, uint64_t generation, uint64_t, int64_t position, uint32_t rows,
                  const int64_t* tokens, const float* residual, std::string& err) override {
@@ -72,6 +87,9 @@ public:
     bool health(std::string&) override { ++health_checks; return true; }
 
     int resets = 0, resumes = 0, prefills = 0, verifies = 0, commits = 0, aborts = 0, health_checks = 0;
+    LayerStageSampling sampling;
+    std::vector<int64_t> checkpoints;
+    int sampling_updates = 0, checkpoint_saves = 0;
     uint32_t mtp_draft_count = 2;
     std::atomic<int> prefill_delay_ms{0}, verify_delay_ms{0};
 private:
@@ -116,7 +134,7 @@ bool send_wire_frame(rpc::Socket socket, uint16_t type, uint64_t operation, cons
                      std::string& err) {
     std::array<uint8_t, 24> header{};
     std::memcpy(header.data(), "STGE", 4);
-    put16(header.data() + 4, 3); put16(header.data() + 6, type);
+    put16(header.data() + 4, kLayerStageProtocolVersion); put16(header.data() + 6, type);
     put64(header.data() + 8, operation); put64(header.data() + 16, payload.size());
     const auto deadline = rpc::deadline_after(std::chrono::seconds(2));
     return rpc::send_all(socket, header.data(), header.size(), deadline, err) &&
@@ -128,7 +146,7 @@ bool receive_wire_frame(rpc::Socket socket, uint16_t expected_type, uint64_t exp
     std::array<uint8_t, 24> header{};
     if (!rpc::recv_all(socket, header.data(), header.size(), rpc::deadline_after(std::chrono::seconds(2)), err)) return false;
     const uint64_t bytes = get64(header.data() + 16);
-    if (std::memcmp(header.data(), "STGE", 4) != 0 || get16(header.data() + 4) != 3 ||
+    if (std::memcmp(header.data(), "STGE", 4) != 0 || get16(header.data() + 4) != kLayerStageProtocolVersion ||
         get16(header.data() + 6) != expected_type || get64(header.data() + 8) != expected_operation || bytes > (1u << 20)) {
         err = "test peer received an invalid layer-stage frame header";
         return false;
@@ -299,6 +317,95 @@ bool test_resume_identity(const LayerStageSpec& spec, std::string& err) {
         executor.prefills != 1 || executor.verifies != 2 || executor.commits != 2 || executor.aborts != 1) {
         if (err.empty()) err = server_err.empty() ? "exact layer-stage continuation failed" : server_err;
         return false;
+    }
+    return true;
+}
+
+// Exercise a prompt checkpoint, decode checkpoint, rewind/branch, and eviction over real TCP.
+// Sampling must follow each request (including a switch back to greedy), not worker startup defaults.
+bool test_checkpoint_and_sampling(LayerStageSpec spec, std::string& err) {
+    const int32_t outputs[] = {20, 99, 21, 22};
+    if (layer_stage_output_commit_count(outputs, 4, 10, {99}) != 2 ||
+        layer_stage_output_commit_count(outputs, 4, 1, {99}) != 1 ||
+        layer_stage_output_commit_count(outputs, 4, 10, {}) != 4 ||
+        layer_stage_output_commit_count(outputs, 1, 10, {99}) != 1 ||
+        layer_stage_output_commit_count(outputs, 4, 0, {}) != 0) {
+        err = "speculative commit passed EOS or the output budget"; return false;
+    }
+    spec.capabilities |= kLayerStageCapabilitySampling;
+    rpc::Socket listener = rpc::kInvalidSocket;
+    uint32_t port = 0;
+    if (!open_listener(listener, port, err)) return false;
+    FakeStage executor;
+    LayerStageServer service("test-token", spec, executor);
+    bool server_ok = false;
+    std::string server_err;
+    std::thread server([&] {
+        rpc::Socket accepted = rpc::kInvalidSocket;
+        if (rpc::accept(listener, accepted, server_err)) server_ok = service.serve(accepted, server_err);
+        rpc::close(listener);
+    });
+    LayerStageClient client;
+    bool ok = client.connect("127.0.0.1:" + std::to_string(port), "test-token", spec, err) &&
+              client.reset(42, 1, 0, err);
+    LayerStageSampling sampled;
+    sampled.temperature = 1.0f; sampled.top_p = 0.9f; sampled.min_p = 0.05f;
+    sampled.top_k = 40; sampled.seed = UINT64_C(0xfedcba9876543210);
+    if (ok) ok = client.set_sampling(42, 1, sampled, err) && executor.sampling_updates == 1 &&
+                 executor.sampling.temperature == 1.0f && executor.sampling.top_p == 0.9f &&
+                 executor.sampling.min_p == 0.05f && executor.sampling.top_k == 40 &&
+                 executor.sampling.seed == sampled.seed;
+    const int64_t prompt[] = {10, 11};
+    const int32_t full[] = {10, 11, 20, 21};
+    const auto prompt_id = layer_stage_prefix_identity(full, 2);
+    const auto full_id = layer_stage_prefix_identity(full, 4);
+    std::vector<float> residual(2 * spec.n_embd * spec.hc, 0.0f); residual[0] = 0.25f;
+    std::vector<float> handoff(2 * (spec.hc * spec.n_embd + spec.n_embd + spec.hc), 0.0f);
+    handoff[0] = -0.5f;
+    int32_t picks[2]{};
+    if (ok) ok = client.prefill(42, 1, 0, 2, prompt, residual.data(), err) &&
+                 client.checkpoint(42, 1, 2, prompt_id, {2}, err) &&
+                 client.verify(42, 1, 2, 2, full + 2, handoff.data(), picks, err);
+    // A checkpoint must never capture a speculative state before commit.
+    if (ok) ok = !client.checkpoint(42, 1, 2, prompt_id, {2}, err) &&
+                 !client.set_sampling(42, 1, sampled, err);
+    err.clear();
+    if (ok) ok = client.commit(42, 1, 2, err) &&
+                 client.checkpoint(42, 1, 4, full_id, {2, 4}, err);
+    auto wrong = prompt_id; wrong.hash_b ^= 1;
+    if (ok) ok = !client.resume(42, 2, 2, wrong, err);
+    err.clear();
+    if (ok) ok = client.resume(42, 2, 2, prompt_id, err) && executor.checkpoints == std::vector<int64_t>{2};
+    LayerStageSampling greedy;
+    if (ok) ok = client.set_sampling(42, 2, greedy, err) && executor.sampling_updates == 2 &&
+                 executor.sampling.temperature == 0.0f && executor.sampling.top_k == 0 &&
+                 executor.sampling.top_p == 1.0f && executor.sampling.min_p == 0.0f && executor.sampling.seed == 0;
+    // A different continuation replaces the discarded branch. Its old checkpoint cannot return.
+    const int32_t branch[] = {30, 31};
+    const int32_t branch_full[] = {10, 11, 30, 31};
+    const auto branch_id = layer_stage_prefix_identity(branch_full, 4);
+    if (ok) ok = client.verify(42, 2, 2, 2, branch, handoff.data(), picks, err) && picks[0] == 31 &&
+                 client.commit(42, 2, 2, err) &&
+                 !client.checkpoint(42, 2, 4, full_id, {2, 4}, err);
+    err.clear();
+    if (ok) ok = client.checkpoint(42, 2, 4, branch_id, {4}, err) &&
+                 !client.resume(42, 3, 2, prompt_id, err);
+    err.clear();
+    if (ok) ok = client.resume(42, 3, 4, branch_id, err) &&
+                 client.reset(42, 4, 0, err) && executor.checkpoints.empty() && client.abort(42, 4, err);
+    client.close();
+    server.join();
+    if (!ok || !server_ok || !server_err.empty() || executor.checkpoint_saves != 3 || executor.resumes != 2) {
+        if (err.empty()) err = server_err.empty() ? "checkpoint rewind/branch or request sampling failed" : server_err;
+        return false;
+    }
+    for (int field = 0; field < 4; ++field) {
+        auto bad = sampled;
+        if (field == 0) bad.temperature = std::numeric_limits<float>::quiet_NaN();
+        if (field == 1) bad.top_p = 1.1f;
+        if (field == 2) bad.min_p = -0.1f;
+        if (field == 3) bad.top_k = -1;
+        if (layer_stage_valid_sampling(bad)) { err = "accepted invalid sampling settings"; return false; }
     }
     return true;
 }
@@ -724,7 +831,7 @@ int main() {
     }
     if (!test_activation_codecs(err) || !test_reduced_precision_rpc(spec, LayerStageWireFormat::bf16, err) ||
         !test_reduced_precision_rpc(spec, LayerStageWireFormat::fp16, err) ||
-        !test_mtp_commit_response(spec, err) ||
+        !test_mtp_commit_response(spec, err) || !test_checkpoint_and_sampling(spec, err) ||
         !test_replay_identity(spec, err) || !test_resume_identity(spec, err) ||
         !test_disconnect_clears_replay(spec, err) ||
         !test_partial_header_timeout_and_reaccept(spec, err) ||
@@ -733,6 +840,6 @@ int main() {
         std::fprintf(stderr, "layer-stage RPC safety regression failed: %s\n", err.c_str());
         return 1;
     }
-    std::puts("layer-stage handshake, reset guards, replay identity, reconnect, cancellation, partial-header timeout, malformed replies, prefill, verify, commit and abort passed");
+    std::puts("layer-stage handshake, reset guards, replay identity, checkpoint rewind/branch, sampling updates, output bounds, reconnect, cancellation, partial-header timeout, malformed replies, prefill, verify, commit and abort passed");
     return 0;
 }

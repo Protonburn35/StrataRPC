@@ -91,6 +91,7 @@ public:
     /// Retain one prompt tail residual until the next token supplies its MTP lookahead ID.
     bool save_prefill_tail(const float* R_row, std::string& err);
     const float* prefill_tail() const { return prefill_tail_; }
+    float* prefill_tail_rw() { return prefill_tail_; } // restoring the worker's pending prompt-lookahead checkpoint
     /// --pipeline-windows: capture the prefill graphs and size its input records for windows of up to max_t rows now,
     /// so a later prefill(sync = false) of a window neither captures nor allocates (both wait for the device).
     bool prepare_prefill(std::string& err);

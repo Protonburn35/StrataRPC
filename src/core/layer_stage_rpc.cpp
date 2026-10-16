@@ -13,7 +13,7 @@
 
 namespace strata::core {
 namespace {
-constexpr uint16_t kVersion = 3;
+constexpr uint16_t kVersion = kLayerStageProtocolVersion;
 constexpr size_t kHeaderBytes = 24;
 constexpr uint64_t kMaxFrameBytes = 1ull << 31;
 constexpr uint32_t kMaxErrorBytes = 4096;
@@ -21,7 +21,8 @@ constexpr auto kHandshakeTimeout = std::chrono::minutes(10);
 constexpr auto kOperationTimeout = std::chrono::minutes(5);
 
 enum Message : uint16_t {
-    kHello = 1, kReset = 2, kPrefill = 3, kVerify = 4, kCommit = 5, kAbort = 6, kHealth = 7, kResume = 8
+    kHello = 1, kReset = 2, kPrefill = 3, kVerify = 4, kCommit = 5, kAbort = 6, kHealth = 7, kResume = 8,
+    kSampling = 9, kCheckpoint = 10
 };
 constexpr size_t kMtpReplyBytes = sizeof(uint32_t) + kLayerStageMaxMtpDrafts * sizeof(int32_t) +
                                   kLayerStageMaxMtpDrafts * sizeof(float);
@@ -66,6 +67,7 @@ struct Writer {
     void u32(uint32_t v) { const size_t n = bytes.size(); bytes.resize(n + 4); put32(bytes.data() + n, v); }
     void u64(uint64_t v) { const size_t n = bytes.size(); bytes.resize(n + 8); put64(bytes.data() + n, v); }
     void i64(int64_t v) { u64((uint64_t)v); }
+    void f32(float v) { uint32_t bits; std::memcpy(&bits, &v, sizeof(bits)); u32(bits); }
     void raw(const void* p, size_t n) {
         if (n == 0) return;
         const size_t at = bytes.size();
@@ -86,6 +88,7 @@ struct Reader {
         v = get64(p + at); at += 8; return true;
     }
     bool i64(int64_t& v) { uint64_t x = 0; if (!u64(x)) return false; v = (int64_t)x; return true; }
+    bool f32(float& v) { uint32_t bits; if (!u32(bits)) return false; std::memcpy(&v, &bits, sizeof(v)); return true; }
     bool raw(void* dst, size_t bytes) {
         if (bytes > n - at) return false;
         if (bytes != 0) std::memcpy(dst, p + at, bytes);
@@ -128,7 +131,7 @@ bool activation_frame_fits(const LayerStageSpec& s, uint32_t rows, bool prefill)
 
 bool valid_spec(const LayerStageSpec& s) {
     constexpr uint32_t known_capabilities = kLayerStageCapabilityBase | kLayerStageCapabilityReuse |
-                                            kLayerStageCapabilityMtp;
+                                            kLayerStageCapabilityMtp | kLayerStageCapabilitySampling;
     return s.model_fingerprint != 0 && s.config_fingerprint != 0 && s.max_context > 0 &&
            s.max_context <= (uint64_t)std::numeric_limits<int64_t>::max() && s.n_layers > 0 &&
            s.n_embd > 0 && s.n_expert > 0 && s.hc > 0 && s.layer_begin < s.layer_end &&
@@ -148,7 +151,7 @@ uint64_t max_operation_payload(const LayerStageSpec& s) {
     const uint64_t wire_bytes = layer_stage_wire_element_bytes(s.wire_format);
     const uint64_t prefill = 44 + prefill_tokens + prefill_floats * wire_bytes;
     const uint64_t verify = 44 + verify_tokens + verify_floats * wire_bytes;
-    return std::max<uint64_t>({prefill, verify, 28, 24, 20, 16});
+    return std::max<uint64_t>({prefill, verify, 44 + 8 * kLayerStageMaxCheckpoints});
 }
 
 std::vector<uint8_t> encode_mtp_reply(const LayerStageMtpReply& reply) {
@@ -206,6 +209,8 @@ const char* message_name(uint16_t type) {
     switch (type) {
         case kReset: return "reset";
         case kResume: return "resume";
+        case kSampling: return "sampling";
+        case kCheckpoint: return "checkpoint";
         case kPrefill: return "prefill";
         case kVerify: return "verify";
         case kCommit: return "commit";
@@ -440,6 +445,20 @@ void put16le(uint8_t* p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 
 
 } // namespace
 
+bool layer_stage_valid_sampling(const LayerStageSampling& s) {
+    return std::isfinite(s.temperature) && s.temperature >= 0.0f &&
+           std::isfinite(s.top_p) && s.top_p >= 0.0f && s.top_p <= 1.0f &&
+           std::isfinite(s.min_p) && s.min_p >= 0.0f && s.min_p <= 1.0f && s.top_k >= 0;
+}
+
+uint32_t layer_stage_output_commit_count(const int32_t* picks, uint32_t accepted, int64_t remaining,
+                                        const std::vector<int64_t>& eos_ids) {
+    const auto count = (uint32_t)std::min<int64_t>(accepted, std::max<int64_t>(remaining, 0));
+    for (uint32_t i = 0; i < count; ++i)
+        if (std::find(eos_ids.begin(), eos_ids.end(), (int64_t)picks[i]) != eos_ids.end()) return i + 1;
+    return count;
+}
+
 LayerStagePrefixIdentity layer_stage_prefix_identity(const int32_t* tokens, size_t count) {
     LayerStagePrefixIdentity identity{1469598103934665603ull, 0x9e3779b97f4a7c15ull};
     for (size_t i = 0; i < count; ++i) {
@@ -672,6 +691,27 @@ bool LayerStageClient::resume(uint64_t session, uint64_t generation, int64_t pos
     return request(kResume, m.bytes.data(), m.bytes.size(), nullptr, 0, nullptr, 0, nullptr, 0, err);
 }
 
+bool LayerStageClient::set_sampling(uint64_t session, uint64_t generation, const LayerStageSampling& sampling,
+                                     std::string& err) {
+    if (!layer_stage_valid_sampling(sampling)) { err = "invalid layer-stage sampling settings"; return false; }
+    Writer m; m.u64(session); m.u64(generation);
+    m.f32(sampling.temperature); m.f32(sampling.top_p); m.f32(sampling.min_p);
+    m.u32((uint32_t)sampling.top_k); m.u64(sampling.seed);
+    return request(kSampling, m.bytes.data(), m.bytes.size(), nullptr, 0, nullptr, 0, nullptr, 0, err);
+}
+
+bool LayerStageClient::checkpoint(uint64_t session, uint64_t generation, int64_t position,
+                                   LayerStagePrefixIdentity prefix, const std::vector<int64_t>& retained,
+                                   std::string& err) {
+    if (retained.empty() || retained.size() > kLayerStageMaxCheckpoints) {
+        err = "layer-stage checkpoint retention exceeds the supported limit"; return false;
+    }
+    Writer m; m.u64(session); m.u64(generation); m.i64(position); m.u64(prefix.hash_a); m.u64(prefix.hash_b);
+    m.u32((uint32_t)retained.size());
+    for (int64_t at : retained) m.i64(at);
+    return request(kCheckpoint, m.bytes.data(), m.bytes.size(), nullptr, 0, nullptr, 0, nullptr, 0, err);
+}
+
 bool LayerStageClient::prefill(uint64_t session, uint64_t generation, int64_t position, uint32_t rows,
                                const int64_t* tokens, const float* residual, std::string& err) {
     if (rows == 0 || rows > spec_.max_prefill_rows || tokens == nullptr || residual == nullptr) {
@@ -803,7 +843,7 @@ bool LayerStageServer::dispatch(uint16_t type, uint64_t operation, const uint8_t
         if (!ok) { session_valid_ = false; pending_verify_rows_ = 0; committed_tokens_.clear(); return true; }
         session_ = session; generation_ = generation; last_operation_ = operation; last_type_ = type;
         last_request_bytes_ = request.bytes; last_request_hash_a_ = request.a; last_request_hash_b_ = request.b;
-        position_ = position; pending_verify_rows_ = 0; committed_tokens_.clear();
+        position_ = position; pending_verify_rows_ = 0; committed_tokens_.clear(); checkpoint_positions_.clear();
         last_response_ = response; session_valid_ = true;
         return true;
     }
@@ -811,15 +851,24 @@ bool LayerStageServer::dispatch(uint16_t type, uint64_t operation, const uint8_t
         uint64_t hash_a = 0, hash_b = 0;
         if (!session_valid_ || session != session_ || generation <= generation_ || operation != last_operation_ + 1 ||
             !r.i64(position) || !r.u64(hash_a) || !r.u64(hash_b) || r.left() != 0 || position < 0 ||
-            position != position_ || pending_verify_rows_ != 0 || (uint64_t)position > spec_.max_context ||
-            committed_tokens_.size() != (size_t)position)
-            return fail("layer-stage resume requires the exact committed position with no verification window pending");
-        const LayerStagePrefixIdentity actual = layer_stage_prefix_identity(committed_tokens_.data(), committed_tokens_.size());
+            position > position_ || pending_verify_rows_ != 0 || (uint64_t)position > spec_.max_context ||
+            committed_tokens_.size() != (size_t)position_ ||
+            (position != position_ && std::find(checkpoint_positions_.begin(), checkpoint_positions_.end(), position) ==
+                                      checkpoint_positions_.end()) ||
+            (spec_.capabilities & kLayerStageCapabilityReuse) == 0)
+            return fail("layer-stage resume needs a retained live/checkpoint position with no verification window pending");
+        const LayerStagePrefixIdentity actual = layer_stage_prefix_identity(committed_tokens_.data(), (size_t)position);
         if (actual.hash_a != hash_a || actual.hash_b != hash_b)
             return fail("layer-stage resume token-prefix identity differs; reset and replay the full prompt");
-        if (!executor_.resume(session, generation_, generation, position, err))
+        if (!executor_.resume(session, generation_, generation, position, err)) {
+            session_valid_ = false;
             return fail(err.empty() ? "layer-stage worker refused the resume state" : err);
+        }
         generation_ = generation;
+        position_ = position;
+        committed_tokens_.resize((size_t)position);
+        checkpoint_positions_.erase(std::remove_if(checkpoint_positions_.begin(), checkpoint_positions_.end(),
+                                   [&](int64_t at) { return at > position; }), checkpoint_positions_.end());
         response = response_payload(true, std::string());
         last_operation_ = operation; last_type_ = type; last_response_ = response;
         last_request_bytes_ = request.bytes; last_request_hash_a_ = request.a; last_request_hash_b_ = request.b;
@@ -828,7 +877,42 @@ bool LayerStageServer::dispatch(uint16_t type, uint64_t operation, const uint8_t
     if (!session_valid_ || session != session_ || generation != generation_ || operation != last_operation_ + 1)
         return fail("layer-stage session is absent, stale, or out of operation order; reset and replay the prompt");
     bool ok = false;
-    if (type == kPrefill || type == kVerify) {
+    if (type == kSampling) {
+        LayerStageSampling sampling;
+        uint32_t top_k = 0;
+        if ((spec_.capabilities & kLayerStageCapabilitySampling) == 0 || pending_verify_rows_ != 0 ||
+            !r.f32(sampling.temperature) || !r.f32(sampling.top_p) || !r.f32(sampling.min_p) ||
+            !r.u32(top_k) || !r.u64(sampling.seed) || r.left() != 0 || top_k > INT32_MAX)
+            return fail("layer-stage sampling frame is invalid or a verifier window is pending");
+        sampling.top_k = (int32_t)top_k;
+        if (!layer_stage_valid_sampling(sampling)) return fail("layer-stage sampling settings are invalid");
+        ok = executor_.set_sampling(sampling, err);
+    } else if (type == kCheckpoint) {
+        uint64_t hash_a = 0, hash_b = 0;
+        uint32_t count = 0;
+        if ((spec_.capabilities & kLayerStageCapabilityReuse) == 0 || pending_verify_rows_ != 0 ||
+            !r.i64(position) || !r.u64(hash_a) || !r.u64(hash_b) || !r.u32(count) ||
+            position <= 0 || position != position_ || count == 0 || count > kLayerStageMaxCheckpoints ||
+            r.left() != (size_t)count * sizeof(int64_t))
+            return fail("layer-stage checkpoint must save the current committed position within its retention limit");
+        const auto actual = layer_stage_prefix_identity(committed_tokens_.data(), committed_tokens_.size());
+        if (actual.hash_a != hash_a || actual.hash_b != hash_b)
+            return fail("layer-stage checkpoint token-prefix identity differs");
+        std::vector<int64_t> retained;
+        for (uint32_t i = 0; i < count; ++i) {
+            int64_t at = 0;
+            if (!r.i64(at) || at <= 0 || at > position ||
+                std::find(retained.begin(), retained.end(), at) != retained.end() ||
+                (at != position && std::find(checkpoint_positions_.begin(), checkpoint_positions_.end(), at) ==
+                                   checkpoint_positions_.end()))
+                return fail("layer-stage checkpoint retention names a missing or duplicate position");
+            retained.push_back(at);
+        }
+        if (std::find(retained.begin(), retained.end(), position) == retained.end())
+            return fail("layer-stage checkpoint retention must include the newly saved position");
+        ok = executor_.checkpoint(position, committed_tokens_, retained, err);
+        if (ok) checkpoint_positions_ = std::move(retained);
+    } else if (type == kPrefill || type == kVerify) {
         if (!r.i64(position) || !r.u32(rows) || !r.u64(float_count) || !r.u64(activation_bytes))
             return fail("layer-stage activation metadata is truncated");
         const bool prefill = type == kPrefill;
@@ -936,7 +1020,7 @@ bool LayerStageServer::dispatch(uint16_t type, uint64_t operation, const uint8_t
     } else if (type == kAbort) {
         if (r.left() != 0) return fail("layer-stage abort frame has unexpected data");
         ok = executor_.abort(session, generation, operation, err);
-        session_valid_ = false; pending_verify_rows_ = 0; committed_tokens_.clear();
+        session_valid_ = false; pending_verify_rows_ = 0; committed_tokens_.clear(); checkpoint_positions_.clear();
     } else {
         return fail("layer-stage worker received an unknown operation");
     }
@@ -944,6 +1028,7 @@ bool LayerStageServer::dispatch(uint16_t type, uint64_t operation, const uint8_t
         session_valid_ = false;
         pending_verify_rows_ = 0;
         committed_tokens_.clear();
+        checkpoint_positions_.clear();
         response = response_payload(false, err.empty() ? "layer-stage operation failed" : err);
         return true;
     }
@@ -1012,7 +1097,7 @@ bool LayerStageServer::serve(rpc::Socket client, std::string& err) {
             if (!disconnected) close_error = err;
             break;
         }
-        if (type < kReset || type > kResume || op_bytes > max_operation_payload(spec_)) {
+        if (type < kReset || type > kCheckpoint || op_bytes > max_operation_payload(spec_)) {
             err = "layer-stage worker received an invalid operation frame";
             break;
         }
@@ -1041,6 +1126,7 @@ bool LayerStageServer::serve(rpc::Socket client, std::string& err) {
         (void)executor_.abort(session_, generation_, last_operation_ + 1, ignored);
         session_valid_ = false; pending_verify_rows_ = 0;
         committed_tokens_.clear();
+        checkpoint_positions_.clear();
     }
     if (close_error.empty() && err == "RPC connection closed") { err.clear(); return true; }
     if (err.empty()) err = close_error.empty() ? "layer-stage connection ended" : close_error;
