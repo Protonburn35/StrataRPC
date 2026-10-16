@@ -68,6 +68,8 @@ public:
     }
     bool commit(uint64_t session, uint64_t generation, uint64_t, uint32_t keep, bool draft_next, float min_p,
                 LayerStageMtpReply* reply, std::string& err) override {
+        const int delay = commit_delay_ms.exchange(0, std::memory_order_relaxed);
+        if (delay > 0) std::this_thread::sleep_for(std::chrono::milliseconds(delay));
         if (session != session_ || generation != generation_ || keep == 0 || keep > pending_) {
             err = "fake stage received an invalid accepted prefix"; return false;
         }
@@ -91,7 +93,7 @@ public:
     std::vector<int64_t> checkpoints;
     int sampling_updates = 0, checkpoint_saves = 0;
     uint32_t mtp_draft_count = 2;
-    std::atomic<int> prefill_delay_ms{0}, verify_delay_ms{0};
+    std::atomic<int> prefill_delay_ms{0}, verify_delay_ms{0}, commit_delay_ms{0};
 private:
     uint64_t session_ = 0, generation_ = 0;
     int64_t position_ = 0;
@@ -563,6 +565,64 @@ bool test_client_cancellation_and_fresh_request(const LayerStageSpec& spec, std:
     return true;
 }
 
+// A user replacing an active reply must not tear down a verify/commit transaction. Stop at its boundary,
+// then start another generation on the SAME connection and executor, with no reset/reload of the worker.
+bool test_coordinator_stop_keeps_connection(const LayerStageSpec& spec, std::string& err) {
+    rpc::Socket listener = rpc::kInvalidSocket;
+    uint32_t port = 0;
+    if (!open_listener(listener, port, err)) return false;
+    FakeStage executor;
+    LayerStageServer service("test-token", spec, executor);
+    bool server_ok = false;
+    std::string server_err;
+    std::thread server([&] {
+        rpc::Socket accepted = rpc::kInvalidSocket;
+        if (rpc::accept(listener, accepted, server_err)) server_ok = service.serve(accepted, server_err);
+        rpc::close(listener);
+    });
+    LayerStageClient client;
+    std::atomic<bool> stop{false};
+    client.set_cancel_flag(&stop, LayerStageCancelMode::finish_window);
+    bool ok = client.connect("127.0.0.1:" + std::to_string(port), "test-token", spec, err) &&
+              client.reset(42, 1, 0, err);
+    auto interrupted = [&](auto&& operation) {
+        stop.store(false);
+        std::thread cancel([&] { std::this_thread::sleep_for(std::chrono::milliseconds(30)); stop.store(true); });
+        const bool completed = operation();
+        cancel.join();
+        return completed && stop.load() && client.connected();
+    };
+    const int64_t prompt = 10;
+    const int32_t tokens[] = {10, 20, 20};
+    const float residual[16] = {0.25f};
+    std::vector<float> handoff(spec.hc * spec.n_embd + spec.n_embd + spec.hc, 0.0f);
+    handoff[0] = -0.5f;
+    int32_t pick = 0;
+    executor.prefill_delay_ms.store(150);
+    if (ok) ok = interrupted([&] { return client.prefill(42, 1, 0, 1, &prompt, residual, err); }) &&
+                 client.checkpoint(42, 1, 1, layer_stage_prefix_identity(tokens, 1), {1}, err) &&
+                 client.resume(42, 2, 1, layer_stage_prefix_identity(tokens, 1), err);
+    executor.verify_delay_ms.store(150);
+    if (ok) ok = interrupted([&] { return client.verify(42, 2, 1, 1, tokens + 1, handoff.data(), &pick, err); }) &&
+                 pick == 21 && client.commit(42, 2, 1, err) && // STOP remains set: commit still must finish
+                 client.resume(42, 3, 2, layer_stage_prefix_identity(tokens, 2), err);
+    if (ok) ok = client.verify(42, 3, 2, 1, tokens + 2, handoff.data(), &pick, err);
+    executor.commit_delay_ms.store(150);
+    if (ok) ok = interrupted([&] { return client.commit(42, 3, 1, err); }) &&
+                 client.resume(42, 4, 3, layer_stage_prefix_identity(tokens, 3), err) && client.health(err);
+    // An edited prompt can rewind to the earlier jointly saved checkpoint after interruption, too.
+    if (ok) ok = client.resume(42, 5, 1, layer_stage_prefix_identity(tokens, 1), err) && client.abort(42, 5, err);
+    client.set_cancel_flag(nullptr);
+    client.close();
+    server.join();
+    if (!ok || !server_ok || !server_err.empty() || executor.resets != 1 || executor.resumes != 4 ||
+        executor.prefills != 1 || executor.verifies != 2 || executor.commits != 2 || executor.aborts != 1) {
+        if (err.empty()) err = server_err.empty() ? "coordinator STOP dropped its resident stage or continuation" : server_err;
+        return false;
+    }
+    return true;
+}
+
 bool test_malformed_success_closes_client(const LayerStageSpec& spec, std::string& err) {
     rpc::Socket listener = rpc::kInvalidSocket;
     uint32_t port = 0;
@@ -836,10 +896,11 @@ int main() {
         !test_disconnect_clears_replay(spec, err) ||
         !test_partial_header_timeout_and_reaccept(spec, err) ||
         !test_client_cancellation_and_fresh_request(spec, err) ||
+        !test_coordinator_stop_keeps_connection(spec, err) ||
         !test_malformed_success_closes_client(spec, err)) {
         std::fprintf(stderr, "layer-stage RPC safety regression failed: %s\n", err.c_str());
         return 1;
     }
-    std::puts("layer-stage handshake, reset guards, replay identity, checkpoint rewind/branch, sampling updates, output bounds, reconnect, cancellation, partial-header timeout, malformed replies, prefill, verify, commit and abort passed");
+    std::puts("layer-stage handshake, reset guards, replay identity, checkpoint rewind/branch, sampling updates, output bounds, reconnect, boundary STOP/resume, immediate cancellation, partial-header timeout, malformed replies, prefill, verify, commit and abort passed");
     return 0;
 }

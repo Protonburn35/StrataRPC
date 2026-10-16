@@ -19,6 +19,24 @@ for each request. Batching, images, penalties, logit bias, cvec overrides, proba
 and expert-cache RPC are not supported. The worker also requires the non-finite-logit
 guard; do not set STRATA_NAN_GUARD=0 on it.
 
+## Exp27: interrupt an active reply without reloading
+
+Sending another message, pressing Stop, or disconnecting the HTTP response cancels the current request. The
+coordinator now finishes its current remote prompt chunk or verify/commit window, reports `DONE ... cancel`, and
+keeps the engine, model weights, expert cache, and RPC connection alive for the next request. It skips a new MTP
+draft when Stop is already known. A completed decode window retains a confirmed prefix; an interrupted pipelined
+prefill retains only its previously acknowledged checkpoints and may need some replay on the next request.
+
+Stopping during prefill can wait for the active GPU chunk and the outstanding pipeline handoff to finish. It does
+not forcibly interrupt a CUDA kernel. Transport deadlines remain enabled; genuine I/O errors are still errors.
+Previously the request's Stop flag interrupted socket I/O and reached a fatal decode error path as
+`RPC operation cancelled`, unloading the host model.
+
+There are no JSON or launcher changes. Exp27 uses the same layer-stage protocol 4 as Exp26. For an existing Exp26
+pair, upgrading the **4090 host engine** is sufficient for this fix; the Exp26 worker remains compatible. Updating
+both engines is also supported. Regression tests interrupt prefill, verification, and commit, then resume and rewind
+on the same connection/executor; the older immediate-I/O cancellation tests remain in place.
+
 ## Exp26 upgrade and sampling
 
 Replace the release engine files on **both PCs** and restart both processes. Exp26 uses layer-stage protocol 4;
@@ -158,8 +176,8 @@ Add the same options to both roles, then restart both processes:
   must be read again. `--prompt-cache` is bounded to 3–8 slots in this mode, with a minimum of three even if the
   config previously requested one. Snapshots use system RAM for recurrent state and indexer tails; existing KV
   pools remain in place. No KV cache is transferred over Ethernet. Retention and token identities are checked on
-  both stages. A refused resume resets both stages and replays the prompt. Disconnects/cancellation invalidate the
-  remote session. This is one active conversation; multi-chat parking remains disabled.
+  both stages. A refused resume resets both stages and replays the prompt. Transport disconnects invalidate the
+  remote session; normal request cancellation finishes the active exchange. This is one active conversation; multi-chat parking remains disabled.
 - `--layer-stage-mtp --mtp C:\\Strata-data\\mtp` moves the native MTP drafter to the terminal worker stage. Both PCs
   need the same MTP directory and MTP options so the connection can verify the model files and draft settings; only
   the worker loads MTP weights onto the GPU. The worker returns draft tokens and probabilities in the accepted-prefix
@@ -213,11 +231,11 @@ acknowledged only at a committed position, and rewinding discards checkpoints be
 full request identity matches; replay state is scoped to one connection. A disconnect aborts and clears the worker's
 active session. The worker accepts clients sequentially; do not run multiple coordinators against one worker process.
 
-Cancellation closes the client connection when an operation is in flight. A following request reconnects and resets a
-fresh generation; a timed-out state-changing request is never retried because the remote outcome may be ambiguous.
-The server permits an idle connection before the first operation-header byte, then applies one total deadline to the
-rest of the header, payload, execution, and reply. Cancellation does not interrupt a CUDA kernel already executing on
-the worker; it only stops waiting on the local network operation and invalidates the session safely.
+Normal serve-request cancellation is cooperative at chunk/window boundaries and keeps the connection open. The
+transport also supports explicit immediate cancellation for callers that intend to discard the connection; those
+callers must reconnect and reset before sending fresh work. A timed-out state-changing request is never retried
+because the remote outcome may be ambiguous. The server permits an idle connection before the first operation-header
+byte, then applies one total deadline to the rest of the header, payload, execution, and reply.
 
 ## Optional Ray supervisor
 

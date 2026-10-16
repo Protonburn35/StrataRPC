@@ -1,5 +1,10 @@
 # StrataRPC (experimental)
 
+Exp27 fixes the host engine exiting with `RPC operation cancelled` when a new message interrupts an active reply.
+Normal Stop/disconnect requests now finish the current RPC chunk or decode window and keep the model loaded.
+No configuration changes are needed. The fix is in the host; an Exp26 worker remains compatible (protocol 4).
+See [LAYER_STAGE_RPC.md](LAYER_STAGE_RPC.md#exp27-interrupt-an-active-reply-without-reloading) for details.
+
 Exp26 fixes layer-stage prefix reuse and enables per-request temperature, top-k, top-p, min-p, and seed on the
 worker. Upgrade the engine on **both PCs**: layer-stage protocol 4 is incompatible with earlier releases. Keep
 `--layer-stage-reuse` enabled for coordinated prompt/decode checkpoints. Temperature 0 remains the default; set

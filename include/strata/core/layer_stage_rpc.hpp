@@ -89,6 +89,11 @@ public:
     virtual bool health(std::string& err) = 0;
 };
 
+enum class LayerStageCancelMode {
+    interrupt_io,
+    finish_window, // coordinator checks STOP between prompt chunks / complete verify+commit windows
+};
+
 /// Persistent request coordinator endpoint for one remote layer stage. Use the same object for all requests so its
 /// TCP connection and per-operation replay state survive between prompt chunks and decode windows.
 class LayerStageClient {
@@ -101,7 +106,12 @@ public:
     bool connect(const std::string& endpoint, const std::string& token, const LayerStageSpec& expected,
                  std::string& err);
     void close();
-    void set_cancel_flag(const std::atomic<bool>* flag) { cancelled_ = flag; }
+    /// finish_window leaves network deadlines active but defers STOP to the coordinator. In particular a
+    /// verify and its commit must both finish even when STOP arrives between their RPCs, so the next request
+    /// can reuse the connection and known state. interrupt_io closes an interrupted connection instead.
+    void set_cancel_flag(const std::atomic<bool>* flag, LayerStageCancelMode mode = LayerStageCancelMode::interrupt_io) {
+        cancelled_ = mode == LayerStageCancelMode::interrupt_io ? flag : nullptr;
+    }
     bool connected() const { return socket_ != rpc::kInvalidSocket && !broken_; }
     bool reset(uint64_t session, uint64_t generation, int64_t position, std::string& err);
     bool resume(uint64_t session, uint64_t generation, int64_t position, LayerStagePrefixIdentity prefix,

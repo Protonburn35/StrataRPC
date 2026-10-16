@@ -10761,7 +10761,11 @@ int main(int argc, char** argv) {
             } rpc_cancel_binding{drive.d.remote, drive.d.remote_count, layer_stage_client ? &stage_client : nullptr};
             for (int i = 0; i < drive.d.remote_count; ++i)
                 if (drive.d.remote[i] != nullptr) drive.d.remote[i]->set_cancel_flag(&stop_req);
-            if (layer_stage_client) stage_client.set_cancel_flag(&stop_req);
+            // STOP ends this request at a complete chunk/window, not halfway through the remote verify/commit.
+            // Interrupting socket I/O here returned "RPC operation cancelled" to fatal engine error paths and
+            // unloaded the model whenever a client replaced an active reply with a new message.
+            if (layer_stage_client)
+                stage_client.set_cancel_flag(&stop_req, strata::core::LayerStageCancelMode::finish_window);
             err.clear();
             // Disk sessions: SAVE <path> | RESTORE <path>, between requests (the path runs to the end of the line,
             // UTF-8).  The file holds what a parked conversation holds (conversation_file.hpp).  Answers: SAVED /
@@ -12169,6 +12173,7 @@ int main(int argc, char** argv) {
             int64_t at = read_from;
             for (const int64_t to : cuts) {
                 if (to <= at) continue;
+                if (layer_stage_client && stop_req.load()) { cancelled = true; break; }
                 err.clear();
                 const bool win = windows_ok(at, to);
                 if (win && !refill(err)) {
@@ -12210,6 +12215,7 @@ int main(int argc, char** argv) {
                     break;
                 }
                 at = to;
+                if (layer_stage_client && stop_req.load()) { cancelled = true; break; }
                 const bool stage_checkpoint = layer_stage_client && o.layer_stage_reuse && req_ckpt;
                 if ((stage_checkpoint || to == turn_at || to == root_at || to == message_at || to == pin_at) &&
                     !checkpoint_at(to, nullptr, stage_checkpoint ? to == n - 1 && to != stage_prompt_anchor :
@@ -12944,6 +12950,7 @@ int main(int argc, char** argv) {
                 }
             }
             while (!pl_ran && !cancelled && produced_n < max_new) {
+                if (layer_stage_client && stop_req.load()) { finish = "cancel"; break; }
                 if (layer_stage_client && o.layer_stage_reuse && req_ckpt && !stop_req.load() &&
                     (int64_t)consumed.size() >= stage_next_decode_checkpoint) {
                     if (!ver.wait_commit(err) || !checkpoint_at((int64_t)consumed.size(), nullptr, true, &consumed)) {
@@ -13087,7 +13094,7 @@ int main(int argc, char** argv) {
                     eos_in_accepted = eos_in_accepted ||
                         std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t)outv[(size_t)i]) != o.eos_ids.end();
                 const bool maxed_after_window = produced_n + (int64_t)a + 1 >= max_new;
-                const bool remote_mtp_draft = remote_mtp && !eos_in_accepted && !maxed_after_window;
+                const bool remote_mtp_draft = remote_mtp && !eos_in_accepted && !maxed_after_window && !stop_req.load();
                 if (!ver.commit(a + 1, err, remote_mtp_draft, (float)req_spec_min_p,
                                 remote_mtp_draft ? &drafts : nullptr,
                                 remote_mtp_draft ? &dprob : nullptr)) {
@@ -13229,8 +13236,8 @@ int main(int argc, char** argv) {
                              (long long) pp_reached);
             }
             if (layer_stage_mode && o.layer_stage_reuse && cancelled) {
-                // Cancellation may race with a remote verifier/commit acknowledgement. Do not claim that its retained
-                // state has a known prefix; the next request resets both endpoints and replays from token zero.
+                // A partial pipelined prompt can be ahead of pp_reached. Keep only jointly acknowledged checkpoints;
+                // the next request resumes one of those or resets the session. Both PCs keep their model weights.
                 live_ok = false;
             }
             static const bool state_hash = std::getenv("STRATA_STATE_HASH") != nullptr;
