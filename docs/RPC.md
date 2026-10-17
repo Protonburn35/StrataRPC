@@ -1,5 +1,10 @@
 # StrataRPC (experimental)
 
+Exp28 adds **optional vision** to persistent layer-stage RPC. Upgrade both PCs (protocol 5), enable `--vision` on
+both, and configure the image encoder on the host. The Windows ZIP includes `strata-vision.exe`. FP16 KV, sampled
+answers, worker MTP and image-aware prefix reuse can be used together. See the
+[vision setup instructions](LAYER_STAGE_RPC.md#exp28-optional-vision). Disk save/restore is not part of this release.
+
 Exp27 fixes the host engine exiting with `RPC operation cancelled` when a new message interrupts an active reply.
 Normal Stop/disconnect requests now finish the current RPC chunk or decode window and keep the model loaded.
 No configuration changes are needed. The fix is in the host; an Exp26 worker remains compatible (protocol 4).

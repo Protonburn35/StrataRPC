@@ -57,6 +57,7 @@ def copy_nvidia_licenses(stage: Path, nvidia_root: Path) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--exe", type=Path, required=True)
+    parser.add_argument("--vision-exe", type=Path, help="optional CUDA image encoder built from tools/vision")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--cuda-version", required=True)
     parser.add_argument("--archs", default="89,120")
@@ -65,6 +66,8 @@ def main() -> int:
     exe = args.exe.resolve()
     if not exe.is_file():
         parser.error(f"engine executable does not exist: {exe}")
+    if args.vision_exe is not None and not args.vision_exe.is_file():
+        parser.error(f"vision executable does not exist: {args.vision_exe}")
     nvidia_root = Path(sysconfig.get_paths()["purelib"]) / "nvidia"
     if not nvidia_root.is_dir():
         raise RuntimeError(f"NVIDIA CUDA Python wheels are missing under {nvidia_root}")
@@ -86,6 +89,11 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="strata-rpc-package-") as temporary:
         stage = Path(temporary)
         shutil.copy2(exe, stage / "strata.exe")
+        if args.vision_exe is not None:
+            shutil.copy2(args.vision_exe, stage / "strata-vision.exe")
+            license_dir = stage / "licenses" / "llama.cpp"
+            license_dir.mkdir(parents=True)
+            shutil.copy2(ROOT / "third_party" / "llama.cpp" / "LICENSE", license_dir / "LICENSE")
         shutil.copy2(ROOT / "LICENSE", stage / "LICENSE")
         shutil.copy2(ROOT / "docs" / "RPC.md", stage / "RPC.md")
         shutil.copy2(ROOT / "docs" / "LAYER_STAGE_RPC.md", stage / "LAYER_STAGE_RPC.md")
@@ -96,7 +104,7 @@ def main() -> int:
             "platform": "windows-x64",
             "version": version_match.group(1),
             "archs": archs,
-            "vision": "none",
+            "vision": "gpu" if args.vision_exe is not None else "none",
             "toolkit": 13,
             "cuda_version": args.cuda_version,
         }, indent=1) + "\n", encoding="utf-8")

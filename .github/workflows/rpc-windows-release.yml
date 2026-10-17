@@ -72,10 +72,33 @@ jobs:
           )
           type ctest.log
 
+      - name: Fetch the pinned image encoder sources
+        shell: pwsh
+        run: python -c "import setup; setup.get_llama_cpp()"
+
+      - name: Build the optional CUDA image encoder
+        shell: cmd /C call {0}
+        run: |
+          @echo off
+          set "CUDA_PATH=%CONDA_PREFIX%\Library"
+          set "VSINSTALL=%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise"
+          call "%VSINSTALL%\Common7\Tools\VsDevCmd.bat" -arch=amd64 -host_arch=amd64
+          if errorlevel 1 exit /b %errorlevel%
+          cmake -S tools/vision -B build-vision -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_VISION_CUDA=ON -DSTRATA_PORTABLE=ON -DCMAKE_CUDA_STANDARD=17 "-DLLAMA_DIR=%CD%\third_party\llama.cpp" "-DCMAKE_CUDA_COMPILER=%CUDA_PATH%\bin\nvcc.exe" "-DCUDAToolkit_ROOT=%CUDA_PATH%" "-DCMAKE_CUDA_ARCHITECTURES=89;120" > vision-configure.log 2>&1
+          if errorlevel 1 (
+            powershell -NoProfile -Command "Get-Content vision-configure.log -Tail 30 | ForEach-Object { Write-Output ('::error::' + $_) }"
+            exit /b 1
+          )
+          cmake --build build-vision --parallel 2 --target strata-vision > vision-build.log 2>&1
+          if errorlevel 1 (
+            powershell -NoProfile -Command "$m = @(Select-String -Path vision-build.log -Pattern 'error|fatal|failed|stopped'); $x = @($m | Select-Object -First 10) + @($m | Select-Object -Last 10); if (-not $x) { $x = Get-Content vision-build.log -Tail 20 }; foreach ($i in $x) { Write-Output ('::error::' + $i) }"
+            exit /b 1
+          )
+
       - name: Package the engine
         shell: pwsh
         run: |
-          python tools/package_rpc_windows.py --exe build-rpc/strata.exe --out dist --cuda-version 13.2.2 --archs 89,120
+          python tools/package_rpc_windows.py --exe build-rpc/strata.exe --vision-exe build-vision/bin/strata-vision.exe --out dist --cuda-version 13.2.2 --archs 89,120
           python tests/test_rpc_windows_package.py dist/strata-rpc-windows-x64.zip
           $asset = "dist/strata-rpc-windows-x64.zip"
           $hash = (Get-FileHash $asset -Algorithm SHA256).Hash.ToLowerInvariant()

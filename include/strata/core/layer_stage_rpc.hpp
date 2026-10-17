@@ -17,9 +17,10 @@ enum LayerStageCapability : uint32_t {
     kLayerStageCapabilityReuse = 2u,
     kLayerStageCapabilityMtp = 4u,
     kLayerStageCapabilitySampling = 8u,
+    kLayerStageCapabilityVision = 16u,
 };
 
-constexpr uint16_t kLayerStageProtocolVersion = 4;
+constexpr uint16_t kLayerStageProtocolVersion = 5;
 constexpr uint32_t kLayerStageMaxMtpDrafts = 7;
 constexpr uint32_t kLayerStageMaxCheckpoints = 8;
 
@@ -76,6 +77,10 @@ public:
     virtual bool resume(uint64_t session, uint64_t old_generation, uint64_t new_generation, int64_t position,
                         std::string& err) = 0;
     virtual bool set_sampling(const LayerStageSampling& sampling, std::string& err) = 0;
+    /// Full absolute (t,h,w) table, including generation positions. Image embeddings stay on the coordinator.
+    virtual bool set_positions(const std::vector<int32_t>& positions, std::string& err) {
+        (void)positions; err = "this worker has no vision position table"; return false;
+    }
     /// Save only running state; the existing KV prefix remains resident. Retention is chosen by the coordinator.
     virtual bool checkpoint(int64_t position, const std::vector<int32_t>& tokens,
                             const std::vector<int64_t>& retained, std::string& err) = 0;
@@ -117,6 +122,7 @@ public:
     bool resume(uint64_t session, uint64_t generation, int64_t position, LayerStagePrefixIdentity prefix,
                 std::string& err);
     bool set_sampling(uint64_t session, uint64_t generation, const LayerStageSampling& sampling, std::string& err);
+    bool set_positions(uint64_t session, uint64_t generation, const std::vector<int32_t>& positions, std::string& err);
     bool checkpoint(uint64_t session, uint64_t generation, int64_t position, LayerStagePrefixIdentity prefix,
                     const std::vector<int64_t>& retained, std::string& err);
     bool prefill(uint64_t session, uint64_t generation, int64_t position, uint32_t rows, const int64_t* tokens,
@@ -177,6 +183,7 @@ private:
     uint16_t last_type_ = 0;
     std::vector<uint8_t> last_response_;
     bool session_valid_ = false;
+    bool positions_ready_ = false;
 };
 
 } // namespace strata::core

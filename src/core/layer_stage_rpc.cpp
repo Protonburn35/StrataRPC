@@ -22,7 +22,7 @@ constexpr auto kOperationTimeout = std::chrono::minutes(5);
 
 enum Message : uint16_t {
     kHello = 1, kReset = 2, kPrefill = 3, kVerify = 4, kCommit = 5, kAbort = 6, kHealth = 7, kResume = 8,
-    kSampling = 9, kCheckpoint = 10
+    kSampling = 9, kCheckpoint = 10, kPositions = 11
 };
 constexpr size_t kMtpReplyBytes = sizeof(uint32_t) + kLayerStageMaxMtpDrafts * sizeof(int32_t) +
                                   kLayerStageMaxMtpDrafts * sizeof(float);
@@ -131,13 +131,16 @@ bool activation_frame_fits(const LayerStageSpec& s, uint32_t rows, bool prefill)
 
 bool valid_spec(const LayerStageSpec& s) {
     constexpr uint32_t known_capabilities = kLayerStageCapabilityBase | kLayerStageCapabilityReuse |
-                                            kLayerStageCapabilityMtp | kLayerStageCapabilitySampling;
+                                            kLayerStageCapabilityMtp | kLayerStageCapabilitySampling |
+                                            kLayerStageCapabilityVision;
     return s.model_fingerprint != 0 && s.config_fingerprint != 0 && s.max_context > 0 &&
            s.max_context <= (uint64_t)std::numeric_limits<int64_t>::max() && s.n_layers > 0 &&
            s.n_embd > 0 && s.n_expert > 0 && s.hc > 0 && s.layer_begin < s.layer_end &&
            s.layer_end <= s.n_layers && s.max_verify_rows > 0 && s.max_verify_rows <= 8 && s.max_prefill_rows > 0 &&
            (s.capabilities & kLayerStageCapabilityBase) != 0 && (s.capabilities & ~known_capabilities) == 0 &&
            layer_stage_wire_element_bytes(s.wire_format) != 0 &&
+           ((s.capabilities & kLayerStageCapabilityVision) == 0 ||
+            s.max_context <= (kMaxFrameBytes - 16) / (3 * sizeof(int32_t)) - 64) &&
            activation_frame_fits(s, s.max_verify_rows, false) &&
            activation_frame_fits(s, s.max_prefill_rows, true);
 }
@@ -151,7 +154,9 @@ uint64_t max_operation_payload(const LayerStageSpec& s) {
     const uint64_t wire_bytes = layer_stage_wire_element_bytes(s.wire_format);
     const uint64_t prefill = 44 + prefill_tokens + prefill_floats * wire_bytes;
     const uint64_t verify = 44 + verify_tokens + verify_floats * wire_bytes;
-    return std::max<uint64_t>({prefill, verify, 44 + 8 * kLayerStageMaxCheckpoints});
+    const uint64_t positions = (s.capabilities & kLayerStageCapabilityVision) != 0
+                                  ? 16 + (s.max_context + 64) * 3 * sizeof(int32_t) : 0;
+    return std::max<uint64_t>({prefill, verify, positions, 44 + 8 * kLayerStageMaxCheckpoints});
 }
 
 std::vector<uint8_t> encode_mtp_reply(const LayerStageMtpReply& reply) {
@@ -211,6 +216,7 @@ const char* message_name(uint16_t type) {
         case kResume: return "resume";
         case kSampling: return "sampling";
         case kCheckpoint: return "checkpoint";
+        case kPositions: return "positions";
         case kPrefill: return "prefill";
         case kVerify: return "verify";
         case kCommit: return "commit";
@@ -700,6 +706,18 @@ bool LayerStageClient::set_sampling(uint64_t session, uint64_t generation, const
     return request(kSampling, m.bytes.data(), m.bytes.size(), nullptr, 0, nullptr, 0, nullptr, 0, err);
 }
 
+bool LayerStageClient::set_positions(uint64_t session, uint64_t generation,
+                                     const std::vector<int32_t>& positions, std::string& err) {
+    if ((spec_.capabilities & kLayerStageCapabilityVision) == 0 ||
+        positions.size() != (spec_.max_context + 64) * 3 ||
+        std::any_of(positions.begin(), positions.end(), [](int32_t p) { return p < 0; })) {
+        err = "vision positions must cover the negotiated context and generation tail"; return false;
+    }
+    Writer m; m.u64(session); m.u64(generation);
+    return request(kPositions, m.bytes.data(), m.bytes.size(), positions.data(), positions.size() * sizeof(int32_t),
+                   nullptr, 0, nullptr, 0, err);
+}
+
 bool LayerStageClient::checkpoint(uint64_t session, uint64_t generation, int64_t position,
                                    LayerStagePrefixIdentity prefix, const std::vector<int64_t>& retained,
                                    std::string& err) {
@@ -844,7 +862,7 @@ bool LayerStageServer::dispatch(uint16_t type, uint64_t operation, const uint8_t
         session_ = session; generation_ = generation; last_operation_ = operation; last_type_ = type;
         last_request_bytes_ = request.bytes; last_request_hash_a_ = request.a; last_request_hash_b_ = request.b;
         position_ = position; pending_verify_rows_ = 0; committed_tokens_.clear(); checkpoint_positions_.clear();
-        last_response_ = response; session_valid_ = true;
+        last_response_ = response; session_valid_ = true; positions_ready_ = false;
         return true;
     }
     if (type == kResume) {
@@ -865,6 +883,7 @@ bool LayerStageServer::dispatch(uint16_t type, uint64_t operation, const uint8_t
             return fail(err.empty() ? "layer-stage worker refused the resume state" : err);
         }
         generation_ = generation;
+        positions_ready_ = false;
         position_ = position;
         committed_tokens_.resize((size_t)position);
         checkpoint_positions_.erase(std::remove_if(checkpoint_positions_.begin(), checkpoint_positions_.end(),
@@ -877,7 +896,17 @@ bool LayerStageServer::dispatch(uint16_t type, uint64_t operation, const uint8_t
     if (!session_valid_ || session != session_ || generation != generation_ || operation != last_operation_ + 1)
         return fail("layer-stage session is absent, stale, or out of operation order; reset and replay the prompt");
     bool ok = false;
-    if (type == kSampling) {
+    if (type == kPositions) {
+        if ((spec_.capabilities & kLayerStageCapabilityVision) == 0 || pending_verify_rows_ != 0 ||
+            r.left() != (spec_.max_context + 64) * 3 * sizeof(int32_t))
+            return fail("vision positions do not match the negotiated context or a verification window is pending");
+        std::vector<int32_t> positions(r.left() / sizeof(int32_t));
+        if (!r.raw(positions.data(), positions.size() * sizeof(int32_t)) ||
+            std::any_of(positions.begin(), positions.end(), [](int32_t p) { return p < 0; }))
+            return fail("vision positions contain an invalid coordinate");
+        ok = executor_.set_positions(positions, err);
+        positions_ready_ = ok;
+    } else if (type == kSampling) {
         LayerStageSampling sampling;
         uint32_t top_k = 0;
         if ((spec_.capabilities & kLayerStageCapabilitySampling) == 0 || pending_verify_rows_ != 0 ||
@@ -913,6 +942,8 @@ bool LayerStageServer::dispatch(uint16_t type, uint64_t operation, const uint8_t
         ok = executor_.checkpoint(position, committed_tokens_, retained, err);
         if (ok) checkpoint_positions_ = std::move(retained);
     } else if (type == kPrefill || type == kVerify) {
+        if ((spec_.capabilities & kLayerStageCapabilityVision) != 0 && !positions_ready_)
+            return fail("configure vision positions after reset or resume before running the stage");
         if (!r.i64(position) || !r.u32(rows) || !r.u64(float_count) || !r.u64(activation_bytes))
             return fail("layer-stage activation metadata is truncated");
         const bool prefill = type == kPrefill;
@@ -1097,7 +1128,7 @@ bool LayerStageServer::serve(rpc::Socket client, std::string& err) {
             if (!disconnected) close_error = err;
             break;
         }
-        if (type < kReset || type > kCheckpoint || op_bytes > max_operation_payload(spec_)) {
+        if (type < kReset || type > kPositions || op_bytes > max_operation_payload(spec_)) {
             err = "layer-stage worker received an invalid operation frame";
             break;
         }

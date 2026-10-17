@@ -18,6 +18,10 @@ using namespace strata::core;
 
 class FakeStage final : public LayerStageExecutor {
 public:
+    bool set_positions(const std::vector<int32_t>& positions, std::string&) override {
+        position_updates.push_back(positions); return true;
+    }
+    std::vector<std::vector<int32_t>> position_updates;
     bool reset(uint64_t session, uint64_t generation, int64_t position, std::string&) override {
         checkpoints.clear();
         session_ = session; generation_ = generation; position_ = position; pending_ = 0; ++resets; return true;
@@ -325,6 +329,58 @@ bool test_resume_identity(const LayerStageSpec& spec, std::string& err) {
 
 // Exercise a prompt checkpoint, decode checkpoint, rewind/branch, and eviction over real TCP.
 // Sampling must follow each request (including a switch back to greedy), not worker startup defaults.
+bool test_vision_positions(LayerStageSpec spec, std::string& err) {
+    spec.max_context = 2048; // Position frame is larger than the tiny test's activation frames.
+    spec.capabilities |= kLayerStageCapabilityVision | kLayerStageCapabilityReuse;
+    rpc::Socket listener = rpc::kInvalidSocket;
+    uint32_t port = 0;
+    if (!open_listener(listener, port, err)) return false;
+    FakeStage executor;
+    LayerStageServer service("test-token", spec, executor);
+    bool server_ok = false;
+    std::string server_err;
+    std::thread server([&] {
+        rpc::Socket accepted = rpc::kInvalidSocket;
+        if (rpc::accept(listener, accepted, server_err)) server_ok = service.serve(accepted, server_err);
+        rpc::close(listener);
+    });
+    LayerStageClient client;
+    std::vector<int32_t> image((spec.max_context + 64) * 3), identity(image.size());
+    for (size_t i = 0; i < identity.size(); ++i) identity[i] = (int32_t)(i / 3);
+    image = identity;
+    image[3] = 0; image[4] = 1; image[5] = 0; // Nontrivial image grid, then compressed generation positions.
+    for (size_t i = 6; i < image.size(); ++i) image[i] = identity[i] - 1;
+    const int64_t tokens[] = {10, 11};
+    const int32_t prefix[] = {10, 11}, drafts[] = {20, 21};
+    int32_t picks[2]{};
+    std::vector<float> residual(2 * spec.n_embd * spec.hc, 0.25f);
+    std::vector<float> handoff(2 * (spec.hc * spec.n_embd + spec.n_embd + spec.hc), -0.5f);
+    bool ok = client.connect("127.0.0.1:" + std::to_string(port), "test-token", spec, err) &&
+              client.reset(42, 1, 0, err);
+    if (ok) ok = !client.prefill(42, 1, 0, 2, tokens, residual.data(), err) && client.connected();
+    if (ok) ok = !client.set_positions(42, 1, {0, 0, 0}, err);
+    auto invalid = image; invalid[0] = -1;
+    if (ok) ok = !client.set_positions(42, 1, invalid, err);
+    if (ok) ok = client.set_positions(42, 1, image, err) &&
+                 client.prefill(42, 1, 0, 2, tokens, residual.data(), err) &&
+                 client.checkpoint(42, 1, 2, layer_stage_prefix_identity(prefix, 2), {2}, err) &&
+                 client.verify(42, 1, 2, 2, drafts, handoff.data(), picks, err);
+    if (ok) ok = !client.set_positions(42, 1, identity, err) && client.connected();
+    if (ok) ok = client.commit(42, 1, 1, err) &&
+                 client.resume(42, 2, 2, layer_stage_prefix_identity(prefix, 2), err);
+    if (ok) ok = !client.prefill(42, 2, 2, 2, tokens, residual.data(), err) &&
+                 client.set_positions(42, 2, image, err) &&
+                 client.prefill(42, 2, 2, 2, tokens, residual.data(), err);
+    if (ok) ok = client.reset(42, 3, 0, err) && client.set_positions(42, 3, identity, err) &&
+                 client.prefill(42, 3, 0, 2, tokens, residual.data(), err);
+    client.close(); server.join();
+    if (!ok || !server_ok || executor.position_updates != std::vector<std::vector<int32_t>>{image, image, identity}) {
+        err = "vision positions / checkpoint continuation / image-to-text reset failed: " + err + server_err;
+        return false;
+    }
+    return true;
+}
+
 bool test_checkpoint_and_sampling(LayerStageSpec spec, std::string& err) {
     const int32_t outputs[] = {20, 99, 21, 22};
     if (layer_stage_output_commit_count(outputs, 4, 10, {99}) != 2 ||
@@ -892,6 +948,7 @@ int main() {
     if (!test_activation_codecs(err) || !test_reduced_precision_rpc(spec, LayerStageWireFormat::bf16, err) ||
         !test_reduced_precision_rpc(spec, LayerStageWireFormat::fp16, err) ||
         !test_mtp_commit_response(spec, err) || !test_checkpoint_and_sampling(spec, err) ||
+        !test_vision_positions(spec, err) ||
         !test_replay_identity(spec, err) || !test_resume_identity(spec, err) ||
         !test_disconnect_clears_replay(spec, err) ||
         !test_partial_header_timeout_and_reaccept(spec, err) ||

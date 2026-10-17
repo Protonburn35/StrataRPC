@@ -47,6 +47,13 @@ def validate(archive: Path) -> None:
         missing = required - names
         if missing:
             raise AssertionError(f"Windows package is missing root files: {sorted(missing)}")
+        metadata = json.loads(zf.read("BUILD.json"))
+        if metadata.get("vision") == "gpu":
+            if "strata-vision.exe" not in names or "licenses/llama.cpp/LICENSE" not in names:
+                raise AssertionError("CUDA vision package needs the encoder and its license")
+            with zf.open("strata-vision.exe") as encoder:
+                if encoder.read(2) != b"MZ":
+                    raise AssertionError("vision encoder is not a Windows executable")
         if "tools/layer_stage_ray.py" in names:
             raise AssertionError("Ray script must be at archive root to match extraction into C:\\Strata\\engine")
 

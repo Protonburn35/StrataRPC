@@ -9,15 +9,56 @@ process. The transport is the bounded native TCP protocol implemented in layer_s
 activation data path.
 
 This is a prototype for performance and capacity experiments, not a benchmarked speedup. It is deliberately limited
-to one serial text request at a time, a static expert profile, a native model pack, --spec >= 2,
+to one serial request at a time, a static expert profile, a native model pack, --spec >= 2,
 and the same explicit fixed --prefill N, model, runtime configuration, and --layer-stage-split K on both PCs. Both
 machines need their own local model files and Strata installation. The worker command is a protocol server, not an
 HTTP generation endpoint. The client remains the API endpoint. Prefix continuation is opt-in; without it,
 every request starts at position zero and rereads the complete prompt. Optional worker-owned native MTP is supported
-for greedy and sampled text requests. Temperature, top-k, top-p, min-p, and seed are applied on the terminal worker
-for each request. Batching, images, penalties, logit bias, cvec overrides, probabilistic or coupled draft sampling,
+for greedy and sampled requests. Images are optional from Exp28. Temperature, top-k, top-p, min-p, and seed are applied on the terminal worker
+for each request. Batching, penalties, logit bias, cvec overrides, probabilistic or coupled draft sampling,
 and expert-cache RPC are not supported. The worker also requires the non-finite-logit
 guard; do not set STRATA_NAN_GUARD=0 on it.
+
+## Exp28: optional vision
+
+Upgrade the engine on **both PCs**. Exp28 uses layer-stage protocol 5 and includes the CUDA `strata-vision.exe`
+encoder. Vision stays off unless enabled. Existing text-only configs continue to work after both engines are updated.
+This release adds vision only; distributed session files are not enabled here.
+
+To enable images with the existing Windows launchers:
+
+1. Add `"--vision"` to the `args` array in **both** the host and worker JSONs. Keep the existing FP16 KV,
+   context, fixed prefill chunk, split, MTP and sampling settings.
+2. On the **host**, add `"--vram-reserve-mib", "2048"` to `args` (replace an existing reserve value). This
+   leaves space for the encoder's image-processing buffers; it reduces room for cached experts. The encoder
+   starts before the main engine, so its loaded weights are also included in the available-memory measurement.
+3. Add this top-level `vision` object to the **host** JSON. Use its own shard 1 as `model`; change `IQ3_S` to
+   `IQ3_XXS` for that quant. The engine folder below is the existing folder, with the new release extracted into it.
+
+```json
+"vision": {
+  "exe": "C:\\Strata\\engine-rpc-exp24\\strata-vision.exe",
+  "mmproj": "C:\\Strata-data\\models\\mmproj-Qwen3.8-Flash-Next-BF16.gguf",
+  "model": "C:\\Strata\\Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf",
+  "gpu": true,
+  "max_tokens": 1024
+}
+```
+
+The host needs the matching mmproj from the ISTA-DASLab Qwen3.8-Flash-Next-GSQ-RCO-GGUF repository. Reuse an existing
+copy if present. The worker does not need the mmproj or an encoder process. Set `gpu` to `false` to encode images
+on the host CPU instead; the engines on both PCs still need `--vision`. Restart the worker first, then the host.
+
+The existing API accepts OpenAI image_url parts, Anthropic image blocks, and browser image attachments. The host
+inserts image embeddings before layer 0. The usual stage activations cross the network, along with one lossless
+absolute image-position table per request (about 3 MiB at 256K context). No image file or KV cache is sent to the
+worker. Both stages use the same positions for attention, decode and MTP. Sending a text prompt after an image
+restores text positions on both stages. Prefix reuse checks image grids/embedding hashes as well as tokens on the
+coordinator; changed images therefore cannot reuse an old image's state merely because their token counts match.
+
+Validation includes protocol tests for missing/invalid positions, updates during a pending verifier window,
+image-prefix checkpoint continuation, and image-to-text transitions. GPU image quality and speed on the real
+4090/5070 Ti pair still require hardware testing; a successful build is not that validation.
 
 ## Exp27: interrupt an active reply without reloading
 
@@ -152,8 +193,8 @@ run. Strata checks the model/config fingerprint, geometry, split, verify limit, 
 mismatch refuses the connection. The RPC secret is sent over plaintext TCP, so use a trusted LAN or VPN and never
 expose this port to the public internet.
 
-Layer-stage mode rejects vision even for text-only requests. The API wrapper forwards per-request sampling fields to
-the engine. Temperature 1 is supported, as are top-k, top-p, min-p, and a seed. Penalties, logit bias, images, and
+Layer-stage vision requires `--vision` on both endpoints (Exp28 or newer). The API wrapper forwards per-request sampling fields to
+the engine. Temperature 1 is supported, as are top-k, top-p, min-p, and a seed. Penalties, logit bias, and
 cvec overrides still return an ERR. Temperature 0 remains the default when the request has no sampling settings.
 
 The worker reserves its owned prefill scratch before sizing the expert cache and disables cache borrowing, because

@@ -1165,9 +1165,10 @@ public:
                             strata::core::Verifier& verifier, strata::prefill::Prefill& prefill,
                             Drive& drive, MappedLayerStageBuffer& handoff,
                             cudaStream_t stream, uint32_t max_verify_rows,
-                            strata::core::MtpDrafter* mtp = nullptr)
+                            strata::core::MtpDrafter* mtp = nullptr, int32_t* mrope = nullptr, size_t mrope_count = 0)
         : session_(session), geometry_(geometry), verifier_(verifier), prefill_(prefill), drive_(drive),
-          handoff_(handoff), stream_(stream), max_verify_rows_(max_verify_rows), mtp_(mtp) {
+          handoff_(handoff), stream_(stream), max_verify_rows_(max_verify_rows), mtp_(mtp),
+          mrope_(mrope), mrope_count_(mrope_count) {
         if (mtp_ != nullptr) {
             auto previous = prefill_.on_chunk;
             prefill_.on_chunk = [this, previous](const float* rows, int64_t count, int64_t position,
@@ -1257,6 +1258,18 @@ public:
         sp.min_p = sampling.min_p;
         sp.seed = sampling.seed;
         verifier_.set_sampling(sp);
+        return true;
+    }
+
+    bool set_positions(const std::vector<int32_t>& positions, std::string& err) override {
+        if (mrope_ == nullptr || positions.size() != mrope_count_ || pending_ != 0) {
+            err = "worker vision position table is absent or has a different size"; return false;
+        }
+        if (!verifier_.wait_commit(err) || (mtp_ != nullptr && !mtp_->idle(err))) return false;
+        if (cudaDeviceSynchronize() != cudaSuccess ||
+            cudaMemcpy(mrope_, positions.data(), positions.size() * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) {
+            err = "worker vision position upload failed"; return false;
+        }
         return true;
     }
 
@@ -1485,6 +1498,8 @@ private:
     const int64_t* current_prefill_tokens_ = nullptr;
     std::vector<int32_t> last_verify_tokens_, last_verify_picks_;
     strata::core::MtpDrafter* mtp_ = nullptr;
+    int32_t* mrope_ = nullptr;
+    size_t mrope_count_ = 0;
     bool valid_ = false;
 };
 
@@ -2813,10 +2828,10 @@ int main(int argc, char** argv) {
         split_at.push_back(cut);
         const bool stage_local_helpers = std::any_of(o.expert_cache_remote.begin(), o.expert_cache_remote.end(),
                                                      [](int slots) { return slots > 0; });
-        if (o.batch > 0 || (!o.mtp.empty() && !o.layer_stage_mtp) || o.peer_device >= 0 || stage_local_helpers || o.vision ||
+        if (o.batch > 0 || (!o.mtp.empty() && !o.layer_stage_mtp) || o.peer_device >= 0 || stage_local_helpers ||
             !o.expert_cache_rpc.empty() || !o.rpc_server.empty() || o.conversation_cache_mib > 0) {
             std::fprintf(stderr, "strata generate: layer-stage RPC requires one request at a time and no unsupported MTP, "
-                                 "vision, peer/helper RPC, or conversation parking\n");
+                                 "peer/helper RPC, or conversation parking\n");
             return 2;
         }
         if (o.layer_stage_reuse && o.prompt_cache == 0) {
@@ -8349,7 +8364,8 @@ int main(int argc, char** argv) {
                 ver.set_stage(local_layer_begin, -1, stage_handoff.device, nullptr);
                 stage_executor = std::make_unique<ModelLayerStageExecutor>(ss, g, ver, sp, drive, stage_handoff,
                                                                            main_stream, (uint32_t) o.spec,
-                                                                           o.layer_stage_mtp ? &mtp : nullptr);
+                                                                           o.layer_stage_mtp ? &mtp : nullptr,
+                                                                           d_mrope, mrope_host.size());
             }
         }
         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
@@ -8672,6 +8688,7 @@ int main(int argc, char** argv) {
             layer_stage_spec.max_prefill_rows = (uint32_t) sp.chunk();
             layer_stage_spec.capabilities = strata::core::kLayerStageCapabilityBase | strata::core::kLayerStageCapabilitySampling |
                 (o.layer_stage_reuse ? strata::core::kLayerStageCapabilityReuse : 0u) |
+                (o.vision ? strata::core::kLayerStageCapabilityVision : 0u) |
                 (o.layer_stage_mtp ? strata::core::kLayerStageCapabilityMtp : 0u);
             layer_stage_spec.wire_format = o.layer_stage_wire == "bf16" ? strata::core::LayerStageWireFormat::bf16
                                            : o.layer_stage_wire == "fp16" ? strata::core::LayerStageWireFormat::fp16
@@ -11084,13 +11101,19 @@ int main(int argc, char** argv) {
                 continue;
             }
             if (layer_stage_mode &&
-                (geni || req_bias_present || req_penalty_last_n > 0 ||
+                (req_bias_present || req_penalty_last_n > 0 ||
                  req_penalty_repeat != 1.0f || req_penalty_freq != 0.0f || req_penalty_present != 0.0f ||
                  req_cvec != 1)) {
-                std::printf("ERR layer-stage RPC supports text requests without logit bias, penalties, or cvec overrides\n");
+                std::printf("ERR layer-stage RPC does not support logit bias, penalties, or cvec overrides\n");
                 continue;
             }
             const int64_t n = (int64_t) ids.size();
+            // Validate before writing an image's absolute position table.
+            if (n > o.max_context - 8 || max_new > o.max_context - n - 8) {
+                std::printf("ERR prompt (%lld tokens) + max_new (%lld) exceeds the context (%lld)\n",
+                            (long long)n, (long long)max_new, (long long)o.max_context);
+                continue;
+            }
             req_imgs.clear();
             if (geni && !o.vision) { std::printf("ERR this engine was started without --vision\n"); continue; }
             if (geni || !mrope_identity) {
@@ -12061,6 +12084,12 @@ int main(int argc, char** argv) {
             ver.set_sampling(req_sp);
             if (layer_stage_client) {
                 strata::core::LayerStageSampling remote_sampling;
+                // Also send identity positions for text after an image request. Decode and MTP use the same
+                // absolute table on both GPUs; image embeddings were already injected by the first stage.
+                if (o.vision && !stage_client.set_positions(stage_session, stage_generation, mrope_host, err)) {
+                    std::printf("ERR configuring remote image positions: %s\n", err.c_str());
+                    return 1;
+                }
                 remote_sampling.temperature = req_sp.greedy ? 0.0f : req_sp.temperature;
                 remote_sampling.top_p = req_sp.top_p;
                 remote_sampling.top_k = req_sp.top_k;
