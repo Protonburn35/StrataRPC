@@ -146,6 +146,10 @@ inline bool conversation_checkpoints_merge(ConversationCheckpointSplit&& split, 
 }
 
 struct SavedConversation {
+    // Optional distributed snapshot identity; format v2 binds the two PCs' files to one immutable save.
+    std::array<uint64_t, 2> stage_snapshot{};
+    // Live MTP residual followed by one residual per saved checkpoint (worker only).
+    std::vector<float> stage_mtp_tails;
     // Runtime compatibility only; NOT a model/weights identity or disk schema.
     std::array<int64_t, 18> geometry{};
     // The session's layer carve the image was captured from ([0, n_layers) on one GPU); restore requires the same.
@@ -165,7 +169,7 @@ struct SavedConversation {
 
     size_t bytes() const {
         size_t n = live.bytes() + checkpoints.capacity() * sizeof(ConversationCheckpoint) +
-                   kv.capacity() * sizeof(ConversationKv);
+                   kv.capacity() * sizeof(ConversationKv) + stage_mtp_tails.capacity() * sizeof(float);
         for (const auto& s : stage_images) n += s.bytes();
         for (const auto& c : checkpoints) n += c.bytes();
         for (const auto& k : kv) n += k.bytes();

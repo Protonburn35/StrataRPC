@@ -262,6 +262,19 @@ class Slots(unittest.TestCase):
         s, b = self.post("/slots/0?action=restore", {"filename": "flush.bin"})
         self.assertEqual(s, 200, b)
 
+    def test_remote_stage_disk_wait_keeps_the_host_engine_alive(self):
+        self.engine.silence_s = 0.3
+        self.engine.script = ["SWAIT remotesave 1\n", 0.7, "SESSION 100 100\n", "SAVED 12 100 750.0\n"]
+        status, body = self.post("/slots/0?action=save", {"filename": "rpc.bin"})
+        self.assertEqual(status, 200, body)
+        self.assertFalse(self.engine.ended)
+        Path(self.dir.name, "rpc.bin").write_bytes(b"x")
+        self.engine.script = ["SESSION 100 100\n", "SWAIT remoterestore 1\n", 0.7,
+                              "SWAIT transfer 1\n", "RESTORED 12 100 750.0\n"]
+        status, body = self.post("/slots/0?action=restore", {"filename": "rpc.bin"})
+        self.assertEqual(status, 200, body)
+        self.assertFalse(self.engine.ended)
+
     def test_a_blocking_step_that_never_ends_is_ended(self):
         """B: the allowance is a bound, not a heartbeat: a step that outlives it ends the engine."""
         self.engine.silence_s = 0.3

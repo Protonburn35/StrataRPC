@@ -103,6 +103,7 @@ bool same_checkpoint(const ConversationCheckpoint& a, const ConversationCheckpoi
 }
 
 bool same(const SavedConversation& a, const SavedConversation& b) {
+    if (a.stage_snapshot != b.stage_snapshot || a.stage_mtp_tails != b.stage_mtp_tails) return false;
     if (a.geometry != b.geometry || a.layer_lo != b.layer_lo || a.layer_hi != b.layer_hi || a.cvec != b.cvec ||
         !same_checkpoint(a.live, b.live) || a.checkpoints.size() != b.checkpoints.size() || a.kv.size() != b.kv.size())
         return false;
@@ -244,7 +245,7 @@ int main() {
     // wrong version: header field patched and header hash recomputed so only the version differs
     {
         auto d = image;
-        uint32_t v = 2; std::memcpy(d.data() + 8, &v, 4);
+        uint32_t v = 99; std::memcpy(d.data() + 8, &v, 4);
         const uint64_t h = session_hash64(d.data(), 56, 0); std::memcpy(d.data() + 56, &h, 8);
         const fs::path p = dir / "ver.bin"; spit(p, d);
         check(rejects(p, id, "version"), "unknown version rejected");
@@ -358,6 +359,13 @@ int main() {
         // K/V in the image and as sources at once is ambiguous: refused
         check(!session_file_write((dir / "both.bin").string(), original, sources, id, written, error),
               "image K/V plus sources refused");
+        auto captured_stage = original;
+        captured_stage.stage_snapshot = meta.stage_snapshot = {123, 456};
+        captured_stage.stage_mtp_tails = meta.stage_mtp_tails = {0.25f, -0.5f, 1.0f};
+        const auto paired = dir / "paired-captured.bin";
+        check(session_file_write(p.string(), meta, sources, id, written, error) &&
+              session_file_write(paired.string(), captured_stage, id, written, error), "paired stage write forms succeed");
+        check(slurp(p) == slurp(paired), "streamed paired stage preserves the MTP tail payload exactly");
     }
 
     // the configuration fingerprint: every field counts, doubles by their exact bits
@@ -769,6 +777,40 @@ int main() {
     }
 #endif
 
+    // Version 2 binds the two independently stored layer stages and preserves the worker's MTP lookahead.
+    // Ordinary session bytes remain covered by the version-1 golden above.
+    {
+        auto stage = sample();
+        stage.stage_snapshot = {0x123456789abcdef0ull, 0xfedcba9876543210ull};
+        stage.stage_mtp_tails = {1.25f, -2.5f, 0.0f, 1.0f};
+        const auto path = dir / "paired-stage.bin";
+        size_t size = 0, read = 0;
+        check(session_file_write(path.string(), stage, id, size, error), "paired stage writes");
+        check(rejects(path, id, "requires both RPC stages"), "single-PC restore rejects a stage snapshot");
+        SessionReadLimits limits;
+        limits.allow_layer_stage = true;
+        check(rejects(path, id, nullptr, limits), "host stage refuses worker MTP tails");
+        limits.max_stage_mtp_floats = 4;
+        SavedConversation restored;
+        check(session_file_read(path.string(), id, restored, read, error, limits) && same(stage, restored),
+              "paired stage round trip includes snapshot ID and MTP tails");
+        check(size == read && size == kGoldenSize + 8 + 4 * sizeof(float), "paired stage exact payload length");
+        auto corrupt = slurp(path);
+        corrupt[40] ^= 1;
+        spit(dir / "paired-corrupt.bin", corrupt);
+        check(rejects(dir / "paired-corrupt.bin", id, "header checksum", limits), "snapshot ID checksum protected");
+        stage.stage_mtp_tails.clear();
+        check(session_file_write(path.string(), stage, id, size, error), "host stage without MTP writes");
+        limits.max_stage_mtp_floats = 0;
+        check(session_file_read(path.string(), id, restored, read, error, limits) && same(stage, restored),
+              "host stage without MTP restores");
+        stage.stage_snapshot[1] = 0;
+        check(!session_file_write(path.string(), stage, id, size, error), "incomplete stage ID rejected");
+        stage.stage_snapshot = {}; stage.stage_mtp_tails = {1.0f};
+        check(!session_file_write(path.string(), stage, id, size, error), "MTP tails require a paired stage ID");
+        check(session_file_read(good.string(), id, restored, read, error, limits) && same(original, restored),
+              "layer-stage-aware reader still reads unchanged version 1");
+    }
     fs::remove_all(dir);
     std::printf("conversation_file_test: %d checks passed\n", checks);
     return 0;

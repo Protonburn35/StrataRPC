@@ -19,11 +19,64 @@ for each request. Batching, penalties, logit bias, cvec overrides, probabilistic
 and expert-cache RPC are not supported. The worker also requires the non-finite-logit
 guard; do not set STRATA_NAN_GUARD=0 on it.
 
+## Exp29: optional disk save/restore, with vision included
+
+Exp29 includes Exp28's vision support and adds paired disk snapshots. Both features remain opt-in and can be used
+independently. Upgrade **both PCs** to Exp29 to enable disk sessions. Ray is not required.
+
+1. Keep `--layer-stage-reuse` and `--prompt-cache` enabled on both PCs. Add `"--layer-stage-sessions"` to both
+   JSON `args` arrays.
+2. Add `"--layer-stage-session-dir", "C:\\Strata-data\\sessions-worker"` to the **5070 Ti worker's** `args`.
+   The engine creates this directory on the worker's local SSD.
+3. Add `"slot_save_path": "C:\\Strata-data\\sessions-host"` as a **top-level field** in the **4090 host JSON**.
+   The API creates this host directory. Keep the usual host API at `127.0.0.1:8081`.
+4. Restart the worker, then the host. Finish a reply before saving; a cancelled/incomplete turn may have no live
+   session to save. Run these PowerShell commands on the 4090 PC:
+
+```powershell
+# Save the conversation currently held by the engine.
+Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:8081/slots/0?action=save' `
+  -ContentType 'application/json' -Body '{"filename":"chat-1.bin"}'
+
+# Restore it, including after restarting both engines with the same configuration.
+Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:8081/slots/0?action=restore' `
+  -ContentType 'application/json' -Body '{"filename":"chat-1.bin"}'
+```
+
+Add your usual API authorization header if you configured an API key. After restore, continue the same chat with
+its full message history, including its images. This saves inference state; it does not save the frontend's chat
+database, messages, image files, or sampling settings. The usual prefix matcher determines how much the next request
+can reuse. For repeatable sampling, provide the same explicit seed/settings in that request.
+
+Each PC saves only its owned layers to its own SSD. The worker also saves MTP KV and the residuals needed to resume
+drafting. The host file contains a generated snapshot ID; the worker file is named `<snapshot-id>.srpc` and its name
+is printed in the worker log. The worker publishes its immutable file before the host publishes the matching file.
+Only the small snapshot descriptor crosses Ethernet, not the KV payload. Image positions are rebuilt from the next
+request and sent through the vision path before inference resumes.
+
+Keep **both** files. A host file alone is insufficient; a missing, corrupt, differently configured, or mismatched
+worker file refuses restore. Use the same model/quant, split, context, KV format, vision setting, wire format and
+MTP settings. Disk files use an opt-in version 2 envelope; ordinary single-PC version 1 file bytes are unchanged.
+Failed restores invalidate live reuse so the next request resets/replays safely. Snapshots contain conversation
+state and should be stored on trusted local disks.
+
+Writes stream KV through the existing bounded staging buffer. Reads temporarily hold that PC's saved state in RAM;
+the existing RAM floor can refuse a large restore if it does not fit. The default disk-space floor is 4096 MiB
+in addition to the new file (`--session-min-free-mib`), and each worker operation has a five-minute RPC deadline.
+Snapshot files are retained until manually deleted. Overwriting a host filename creates a new worker snapshot;
+old worker snapshots, and worker files left by a failed host write, are not automatically removed. To reclaim all
+saved sessions, stop both engines and delete the session files in both dedicated directories.
+
+Validation covers version-1 byte compatibility, version-2 round trips and bounds, identity mismatches, failed saves,
+checkpoint resume, reconnect restore and image-position reinitialization. CUDA snapshot tests are included in the
+build and skip when no GPU is available. Actual GPU restore correctness and latency on a two-PC model run remain
+hardware validation tasks.
+
 ## Exp28: optional vision
 
 Upgrade the engine on **both PCs**. Exp28 uses layer-stage protocol 5 and includes the CUDA `strata-vision.exe`
 encoder. Vision stays off unless enabled. Existing text-only configs continue to work after both engines are updated.
-This release adds vision only; distributed session files are not enabled here.
+The Exp28 release adds vision only; distributed session files arrive in Exp29 above.
 
 To enable images with the existing Windows launchers:
 

@@ -22,7 +22,7 @@ constexpr auto kOperationTimeout = std::chrono::minutes(5);
 
 enum Message : uint16_t {
     kHello = 1, kReset = 2, kPrefill = 3, kVerify = 4, kCommit = 5, kAbort = 6, kHealth = 7, kResume = 8,
-    kSampling = 9, kCheckpoint = 10, kPositions = 11
+    kSampling = 9, kCheckpoint = 10, kPositions = 11, kSaveSnapshot = 12, kRestoreSnapshot = 13
 };
 constexpr size_t kMtpReplyBytes = sizeof(uint32_t) + kLayerStageMaxMtpDrafts * sizeof(int32_t) +
                                   kLayerStageMaxMtpDrafts * sizeof(float);
@@ -98,6 +98,34 @@ struct Reader {
     size_t left() const { return n - at; }
 };
 
+bool valid_snapshot(const LayerStageSnapshot& s, const LayerStageSpec& spec) {
+    if ((spec.capabilities & kLayerStageCapabilitySessions) == 0 || !s.id[0] || !s.id[1] ||
+        s.position <= 0 || (uint64_t)s.position > spec.max_context ||
+        s.checkpoints.size() > kLayerStageMaxCheckpoints) return false;
+    for (size_t i = 0; i < s.checkpoints.size(); ++i) {
+        if (s.checkpoints[i] <= 0 || s.checkpoints[i] > s.position ||
+            std::find(s.checkpoints.begin(), s.checkpoints.begin() + i, s.checkpoints[i]) != s.checkpoints.begin() + i)
+            return false;
+    }
+    return true;
+}
+
+void write_snapshot(Writer& w, const LayerStageSnapshot& s) {
+    w.u64(s.id[0]); w.u64(s.id[1]); w.i64(s.position);
+    w.u64(s.prefix.hash_a); w.u64(s.prefix.hash_b); w.u32((uint32_t)s.checkpoints.size());
+    for (int64_t at : s.checkpoints) w.i64(at);
+}
+
+bool read_snapshot(Reader& r, LayerStageSnapshot& s, const LayerStageSpec& spec) {
+    uint32_t count = 0;
+    if (!r.u64(s.id[0]) || !r.u64(s.id[1]) || !r.i64(s.position) ||
+        !r.u64(s.prefix.hash_a) || !r.u64(s.prefix.hash_b) || !r.u32(count) ||
+        count > kLayerStageMaxCheckpoints || r.left() != (size_t)count * 8) return false;
+    s.checkpoints.resize(count);
+    for (auto& at : s.checkpoints) if (!r.i64(at)) return false;
+    return valid_snapshot(s, spec);
+}
+
 bool checked_mul(uint64_t a, uint64_t b, uint64_t& result) {
     if (b != 0 && a > std::numeric_limits<uint64_t>::max() / b) return false;
     result = a * b;
@@ -132,7 +160,7 @@ bool activation_frame_fits(const LayerStageSpec& s, uint32_t rows, bool prefill)
 bool valid_spec(const LayerStageSpec& s) {
     constexpr uint32_t known_capabilities = kLayerStageCapabilityBase | kLayerStageCapabilityReuse |
                                             kLayerStageCapabilityMtp | kLayerStageCapabilitySampling |
-                                            kLayerStageCapabilityVision;
+                                            kLayerStageCapabilityVision | kLayerStageCapabilitySessions;
     return s.model_fingerprint != 0 && s.config_fingerprint != 0 && s.max_context > 0 &&
            s.max_context <= (uint64_t)std::numeric_limits<int64_t>::max() && s.n_layers > 0 &&
            s.n_embd > 0 && s.n_expert > 0 && s.hc > 0 && s.layer_begin < s.layer_end &&
@@ -156,7 +184,7 @@ uint64_t max_operation_payload(const LayerStageSpec& s) {
     const uint64_t verify = 44 + verify_tokens + verify_floats * wire_bytes;
     const uint64_t positions = (s.capabilities & kLayerStageCapabilityVision) != 0
                                   ? 16 + (s.max_context + 64) * 3 * sizeof(int32_t) : 0;
-    return std::max<uint64_t>({prefill, verify, positions, 44 + 8 * kLayerStageMaxCheckpoints});
+    return std::max<uint64_t>({prefill, verify, positions, 64 + 8 * kLayerStageMaxCheckpoints});
 }
 
 std::vector<uint8_t> encode_mtp_reply(const LayerStageMtpReply& reply) {
@@ -217,6 +245,8 @@ const char* message_name(uint16_t type) {
         case kSampling: return "sampling";
         case kCheckpoint: return "checkpoint";
         case kPositions: return "positions";
+        case kSaveSnapshot: return "save-snapshot";
+        case kRestoreSnapshot: return "restore-snapshot";
         case kPrefill: return "prefill";
         case kVerify: return "verify";
         case kCommit: return "commit";
@@ -559,6 +589,12 @@ bool layer_stage_decode_activations(LayerStageWireFormat format, const uint8_t* 
     return true;
 }
 
+std::string layer_stage_snapshot_name(const std::array<uint64_t, 2>& id) {
+    char name[48];
+    std::snprintf(name, sizeof(name), "%016llx%016llx.srpc", (unsigned long long)id[0], (unsigned long long)id[1]);
+    return name;
+}
+
 LayerStageClient::~LayerStageClient() { close(); }
 
 bool LayerStageClient::connect(const std::string& endpoint, const std::string& token, const LayerStageSpec& expected,
@@ -718,6 +754,27 @@ bool LayerStageClient::set_positions(uint64_t session, uint64_t generation,
                    nullptr, 0, nullptr, 0, err);
 }
 
+bool LayerStageClient::save_snapshot(uint64_t session, uint64_t generation,
+                                    const LayerStageSnapshot& snapshot, std::string& err) {
+    if (!valid_snapshot(snapshot, spec_)) { err = "invalid or disabled worker disk snapshot"; return false; }
+    Writer m; m.u64(session); m.u64(generation); write_snapshot(m, snapshot);
+    return request(kSaveSnapshot, m.bytes.data(), m.bytes.size(), nullptr, 0, nullptr, 0, nullptr, 0, err);
+}
+
+bool LayerStageClient::restore_snapshot(uint64_t session, uint64_t generation,
+                                       const LayerStageSnapshot& snapshot, std::string& err) {
+    if (!valid_snapshot(snapshot, spec_)) { err = "invalid or disabled worker disk snapshot"; return false; }
+    if (!connected()) {
+        const std::string endpoint = endpoint_, token = token_;
+        const LayerStageSpec expected = spec_;
+        if (endpoint.empty() || token.empty()) { err = "no saved worker endpoint for disk restore"; return false; }
+        if (!connect(endpoint, token, expected, err)) return false;
+    }
+    next_operation_ = 1;
+    Writer m; m.u64(session); m.u64(generation); write_snapshot(m, snapshot);
+    return request(kRestoreSnapshot, m.bytes.data(), m.bytes.size(), nullptr, 0, nullptr, 0, nullptr, 0, err);
+}
+
 bool LayerStageClient::checkpoint(uint64_t session, uint64_t generation, int64_t position,
                                    LayerStagePrefixIdentity prefix, const std::vector<int64_t>& retained,
                                    std::string& err) {
@@ -850,6 +907,27 @@ bool LayerStageServer::dispatch(uint16_t type, uint64_t operation, const uint8_t
         response = last_response_;
         return true; // replay the prior acknowledgement/result only for an identical request
     }
+    if (type == kRestoreSnapshot) {
+        LayerStageSnapshot snapshot;
+        if (operation != 1 || session == 0 || generation == 0 || pending_verify_rows_ != 0 ||
+            (session == session_ && generation <= generation_) || !read_snapshot(r, snapshot, spec_))
+            return fail("disk restore requires a fresh generation and a valid snapshot with no pending verification");
+        // A failed restore may have written device state. Require reset/another restore before any inference.
+        session_valid_ = false; positions_ready_ = false;
+        std::vector<int32_t> tokens;
+        if (!executor_.restore_snapshot(snapshot, session, generation, tokens, err))
+            return fail(err.empty() ? "worker disk restore failed" : err);
+        const auto prefix = layer_stage_prefix_identity(tokens.data(), tokens.size());
+        if (tokens.size() != (size_t)snapshot.position || prefix.hash_a != snapshot.prefix.hash_a ||
+            prefix.hash_b != snapshot.prefix.hash_b) return fail("restored worker prefix differs from host snapshot");
+        committed_tokens_ = std::move(tokens); checkpoint_positions_ = snapshot.checkpoints;
+        position_ = snapshot.position; pending_verify_rows_ = 0;
+        session_ = session; generation_ = generation; session_valid_ = true;
+        response = response_payload(true, std::string());
+        last_operation_ = operation; last_type_ = type; last_response_ = response;
+        last_request_bytes_ = request.bytes; last_request_hash_a_ = request.a; last_request_hash_b_ = request.b;
+        return true;
+    }
     if (type == kReset) {
         if (operation != 1 || !r.i64(position) || r.left() != 0 || session == 0 || generation == 0 || position != 0 ||
             (uint64_t)position > spec_.max_context)
@@ -896,7 +974,21 @@ bool LayerStageServer::dispatch(uint16_t type, uint64_t operation, const uint8_t
     if (!session_valid_ || session != session_ || generation != generation_ || operation != last_operation_ + 1)
         return fail("layer-stage session is absent, stale, or out of operation order; reset and replay the prompt");
     bool ok = false;
-    if (type == kPositions) {
+    if (type == kSaveSnapshot) {
+        LayerStageSnapshot snapshot;
+        if (pending_verify_rows_ != 0 || !read_snapshot(r, snapshot, spec_) || snapshot.position != position_)
+            return fail("disk save requires the current committed position with no pending verification");
+        const auto prefix = layer_stage_prefix_identity(committed_tokens_.data(), committed_tokens_.size());
+        if (prefix.hash_a != snapshot.prefix.hash_a || prefix.hash_b != snapshot.prefix.hash_b)
+            return fail("disk save host and worker prefixes differ");
+        for (int64_t at : snapshot.checkpoints)
+            if (std::find(checkpoint_positions_.begin(), checkpoint_positions_.end(), at) == checkpoint_positions_.end())
+                return fail("disk save names a checkpoint no longer retained by the worker");
+        // Disk-full / permission errors do not discard an otherwise usable live session.
+        if (!executor_.save_snapshot(snapshot, committed_tokens_, err))
+            return fail(err.empty() ? "worker disk save failed" : err);
+        ok = true;
+    } else if (type == kPositions) {
         if ((spec_.capabilities & kLayerStageCapabilityVision) == 0 || pending_verify_rows_ != 0 ||
             r.left() != (spec_.max_context + 64) * 3 * sizeof(int32_t))
             return fail("vision positions do not match the negotiated context or a verification window is pending");
@@ -1128,7 +1220,7 @@ bool LayerStageServer::serve(rpc::Socket client, std::string& err) {
             if (!disconnected) close_error = err;
             break;
         }
-        if (type < kReset || type > kPositions || op_bytes > max_operation_payload(spec_)) {
+        if (type < kReset || type > kRestoreSnapshot || op_bytes > max_operation_payload(spec_)) {
             err = "layer-stage worker received an invalid operation frame";
             break;
         }

@@ -18,6 +18,7 @@ enum LayerStageCapability : uint32_t {
     kLayerStageCapabilityMtp = 4u,
     kLayerStageCapabilitySampling = 8u,
     kLayerStageCapabilityVision = 16u,
+    kLayerStageCapabilitySessions = 32u,
 };
 
 constexpr uint16_t kLayerStageProtocolVersion = 5;
@@ -65,6 +66,15 @@ struct LayerStagePrefixIdentity {
     uint64_t hash_a = 0, hash_b = 0;
 };
 
+struct LayerStageSnapshot {
+    std::array<uint64_t, 2> id{};
+    int64_t position = 0;
+    LayerStagePrefixIdentity prefix;
+    std::vector<int64_t> checkpoints;
+};
+/// Only the generated hex basename crosses the storage boundary; clients cannot supply worker paths.
+std::string layer_stage_snapshot_name(const std::array<uint64_t, 2>& id);
+
 /// Stable identity for the exact committed token prefix, independent of vector capacity or allocator address.
 LayerStagePrefixIdentity layer_stage_prefix_identity(const int32_t* tokens, size_t count);
 
@@ -80,6 +90,13 @@ public:
     /// Full absolute (t,h,w) table, including generation positions. Image embeddings stay on the coordinator.
     virtual bool set_positions(const std::vector<int32_t>& positions, std::string& err) {
         (void)positions; err = "this worker has no vision position table"; return false;
+    }
+    virtual bool save_snapshot(const LayerStageSnapshot&, const std::vector<int32_t>&, std::string& err) {
+        err = "worker disk sessions are disabled"; return false;
+    }
+    virtual bool restore_snapshot(const LayerStageSnapshot&, uint64_t, uint64_t,
+                                  std::vector<int32_t>&, std::string& err) {
+        err = "worker disk sessions are disabled"; return false;
     }
     /// Save only running state; the existing KV prefix remains resident. Retention is chosen by the coordinator.
     virtual bool checkpoint(int64_t position, const std::vector<int32_t>& tokens,
@@ -123,6 +140,8 @@ public:
                 std::string& err);
     bool set_sampling(uint64_t session, uint64_t generation, const LayerStageSampling& sampling, std::string& err);
     bool set_positions(uint64_t session, uint64_t generation, const std::vector<int32_t>& positions, std::string& err);
+    bool save_snapshot(uint64_t session, uint64_t generation, const LayerStageSnapshot& snapshot, std::string& err);
+    bool restore_snapshot(uint64_t session, uint64_t generation, const LayerStageSnapshot& snapshot, std::string& err);
     bool checkpoint(uint64_t session, uint64_t generation, int64_t position, LayerStagePrefixIdentity prefix,
                     const std::vector<int64_t>& retained, std::string& err);
     bool prefill(uint64_t session, uint64_t generation, int64_t position, uint32_t rows, const int64_t* tokens,

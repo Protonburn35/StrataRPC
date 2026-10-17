@@ -237,6 +237,33 @@ void full_session(int fmt, int mode, int experts) {
         check(conversation_snapshot_validate(stage,ss,g,nullptr,err),"validate a stage image without a draft");
         check(!conversation_snapshot_validate(stage,ss,g,draft.state,err),"a stage image is refused where a draft is expected");
         check(!conversation_snapshot_validate(a,ss,g,nullptr,err),"an image with a draft is refused where none is expected");
+        {
+            SavedConversation meta, disk;
+            std::vector<SessionKvSource> sources;
+            SessionReadLimits limits;
+            check(conversation_snapshot_sources(meta,sources,view,ss,g,nullptr,err),"stream a stage without local MTP");
+            check(sources.size()==stage.kv.size(),"streamed stage excludes the absent draft");
+            check(conversation_session_read_limits(limits,ss,g,nullptr,96,8,err) &&
+                  limits.max_kv_layers==sources.size(),"stage disk limits exclude the absent draft");
+            meta.stage_snapshot={123,456}; stage.stage_snapshot=meta.stage_snapshot;
+            limits.allow_layer_stage=true;
+            const auto folder=std::filesystem::temp_directory_path()/std::to_string(
+                std::chrono::steady_clock::now().time_since_epoch().count());
+            std::filesystem::create_directories(folder);
+            const auto streamed=(folder/"streamed.bin").string(), captured=(folder/"captured.bin").string();
+            size_t bytes=0;
+            const SessionFileIdentity identity{1,2};
+            check(session_file_write(streamed,meta,sources,identity,bytes,err) &&
+                  session_file_write(captured,stage,identity,bytes,err),"both stage disk write forms succeed");
+            auto contents=[](const std::string& p) {
+                std::ifstream f(p,std::ios::binary);
+                return std::vector<char>((std::istreambuf_iterator<char>(f)),std::istreambuf_iterator<char>());
+            };
+            check(contents(streamed)==contents(captured),"streamed stage file equals captured stage bytes");
+            check(session_file_read(streamed,identity,disk,bytes,err,limits) &&
+                  conversation_snapshot_validate(disk,ss,g,nullptr,err),"stage disk round trip validates without draft");
+            std::filesystem::remove_all(folder);
+        }
         fill(201);
         check(conversation_snapshot_save(stage_b,view,ss,g,nullptr,err),"capture another stage state");
         check(conversation_snapshot_restore(a,ss,g,nullptr,err)==ConversationRestore::invalid,

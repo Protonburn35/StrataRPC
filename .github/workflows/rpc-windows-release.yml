@@ -55,17 +55,17 @@ jobs:
           if errorlevel 1 exit /b %errorlevel%
           nvcc --version
           if errorlevel 1 exit /b %errorlevel%
-          cmake -S . -B build-rpc -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=ON -DSTRATA_PORTABLE=ON -DCMAKE_CUDA_STANDARD=17 -DCMAKE_CUDA_STANDARD_REQUIRED=ON -DCMAKE_CUDA_EXTENSIONS=OFF -DCMAKE_CUDA_FLAGS=--std=c++17 "-DCMAKE_CUDA_COMPILER=%CUDA_PATH%\bin\nvcc.exe" "-DCUDAToolkit_ROOT=%CUDAToolkit_ROOT%" "-DCMAKE_CUDA_ARCHITECTURES=89;120" > configure.log 2>&1
+          cmake -S . -B build-rpc -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=ON -DSTRATA_BUILD_CONVERSATION_TESTS=ON -DSTRATA_PORTABLE=ON -DCMAKE_CUDA_STANDARD=17 -DCMAKE_CUDA_STANDARD_REQUIRED=ON -DCMAKE_CUDA_EXTENSIONS=OFF -DCMAKE_CUDA_FLAGS=--std=c++17 "-DCMAKE_CUDA_COMPILER=%CUDA_PATH%\bin\nvcc.exe" "-DCUDAToolkit_ROOT=%CUDAToolkit_ROOT%" "-DCMAKE_CUDA_ARCHITECTURES=89;120" > configure.log 2>&1
           if errorlevel 1 (
             powershell -NoProfile -Command "$m = @(Select-String -Path configure.log -Pattern 'error|fatal|failed'); $x = @($m | Select-Object -First 10) + @($m | Select-Object -Last 10); if (-not $x) { $x = Get-Content configure.log -Tail 20 }; foreach ($i in $x) { Write-Output ('::error::' + $i.Line) }"
             exit /b 1
           )
-          cmake --build build-rpc --parallel 2 --target strata rpc_transport_test layer_stage_rpc_test expert_cache_layout_test router_lookahead_rpc_ownership_test > build.log 2>&1
+          cmake --build build-rpc --parallel 2 --target strata rpc_transport_test layer_stage_rpc_test conversation_file_test conversation_snapshot_test expert_cache_layout_test router_lookahead_rpc_ownership_test > build.log 2>&1
           if errorlevel 1 (
             powershell -NoProfile -Command "$m = @(Select-String -Path build.log -Pattern 'nvcc.*device\.cu|--std=c\+\+|error|fatal|failed|stopped'); $x = @($m | Select-Object -First 10) + @($m | Select-Object -Last 10); if (-not $x) { $x = Get-Content build.log -Tail 20 }; foreach ($i in $x) { Write-Output ('::error::' + $i.Line) }"
             exit /b 1
           )
-          ctest --test-dir build-rpc -R "^(rpc_transport_test|layer_stage_rpc_test|expert_cache_layout_test|router_lookahead_rpc_ownership_test)$" --output-on-failure > ctest.log 2>&1
+          ctest --test-dir build-rpc -R "^(rpc_transport_test|layer_stage_rpc_test|conversation_file_test|conversation_snapshot_test|expert_cache_layout_test|router_lookahead_rpc_ownership_test)$" --output-on-failure > ctest.log 2>&1
           if errorlevel 1 (
             powershell -NoProfile -Command "$x = Get-Content ctest.log -Tail 20; foreach ($i in $x) { Write-Output ('::error::' + $i) }"
             exit /b 1

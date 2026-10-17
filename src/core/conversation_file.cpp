@@ -698,13 +698,14 @@ void put_payload(Out& o, const SavedConversation& s, const std::vector<SessionKv
             put_kv_header(o, k.format, k.cells, k.heads, k.head_dim, k.page_size, k.pooled_rows, k.idx_dim);
             for (size_t part = 0; part < 5; ++part) o.source(k, part);
         }
-        return;
+    } else {
+        o.u64(s.kv.size());
+        for (const auto& k : s.kv) {
+            put_kv_header(o, k.format, k.cells, k.heads, k.head_dim, k.page_size, k.pooled_rows, k.idx_dim);
+            o.buffer(k.k); o.buffer(k.v); o.buffer(k.k_scale); o.buffer(k.v_scale); o.buffer(k.pooled);
+        }
     }
-    o.u64(s.kv.size());
-    for (const auto& k : s.kv) {
-        put_kv_header(o, k.format, k.cells, k.heads, k.head_dim, k.page_size, k.pooled_rows, k.idx_dim);
-        o.buffer(k.k); o.buffer(k.v); o.buffer(k.k_scale); o.buffer(k.v_scale); o.buffer(k.pooled);
-    }
+    if (s.stage_snapshot[0]) o.vec(s.stage_mtp_tails);
 }
 
 // ---- parsing: every count is checked against the bytes left and the caller's limits before anything is allocated
@@ -792,7 +793,7 @@ bool get_payload(In& in, SavedConversation& s) {
         if (!in.buffer(k.k, 0) || !in.buffer(k.v, 1) || !in.buffer(k.k_scale, 2) || !in.buffer(k.v_scale, 3) ||
             !in.buffer(k.pooled, 4)) return false;
     }
-    return true;
+    return !s.stage_snapshot[0] || in.vec(s.stage_mtp_tails, in.limits.max_stage_mtp_floats);
 }
 
 bool has_stage_parts(const SavedConversation& s) {
@@ -803,15 +804,17 @@ bool has_stage_parts(const SavedConversation& s) {
 
 // header v1, little-endian: magic[8] version:u32 header_size:u32 model:u64 config:u64 payload:u64 reserved:u64[2]
 // header_hash:u64 (session_hash64 of bytes 0..55, seed 0)
-void header_bytes(uint8_t* h, const SessionFileIdentity& id, uint64_t payload) {
+void header_bytes(uint8_t* h, const SessionFileIdentity& id, uint64_t payload,
+                  const std::array<uint64_t, 2>& snapshot) {
     std::memset(h, 0, kHeader);
     std::memcpy(h, kMagic, 8);
-    const uint32_t version = kVersion, size = kHeader;
+    const uint32_t version = snapshot[0] ? 2 : kVersion, size = kHeader;
     std::memcpy(h + 8, &version, 4);
     std::memcpy(h + 12, &size, 4);
     std::memcpy(h + 16, &id.model, 8);
     std::memcpy(h + 24, &id.config, 8);
     std::memcpy(h + 32, &payload, 8);
+    std::memcpy(h + 40, snapshot.data(), 16);
     const uint64_t hh = session_hash64(h, 56, 0);
     std::memcpy(h + 56, &hh, 8);
 }
@@ -1014,6 +1017,7 @@ uint64_t session_read_max_file_bytes(const SessionReadLimits& l) {
         n = sat_add(n, 7 * 8);
         for (uint64_t b : l.max_kv_bytes[(size_t) i]) n = sat_add(n, sat_add(8, b));
     }
+    if (l.allow_layer_stage) n = sat_add(n, sat_add(8, sat_mul(l.max_stage_mtp_floats, sizeof(float))));
     return std::min(n, l.max_file_bytes);
 }
 
@@ -1029,6 +1033,10 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
                 SessionStatus& st) {
     st = {};
     st.error = SessionError::invalid;   // refusals before any disk access
+    if ((image.stage_snapshot[0] == 0) != (image.stage_snapshot[1] == 0) ||
+        (!image.stage_snapshot[0] && !image.stage_mtp_tails.empty())) {
+        error = "session file: invalid layer-stage snapshot metadata"; return false;
+    }
     if (has_stage_parts(image)) { error = "session file: layer-split state cannot be saved"; return false; }
     if (sources && !image.kv.empty()) { error = "session file: K/V given both in the image and as sources"; return false; }
     Out sizing;
@@ -1069,7 +1077,7 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
     f.write_fault = injected(fault, "write");
     f.flush_fault = injected(fault, "file_flush");
     uint8_t h[kHeader];
-    header_bytes(h, id, payload);
+    header_bytes(h, id, payload, image.stage_snapshot);
     bool ok = f.write(h, kHeader);
     SessionHasher hash(0);
     Out out;
@@ -1204,8 +1212,13 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
     std::memcpy(&r0, h + 40, 8); std::memcpy(&r1, h + 48, 8); std::memcpy(&hh, h + 56, 8);
     if (std::memcmp(h, kMagic, 8) != 0) { error = "session file: not a Strata session file (magic)"; return false; }
     if (hh != session_hash64(h, 56, 0)) { error = "session file: header checksum mismatch"; return false; }
-    if (version != kVersion) { error = "session file: unsupported version " + std::to_string(version); return false; }
-    if (hsize != kHeader || r0 || r1) { error = "session file: invalid header fields"; return false; }
+    if (version != kVersion && version != 2) { error = "session file: unsupported version " + std::to_string(version); return false; }
+    if (version == 2 && !limits.allow_layer_stage) {
+        error = "session file: layer-stage snapshot requires both RPC stages"; return false;
+    }
+    if (hsize != kHeader || (version == kVersion ? (r0 || r1) : (!r0 || !r1))) {
+        error = "session file: invalid header fields"; return false;
+    }
     if (model != id.model) { error = "session file: saved with another model (model fingerprint differs)"; return false; }
     if (config != id.config) { error = "session file: saved with another engine configuration (config fingerprint differs)"; return false; }
     if (payload > size || size - kHeader - kTrailer != payload) {
@@ -1222,6 +1235,7 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
         }
     }
     SavedConversation parsed;
+    if (version == 2) parsed.stage_snapshot = {r0, r1};
     In in{&f, SessionHasher(0), payload, error, limits};
     if (!get_payload(in, parsed)) { st.error = in.kind; return false; }
     if (in.left) { error = "session file: payload has " + std::to_string(in.left) + " unparsed bytes"; return false; }

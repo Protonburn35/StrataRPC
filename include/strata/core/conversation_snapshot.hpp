@@ -87,6 +87,12 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
 bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
                                    const ConversationView& view, const SessionState& session,
                                    const ModelGeometry& g, const QsaState& draft, std::string& error);
+bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
+                                   const ConversationView& view, const SessionState& session,
+                                   const ModelGeometry& g, const QsaState* draft, std::string& error);
+bool conversation_session_read_limits(SessionReadLimits& limits, const SessionState& session,
+                                      const ModelGeometry& g, const QsaState* draft, uint64_t max_tokens,
+                                      uint64_t max_checkpoints, std::string& error);
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& session,
                                     const ModelGeometry& g, const QsaState& draft, std::string& error);
 enum class ConversationRestore { restored, invalid, transfer_failed };

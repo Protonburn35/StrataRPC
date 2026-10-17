@@ -2,6 +2,8 @@
 // checkpoints the caller passes (the engine passes only the deepest one), every QSA layer's authoritative K/V and
 // the draft layer's K/V.  Pure host code: no CUDA.  Format v1 and the fail-closed read order are in
 // docs/DETAILS.md (Session files).
+// Opt-in layer-stage files use version 2: the header's reserved words hold the paired snapshot ID and the payload
+// appends bounded worker MTP residuals. Version 1 bytes and the default reader remain unchanged.
 //
 // Format v1 is little-endian, with fixed-width integers and IEEE-754 floats; a big-endian build is refused at
 // compile time.  The hashes detect accidental corruption; they do not authenticate a file: restore trusted files only.
@@ -206,6 +208,8 @@ bool session_save_checkpoints(const std::vector<ConversationCheckpoint>& chain, 
 // these limits BEFORE its array is allocated; the defaults accept whatever the payload can hold.  The engine sets all
 // of them from its runtime (conversation_session_read_limits), and then the file size is bounded too.
 struct SessionReadLimits {
+    bool allow_layer_stage = false; // v2 is never restored as a complete single-PC session
+    uint64_t max_stage_mtp_floats = 0;
     uint64_t max_file_bytes = UINT64_MAX;
     uint64_t max_tokens = UINT64_MAX;       // token and image counts of the live state and of each checkpoint
     uint64_t max_checkpoints = UINT64_MAX;

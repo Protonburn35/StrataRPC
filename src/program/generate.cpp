@@ -121,6 +121,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <random>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -469,6 +470,8 @@ struct Options {
     std::string layer_stage_wire = "fp32"; ///< negotiated activation boundary representation (fp32 default)
     bool layer_stage_reuse = false; ///< keep one active remote sequence for exact append-only conversation continuation
     bool layer_stage_mtp = false; ///< run native MTP on the terminal layer-stage worker
+    bool layer_stage_sessions = false; ///< paired snapshots on each PC's local disk
+    std::string layer_stage_session_dir; ///< worker-owned snapshot directory (never supplied over RPC)
     std::string expert_cache_rpc_layers; ///< complete remote expert blocks; host cache is packed around these layers
     std::string rpc_server;       ///< serve a remote expert cache, bind-address:port
     bool remote_expert_opt = false; ///< optional optimization of the existing remote-expert decode path
@@ -868,6 +871,8 @@ void usage() {
                  "  --layer-stage-wire fp32|bf16|fp16  negotiated activation wire dtype (default fp32; lossy formats opt in)\n"
                  "  --layer-stage-reuse        --serve: retain coordinated prompt/decode checkpoints for chat continuation\n"
                  "  --layer-stage-mtp          --serve: place --mtp drafting on the suffix worker\n"
+                 "  --layer-stage-sessions     --serve: opt in to paired disk save/restore on both PCs\n"
+                 "  --layer-stage-session-dir P  worker only: local directory for paired snapshots\n"
                  "  --expert-profile-save P  --serve, #477: save what the adaptive tier learned (the experts in\n"
                  "                       VRAM, then the routing counted since the start) as a profile at P, on\n"
                  "                       QUIT and every --expert-profile-save-every MIN minutes (default 10;\n"
@@ -1273,6 +1278,141 @@ public:
         return true;
     }
 
+    bool configure_sessions(const std::string& root, strata::core::SessionFileIdentity identity,
+                            uint64_t ram_floor, uint64_t disk_floor, uint64_t max_context, std::string& err) {
+        std::error_code ec;
+        auto dir = std::filesystem::absolute(std::filesystem::u8path(root), ec);
+        if (ec) { err = "cannot resolve worker snapshot directory: " + ec.message(); return false; }
+        std::filesystem::create_directories(dir, ec);
+        if (ec || !std::filesystem::is_directory(dir, ec)) {
+            err = "cannot create worker snapshot directory: " + ec.message(); return false;
+        }
+        session_dir_ = std::move(dir); session_identity_ = identity;
+        session_ram_floor_ = ram_floor; session_disk_floor_ = disk_floor; session_max_context_ = max_context;
+        return true;
+    }
+
+    bool save_snapshot(const strata::core::LayerStageSnapshot& snapshot, const std::vector<int32_t>& tokens,
+                       std::string& err) override {
+        using namespace strata::core;
+        if (session_dir_.empty() || !valid_ || pending_ != 0 || snapshot.position != position_ ||
+            tokens.size() != (size_t)position_) { err = "worker snapshot has no committed session"; return false; }
+        try {
+            const std::string path = snapshot_path(snapshot.id);
+            std::error_code ec;
+            if (std::filesystem::exists(std::filesystem::u8path(path), ec) || ec) {
+                err = "worker snapshot ID already exists or cannot be inspected"; return false;
+            }
+            if (!verifier_.wait_commit(err) || (mtp_ != nullptr && !mtp_->idle(err)) ||
+                cudaDeviceSynchronize() != cudaSuccess) { if (err.empty()) err = "worker snapshot synchronize failed"; return false; }
+            ConversationStateSizes z;
+            if (!conversation_session_sizes(geometry_, session_, z, err)) return false;
+            const uint64_t state_bytes = z.gdn + z.ple + (uint64_t)session_.qsa_alloc * (z.tail + z.dead + z.block_pos);
+            uint64_t need = state_bytes + tokens.size() * sizeof(int32_t) + (18u << 20);
+            for (int64_t at : snapshot.checkpoints) {
+                auto it = checkpoints_.find(at);
+                if (it == checkpoints_.end()) { err = "worker snapshot checkpoint is missing"; return false; }
+                need += 2 * (it->second.state.bytes() + it->second.mtp_tail.size() * sizeof(float));
+            }
+            if (!conversation_memory_admit(available_host_bytes(), need, session_ram_floor_)) {
+                err = "not enough RAM to save worker snapshot above its memory floor"; return false;
+            }
+            std::vector<ConversationCheckpoint> checks;
+            for (int64_t at : snapshot.checkpoints) checks.push_back(checkpoints_.at(at).state);
+            const std::vector<ConversationImageKey> images;
+            const ConversationView view{tokens, images, checks, true};
+            SavedConversation meta;
+            std::vector<SessionKvSource> sources;
+            if (!conversation_snapshot_sources(meta, sources, view, session_, geometry_,
+                                               mtp_ ? &mtp_->kv_state() : nullptr, err)) return false;
+            meta.stage_snapshot = snapshot.id;
+            if (mtp_ != nullptr) {
+                const OnDevice on_mtp(mtp_->device());
+                const size_t width = (size_t)geometry_.hc * (size_t)geometry_.n_embd;
+                meta.stage_mtp_tails.resize(width);
+                if (cudaMemcpy(meta.stage_mtp_tails.data(), mtp_->prefill_tail(), width * sizeof(float),
+                               cudaMemcpyDeviceToHost) != cudaSuccess) { err = "worker MTP snapshot failed"; return false; }
+                for (int64_t at : snapshot.checkpoints) {
+                    const auto& tail = checkpoints_.at(at).mtp_tail;
+                    if (tail.size() != width) { err = "worker MTP checkpoint tail is incomplete"; return false; }
+                    meta.stage_mtp_tails.insert(meta.stage_mtp_tails.end(), tail.begin(), tail.end());
+                }
+            }
+            SessionWriteOptions options; options.min_free_bytes = session_disk_floor_;
+            size_t bytes = 0;
+            if (!session_file_write(path, meta, sources, session_identity_, bytes, err, options)) return false;
+            std::fprintf(stderr, "strata layer-stage: saved worker snapshot %s (%zu tokens, %zu bytes)\n",
+                         layer_stage_snapshot_name(snapshot.id).c_str(), tokens.size(), bytes);
+            return true;
+        } catch (const std::exception& e) { err = std::string("worker snapshot save: ") + e.what(); return false; }
+    }
+
+    bool restore_snapshot(const strata::core::LayerStageSnapshot& snapshot, uint64_t session, uint64_t generation,
+                          std::vector<int32_t>& tokens, std::string& err) override {
+        using namespace strata::core;
+        if (session_dir_.empty() || pending_ != 0) { err = "worker disk sessions disabled or verification pending"; return false; }
+        // All failures require a fresh reset/restore; no partial state may be used.
+        valid_ = false;
+        try {
+            SessionReadLimits limits;
+            if (!conversation_session_read_limits(limits, session_, geometry_, mtp_ ? &mtp_->kv_state() : nullptr,
+                    session_max_context_, kLayerStageMaxCheckpoints, err)) return false;
+            const size_t width = mtp_ ? (size_t)geometry_.hc * (size_t)geometry_.n_embd : 0;
+            limits.allow_layer_stage = true;
+            limits.max_stage_mtp_floats = width * (kLayerStageMaxCheckpoints + 1);
+            limits.admit = [&](uint64_t need, std::string& why) {
+                if (conversation_memory_admit(available_host_bytes(), need, session_ram_floor_)) return true;
+                why = "not enough RAM to restore worker snapshot above its memory floor"; return false;
+            };
+            SavedConversation image;
+            size_t bytes = 0;
+            if (!session_file_read(snapshot_path(snapshot.id), session_identity_, image, bytes, err, limits)) return false;
+            const auto prefix = layer_stage_prefix_identity(image.live.ids.data(), image.live.ids.size());
+            if (image.stage_snapshot != snapshot.id || image.live.ids.size() != (size_t)snapshot.position ||
+                prefix.hash_a != snapshot.prefix.hash_a || prefix.hash_b != snapshot.prefix.hash_b ||
+                image.checkpoints.size() != snapshot.checkpoints.size() ||
+                image.stage_mtp_tails.size() != width * (snapshot.checkpoints.size() + 1) ||
+                std::any_of(image.stage_mtp_tails.begin(), image.stage_mtp_tails.end(),
+                            [](float f) { return !std::isfinite(f); })) {
+                err = "worker snapshot does not match the host snapshot or MTP configuration"; return false;
+            }
+            std::map<int64_t, SavedCheckpoint> restored;
+            for (size_t i = 0; i < image.checkpoints.size(); ++i) {
+                if (image.checkpoints[i].ids.size() != (size_t)snapshot.checkpoints[i]) {
+                    err = "worker snapshot checkpoint differs from host snapshot"; return false;
+                }
+                SavedCheckpoint c;
+                c.pending_mtp_cell = width ? snapshot.checkpoints[i] - 1 : -1;
+                c.mtp_tail.assign(image.stage_mtp_tails.begin() + (i + 1) * width,
+                                  image.stage_mtp_tails.begin() + (i + 2) * width);
+                restored.emplace(snapshot.checkpoints[i], std::move(c));
+            }
+            if (!conversation_snapshot_validate(image, session_, geometry_, mtp_ ? &mtp_->kv_state() : nullptr, err) ||
+                !verifier_.wait_commit(err) || (mtp_ != nullptr && !mtp_->idle(err))) return false;
+            if (conversation_snapshot_restore(image, session_, geometry_, mtp_ ? &mtp_->kv_state() : nullptr, err) !=
+                ConversationRestore::restored) return false;
+            if (mtp_ != nullptr) {
+                const OnDevice on_mtp(mtp_->device());
+                if (cudaMemcpy(mtp_->prefill_tail_rw(), image.stage_mtp_tails.data(), width * sizeof(float),
+                               cudaMemcpyHostToDevice) != cudaSuccess) { err = "worker MTP snapshot restore failed"; return false; }
+                mtp_->set_prompt_len(0); mtp_->kv_restore(snapshot.position);
+            }
+            for (size_t i = 0; i < image.checkpoints.size(); ++i)
+                restored.at(snapshot.checkpoints[i]).state = std::move(image.checkpoints[i]);
+            checkpoints_ = std::move(restored);
+            tokens = std::move(image.live.ids);
+            session_id_ = session; generation_ = generation; position_ = snapshot.position;
+            pending_mtp_cell_ = mtp_ ? position_ - 1 : -1;
+            pending_ = 0; last_verify_rows_ = 0;
+            last_verify_tokens_.clear(); last_verify_picks_.clear();
+            current_prefill_tokens_ = nullptr; current_prefill_rows_ = 0;
+            valid_ = true;
+            std::fprintf(stderr, "strata layer-stage: restored worker snapshot %s (%zu tokens, %zu bytes)\n",
+                         layer_stage_snapshot_name(snapshot.id).c_str(), tokens.size(), bytes);
+            return true;
+        } catch (const std::exception& e) { err = std::string("worker snapshot restore: ") + e.what(); return false; }
+    }
+
     bool checkpoint(int64_t position, const std::vector<int32_t>& tokens,
                     const std::vector<int64_t>& retained, std::string& err) override {
         if (!valid_ || pending_ != 0 || position != position_ || (int64_t)tokens.size() != position) {
@@ -1500,6 +1640,13 @@ private:
     strata::core::MtpDrafter* mtp_ = nullptr;
     int32_t* mrope_ = nullptr;
     size_t mrope_count_ = 0;
+    std::filesystem::path session_dir_;
+    strata::core::SessionFileIdentity session_identity_;
+    uint64_t session_ram_floor_ = 0, session_disk_floor_ = 0, session_max_context_ = 0;
+    std::string snapshot_path(const std::array<uint64_t, 2>& id) const {
+        const auto path = (session_dir_ / strata::core::layer_stage_snapshot_name(id)).u8string();
+        return std::string(path.begin(), path.end());
+    }
     bool valid_ = false;
 };
 
@@ -2273,6 +2420,8 @@ int main(int argc, char** argv) {
         else if (a == "--layer-stage-wire") o.layer_stage_wire = next("--layer-stage-wire");
         else if (a == "--layer-stage-reuse") o.layer_stage_reuse = true;
         else if (a == "--layer-stage-mtp") o.layer_stage_mtp = true;
+        else if (a == "--layer-stage-sessions") o.layer_stage_sessions = true;
+        else if (a == "--layer-stage-session-dir") o.layer_stage_session_dir = next("--layer-stage-session-dir");
         else if (a == "--expert-cache-rpc-layers") o.expert_cache_rpc_layers = next("--expert-cache-rpc-layers");
         else if (a == "--pack") o.pack = next("--pack");
         else if (a == "--tokens") {
@@ -2789,6 +2938,13 @@ int main(int argc, char** argv) {
     const bool layer_stage_server = !o.layer_stage_server.empty();
     const bool layer_stage_mode = layer_stage_client || layer_stage_server;
     const bool remote_mtp = layer_stage_client && o.layer_stage_mtp;
+    if ((o.layer_stage_sessions && (!layer_stage_mode || !o.layer_stage_reuse)) ||
+        (o.layer_stage_sessions && layer_stage_server && o.layer_stage_session_dir.empty()) ||
+        (!o.layer_stage_session_dir.empty() && (!layer_stage_server || !o.layer_stage_sessions))) {
+        std::fprintf(stderr, "strata generate: --layer-stage-sessions needs a layer-stage endpoint and --layer-stage-reuse; "
+                             "the worker also needs --layer-stage-session-dir PATH\n");
+        return 2;
+    }
     if (o.layer_stage_wire != "fp32" && o.layer_stage_wire != "bf16" && o.layer_stage_wire != "fp16") {
         std::fprintf(stderr, "strata generate: --layer-stage-wire must be fp32, bf16, or fp16 (got '%s')\n",
                      o.layer_stage_wire.c_str());
@@ -8662,6 +8818,13 @@ int main(int argc, char** argv) {
                     c.switches.emplace_back("mtp_q4_head", o.mtp_q4 == "all" || o.mtp_q4 == "head");
                     c.switches.emplace_back("mtp_max_t", o.mtp_max_t);
                 }
+                if (o.layer_stage_sessions) {
+                    c.switches.emplace_back("layer_stage_session_schema", 1);
+                    c.switches.emplace_back("layer_stage_split", split_at[0]);
+                    c.switches.emplace_back("layer_stage_mtp", o.layer_stage_mtp);
+                    c.switches.emplace_back("layer_stage_wire", o.layer_stage_wire == "fp32" ? 0 :
+                                                               o.layer_stage_wire == "bf16" ? 1 : 2);
+                }
                 config_fp = strata::core::session_config_fingerprint(c);
             }
             id.model = *model_fp;
@@ -8689,6 +8852,7 @@ int main(int argc, char** argv) {
             layer_stage_spec.capabilities = strata::core::kLayerStageCapabilityBase | strata::core::kLayerStageCapabilitySampling |
                 (o.layer_stage_reuse ? strata::core::kLayerStageCapabilityReuse : 0u) |
                 (o.vision ? strata::core::kLayerStageCapabilityVision : 0u) |
+                (o.layer_stage_sessions ? strata::core::kLayerStageCapabilitySessions : 0u) |
                 (o.layer_stage_mtp ? strata::core::kLayerStageCapabilityMtp : 0u);
             layer_stage_spec.wire_format = o.layer_stage_wire == "bf16" ? strata::core::LayerStageWireFormat::bf16
                                            : o.layer_stage_wire == "fp16" ? strata::core::LayerStageWireFormat::fp16
@@ -8711,6 +8875,13 @@ int main(int argc, char** argv) {
             } else {
                 if (!stage_executor) {
                     std::fprintf(stderr, "strata serve: layer-stage worker executor was not initialized\n");
+                    return 1;
+                }
+                if (o.layer_stage_sessions &&
+                    !stage_executor->configure_sessions(o.layer_stage_session_dir, identity,
+                        (uint64_t)o.conversation_cache_min_free_mib << 20,
+                        (uint64_t)o.session_min_free_mib << 20, (uint64_t)o.max_context, err)) {
+                    std::fprintf(stderr, "strata serve: worker disk sessions: %s\n", err.c_str());
                     return 1;
                 }
                 strata::core::rpc::Socket listener = strata::core::rpc::kInvalidSocket;
@@ -10826,7 +10997,9 @@ int main(int argc, char** argv) {
                 };
                 strata::core::progress_at(save ? "saving a session" : "restoring a session");
                 if (path.empty()) { refuse("missing path"); continue; }
-                if (layer_stage_mode) { refuse("session files do not support layer-stage RPC"); continue; }
+                if (layer_stage_mode && (!layer_stage_client || !o.layer_stage_sessions)) {
+                    refuse("RPC session files need --layer-stage-sessions on both PCs"); continue;
+                }
                 if (!stages.empty() || multi_gpu) { refuse("session files do not support --layer-split"); continue; }
                 if (o.peer_device >= 1) { refuse("session files do not support --peer-device"); continue; }
                 if (o.batch > 0) { refuse("session files do not support --batch (parallel requests)"); continue; }
@@ -10910,12 +11083,30 @@ int main(int argc, char** argv) {
                         std::vector<strata::core::SessionKvSource> sources;
                         // the live running state comes off the device in one synchronous copy
                         blocking("capture", sl.state_bytes == UINT64_MAX ? 0 : sl.state_bytes);
-                        if (!strata::core::conversation_snapshot_sources(meta, sources, view, ss, g, mtp.kv_state(),
+                        if (!strata::core::conversation_snapshot_sources(meta, sources, view, ss, g,
+                                                                         layer_stage_client ? nullptr : &mtp.kv_state(),
                                                                          err)) {
                             refuse(err, strata::core::SessionError::io);
                             continue;
                         }
                         capture_ms = ms();
+                        if (layer_stage_client) {
+                            strata::core::LayerStageSnapshot snapshot;
+                            std::random_device random;
+                            for (auto& word : snapshot.id) {
+                                do { word = ((uint64_t)random() << 32) ^ (uint64_t)random(); } while (word == 0);
+                            }
+                            snapshot.position = (int64_t)live.size();
+                            snapshot.prefix = strata::core::layer_stage_prefix_identity(live.data(), live.size());
+                            for (const auto& c : disk_checks) snapshot.checkpoints.push_back((int64_t)c.ids.size());
+                            // Allow the remote disk operation's five-minute RPC deadline before the host's
+                            // normal progress watchdog judges it stuck. No remote KV is sent over the wire.
+                            blocking("remotesave", 1ull << 30);
+                            if (!stage_client.save_snapshot(stage_session, stage_generation, snapshot, err)) {
+                                refuse("worker snapshot save: " + err, strata::core::SessionError::io); continue;
+                            }
+                            meta.stage_snapshot = snapshot.id;
+                        }
                         strata::core::SessionWriteOptions wo;
                         wo.min_free_bytes = (uint64_t) o.session_min_free_mib << 20;
                         wo.progress = moving;
@@ -10930,6 +11121,9 @@ int main(int argc, char** argv) {
                                                  "folder, so the new name is not flushed\n", path.c_str());
                     } catch (const std::bad_alloc&) {
                         refuse("not enough RAM to save the session", strata::core::SessionError::memory);
+                        continue;
+                    } catch (const std::exception& e) {
+                        refuse(std::string("session save: ") + e.what(), strata::core::SessionError::io);
                         continue;
                     }
                     std::fprintf(stderr, "strata serve: session saved %zu tokens, %zu of %zu checkpoints, %zu bytes to %s "
@@ -10956,11 +11150,12 @@ int main(int argc, char** argv) {
                             return false;
                         };
                         if (!strata::core::conversation_session_read_limits(
-                                limits, ss, g, mtp.kv_state(), (uint64_t) o.max_context,
+                                limits, ss, g, layer_stage_client ? nullptr : &mtp.kv_state(), (uint64_t) o.max_context,
                                 (uint64_t) std::max(o.prompt_cache, 1), err)) {
                             refuse(err, strata::core::SessionError::io);
                             continue;
                         }
+                        limits.allow_layer_stage = layer_stage_client;
                         strata::core::SessionStatus st;
                         if (!strata::core::session_file_read(path, id, image, bytes, err, limits, &st)) {
                             refuse(err, st.error);
@@ -10971,9 +11166,13 @@ int main(int argc, char** argv) {
                         continue;
                     }
                     const double read_ms = ms();
+                    if (layer_stage_client && image.stage_snapshot[0] == 0) {
+                        refuse("this is a single-PC session; it has no paired worker snapshot"); continue;
+                    }
                     // the whole image against this engine, still without any device write
                     blocking("validate", bytes);
-                    if (!strata::core::conversation_snapshot_validate(image, ss, g, mtp.kv_state(), err)) {
+                    if (!strata::core::conversation_snapshot_validate(image, ss, g,
+                                                                     layer_stage_client ? nullptr : &mtp.kv_state(), err)) {
                         refuse(err);
                         continue;
                     }
@@ -10984,9 +11183,25 @@ int main(int argc, char** argv) {
                     }
                     conversations.take_reuse();   // retained K/V described the outgoing session
                     live_ok = false;
+                    if (layer_stage_client) {
+                        strata::core::LayerStageSnapshot snapshot;
+                        snapshot.id = image.stage_snapshot;
+                        snapshot.position = (int64_t)image.live.ids.size();
+                        snapshot.prefix = strata::core::layer_stage_prefix_identity(image.live.ids.data(), image.live.ids.size());
+                        for (const auto& c : image.checkpoints) snapshot.checkpoints.push_back((int64_t)c.ids.size());
+                        // Once either side begins restoring, old checkpoints must never resume the outgoing state.
+                        checks.clear(); tail_ckpt_len = -1; stage_prompt_anchor = -1;
+                        if (stage_generation == UINT64_MAX) { refuse("RPC generation counter exhausted"); continue; }
+                        ++stage_generation;
+                        blocking("remoterestore", 1ull << 30);
+                        if (!stage_client.restore_snapshot(stage_session, stage_generation, snapshot, err)) {
+                            refuse("worker snapshot restore: " + err, strata::core::SessionError::io); continue;
+                        }
+                    }
                     // host -> device in synchronous copies of the whole state: one bounded allowance
                     blocking("transfer", bytes);
-                    if (strata::core::conversation_snapshot_restore(image, ss, g, mtp.kv_state(), err) !=
+                    if (strata::core::conversation_snapshot_restore(image, ss, g,
+                                                                  layer_stage_client ? nullptr : &mtp.kv_state(), err) !=
                         strata::core::ConversationRestore::restored) {
                         // validated above: a failure here is a transfer failure, after device writes began - never
                         // decode from a partial state; the server starts the engine again

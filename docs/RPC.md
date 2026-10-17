@@ -1,9 +1,15 @@
 # StrataRPC (experimental)
 
+Exp29 adds **optional disk save/restore** to layer-stage RPC and includes Exp28's vision support. Add
+`--layer-stage-sessions` on both PCs, a local `--layer-stage-session-dir` on the worker, and `slot_save_path` in the
+host API config. Each PC stores its own state locally; paired snapshot IDs coordinate restore without transferring
+KV over Ethernet. See the [disk-session setup and commands](LAYER_STAGE_RPC.md#exp29-optional-disk-saverestore-with-vision-included).
+Both features stay off until enabled. No two-GPU inference or performance claim follows from the build checks.
+
 Exp28 adds **optional vision** to persistent layer-stage RPC. Upgrade both PCs (protocol 5), enable `--vision` on
 both, and configure the image encoder on the host. The Windows ZIP includes `strata-vision.exe`. FP16 KV, sampled
 answers, worker MTP and image-aware prefix reuse can be used together. See the
-[vision setup instructions](LAYER_STAGE_RPC.md#exp28-optional-vision). Disk save/restore is not part of this release.
+[vision setup instructions](LAYER_STAGE_RPC.md#exp28-optional-vision). Disk save/restore is added separately in Exp29.
 
 Exp27 fixes the host engine exiting with `RPC operation cancelled` when a new message interrupts an active reply.
 Normal Stop/disconnect requests now finish the current RPC chunk or decode window and keep the model loaded.

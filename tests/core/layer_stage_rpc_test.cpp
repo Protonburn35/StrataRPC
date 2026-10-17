@@ -22,6 +22,23 @@ public:
         position_updates.push_back(positions); return true;
     }
     std::vector<std::vector<int32_t>> position_updates;
+    bool save_snapshot(const LayerStageSnapshot& s, const std::vector<int32_t>& tokens, std::string& err) override {
+        if (fail_save.load()) { err = "simulated disk full"; return false; }
+        saved = s; saved_tokens = tokens; ++saves; return true;
+    }
+    bool restore_snapshot(const LayerStageSnapshot& s, uint64_t session, uint64_t generation,
+                          std::vector<int32_t>& tokens, std::string& err) override {
+        if (s.id != saved.id || s.position != saved.position || s.prefix.hash_a != saved.prefix.hash_a ||
+            s.prefix.hash_b != saved.prefix.hash_b || s.checkpoints != saved.checkpoints) {
+            err = "fake snapshot does not exist or match"; return false;
+        }
+        session_ = session; generation_ = generation; position_ = s.position; pending_ = 0;
+        tokens = saved_tokens; checkpoints = s.checkpoints; ++restores; return true;
+    }
+    LayerStageSnapshot saved;
+    std::vector<int32_t> saved_tokens;
+    std::atomic<bool> fail_save{false};
+    int saves = 0, restores = 0;
     bool reset(uint64_t session, uint64_t generation, int64_t position, std::string&) override {
         checkpoints.clear();
         session_ = session; generation_ = generation; position_ = position; pending_ = 0; ++resets; return true;
@@ -377,6 +394,70 @@ bool test_vision_positions(LayerStageSpec spec, std::string& err) {
     if (!ok || !server_ok || executor.position_updates != std::vector<std::vector<int32_t>>{image, image, identity}) {
         err = "vision positions / checkpoint continuation / image-to-text reset failed: " + err + server_err;
         return false;
+    }
+    return true;
+}
+
+bool test_disk_sessions(LayerStageSpec spec, std::string& err) {
+    spec.capabilities |= kLayerStageCapabilitySessions | kLayerStageCapabilityReuse | kLayerStageCapabilityVision;
+    rpc::Socket listener = rpc::kInvalidSocket;
+    uint32_t port = 0;
+    if (!open_listener(listener, port, err)) return false;
+    FakeStage executor;
+    LayerStageServer service("test-token", spec, executor);
+    std::string server_err;
+    bool server_ok = true;
+    std::thread server([&] {
+        for (int i = 0; i < 2; ++i) {
+            rpc::Socket accepted = rpc::kInvalidSocket;
+            if (!rpc::accept(listener, accepted, server_err) || !service.serve(accepted, server_err)) {
+                server_ok = false; break;
+            }
+        }
+        rpc::close(listener);
+    });
+    LayerStageClient client;
+    const std::string endpoint = "127.0.0.1:" + std::to_string(port);
+    std::vector<int32_t> positions((spec.max_context + 64) * 3);
+    for (size_t i = 0; i < positions.size(); ++i) positions[i] = (int32_t)(i / 3);
+    const int64_t prompt[] = {10, 11};
+    const int32_t tokens[] = {10, 11}, drafts[] = {20, 21};
+    int32_t picks[2]{};
+    std::vector<float> residual(2 * spec.n_embd * spec.hc, 0.25f);
+    std::vector<float> handoff(2 * (spec.hc * spec.n_embd + spec.n_embd + spec.hc), -0.5f);
+    LayerStageSnapshot snap{{123, 456}, 2, layer_stage_prefix_identity(tokens, 2), {2}};
+    bool ok = layer_stage_snapshot_name(snap.id) == "000000000000007b00000000000001c8.srpc" &&
+              client.connect(endpoint, "test-token", spec, err) && client.reset(42, 1, 0, err) &&
+              client.set_positions(42, 1, positions, err) && client.prefill(42, 1, 0, 2, prompt, residual.data(), err) &&
+              client.checkpoint(42, 1, 2, snap.prefix, {2}, err);
+    auto wrong = snap; wrong.prefix.hash_a ^= 1;
+    if (ok) ok = !client.save_snapshot(42, 1, wrong, err);
+    wrong = snap; wrong.checkpoints = {1};
+    if (ok) ok = !client.save_snapshot(42, 1, wrong, err);
+    executor.fail_save.store(true);
+    if (ok) ok = !client.save_snapshot(42, 1, snap, err) && err.find("disk full") != std::string::npos;
+    executor.fail_save.store(false);
+    if (ok) ok = client.save_snapshot(42, 1, snap, err) &&
+                 client.verify(42, 1, 2, 2, drafts, handoff.data(), picks, err);
+    if (ok) ok = !client.save_snapshot(42, 1, snap, err) && client.commit(42, 1, 1, err);
+    if (ok) ok = client.restore_snapshot(42, 2, snap, err) &&
+                 !client.prefill(42, 2, 2, 2, prompt, residual.data(), err) && // must rebuild mRoPE
+                 client.set_positions(42, 2, positions, err) &&
+                 client.prefill(42, 2, 2, 2, prompt, residual.data(), err) &&
+                 client.resume(42, 3, 2, snap.prefix, err); // restored checkpoint can rewind after continuing
+    wrong = snap; wrong.id[0]++;
+    if (ok) ok = !client.restore_snapshot(42, 4, wrong, err) && client.connected() &&
+                 !client.set_positions(42, 3, positions, err) && // failed restore invalidates inference
+                 client.reset(42, 5, 0, err);
+    client.close();
+    // Simulate a host restart: a new TCP connection can restore a snapshot even with no live prefix.
+    const bool connected = client.connect(endpoint, "test-token", spec, err);
+    if (ok) ok = connected && client.restore_snapshot(99, 1, snap, err) &&
+                 client.set_positions(99, 1, positions, err) &&
+                 client.verify(99, 1, 2, 2, drafts, handoff.data(), picks, err) && client.commit(99, 1, 1, err);
+    client.close(); server.join();
+    if (!ok || !server_ok || executor.saves != 1 || executor.restores != 2) {
+        err = "paired disk snapshot save/restore/continuation failed: " + err + server_err; return false;
     }
     return true;
 }
@@ -948,7 +1029,7 @@ int main() {
     if (!test_activation_codecs(err) || !test_reduced_precision_rpc(spec, LayerStageWireFormat::bf16, err) ||
         !test_reduced_precision_rpc(spec, LayerStageWireFormat::fp16, err) ||
         !test_mtp_commit_response(spec, err) || !test_checkpoint_and_sampling(spec, err) ||
-        !test_vision_positions(spec, err) ||
+        !test_vision_positions(spec, err) || !test_disk_sessions(spec, err) ||
         !test_replay_identity(spec, err) || !test_resume_identity(spec, err) ||
         !test_disconnect_clears_replay(spec, err) ||
         !test_partial_header_timeout_and_reaccept(spec, err) ||
