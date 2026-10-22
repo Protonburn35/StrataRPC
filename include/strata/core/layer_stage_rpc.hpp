@@ -19,6 +19,9 @@ enum LayerStageCapability : uint32_t {
     kLayerStageCapabilitySampling = 8u,
     kLayerStageCapabilityVision = 16u,
     kLayerStageCapabilitySessions = 32u,
+    /// Pipelined decode (needs MTP): the coordinator runs its layers of the next window while the worker verifies
+    /// this one, and the worker's commit returns a draft chain teacher-forced through that next window's drafts.
+    kLayerStageCapabilityPipeline = 64u,
 };
 
 constexpr uint16_t kLayerStageProtocolVersion = 5;
@@ -107,6 +110,14 @@ public:
                         const int32_t* tokens, const float* handoff, int32_t* picks, std::string& err) = 0;
     virtual bool commit(uint64_t session, uint64_t generation, uint64_t operation, uint32_t keep,
                         bool draft_next, float min_p, LayerStageMtpReply* reply, std::string& err) = 0;
+    /// Pipelined decode: commit `keep` rows, then run the MTP chain from the last kept row for `n_out` outputs,
+    /// feeding step j (1 <= j <= n_force) force[j - 1] instead of its own previous output. reply->count <= n_out.
+    virtual bool commit_chain(uint64_t session, uint64_t generation, uint64_t operation, uint32_t keep,
+                              const int32_t* force, uint32_t n_force, uint32_t n_out, LayerStageMtpReply* reply,
+                              std::string& err) {
+        (void)session; (void)generation; (void)operation; (void)keep; (void)force; (void)n_force; (void)n_out;
+        (void)reply; err = "this worker does not support pipelined decode"; return false;
+    }
     virtual bool abort(uint64_t session, uint64_t generation, uint64_t operation, std::string& err) = 0;
     virtual bool health(std::string& err) = 0;
 };
@@ -155,6 +166,16 @@ public:
                 LayerStageMtpReply* reply, std::string& err);
     bool abort(uint64_t session, uint64_t generation, std::string& err);
     bool health(std::string& err);
+    /// Pipelined decode (kLayerStageCapabilityPipeline): send a request now and read its reply later, so a commit and
+    /// the next verify can be on the wire together. Replies are read in the order the requests were sent; any
+    /// failure or rejection while requests are outstanding closes the connection (the next reset reconnects).
+    bool send_verify(uint64_t session, uint64_t generation, int64_t position, uint32_t rows, const int32_t* tokens,
+                     const float* handoff, std::string& err);
+    bool receive_verify(uint32_t rows, int32_t* picks, std::string& err);
+    bool send_commit_chain(uint64_t session, uint64_t generation, uint32_t keep, const int32_t* force,
+                           uint32_t n_force, uint32_t n_out, std::string& err);
+    bool receive_commit_chain(LayerStageMtpReply& reply, std::string& err);
+    size_t outstanding() const { return in_flight_.size(); }
     uint64_t bytes_sent() const { return bytes_sent_; }
     uint64_t bytes_received() const { return bytes_received_; }
     LayerStageWireFormat wire_format() const { return spec_.wire_format; }
@@ -163,6 +184,20 @@ private:
     bool request(uint16_t type, const uint8_t* metadata, size_t metadata_bytes, const void* body_a,
                  size_t body_a_bytes, const void* body_b, size_t body_b_bytes, void* response,
                  size_t response_bytes, std::string& err);
+    bool send_request(uint16_t type, const uint8_t* metadata, size_t metadata_bytes, const void* body_a,
+                      size_t body_a_bytes, const void* body_b, size_t body_b_bytes, std::string& err);
+    bool receive_response(uint16_t type, void* response, size_t response_bytes, std::string& err);
+    void invalidate();
+    bool encode_verify(uint64_t session, uint64_t generation, int64_t position, uint32_t rows, const int32_t* tokens,
+                       const float* handoff, std::vector<uint8_t>& metadata, const void*& activation_body,
+                       size_t& token_bytes, size_t& activation_bytes, std::string& err);
+    struct InFlight {
+        uint16_t type = 0;
+        uint64_t operation = 0;
+        uint64_t sent_bytes = 0;
+        std::chrono::steady_clock::time_point started;
+    };
+    std::vector<InFlight> in_flight_;
     rpc::Socket socket_ = rpc::kInvalidSocket;
     LayerStageSpec spec_{};
     std::string endpoint_, token_;

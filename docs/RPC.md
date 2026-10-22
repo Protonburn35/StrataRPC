@@ -1,5 +1,11 @@
 # StrataRPC (experimental)
 
+Exp30 adds **optional pipelined decode** to layer-stage RPC: with `--layer-stage-pipeline` on both PCs (it needs
+`--layer-stage-mtp`), the host runs its layers of the next decode window while the worker verifies the current one, on
+a guess it undoes when the guess is wrong. The tokens are the serial loop's. Off by default; the protocol stays 5, so
+Exp29 peers still connect without it. It has not been run on GPUs or timed yet. See
+[pipelined decode](LAYER_STAGE_RPC.md#exp30-optional-pipelined-decode) for setup, costs and how to check it.
+
 Exp29 adds **optional disk save/restore** to layer-stage RPC and includes Exp28's vision support. Add
 `--layer-stage-sessions` on both PCs, a local `--layer-stage-session-dir` on the worker, and `slot_save_path` in the
 host API config. Each PC stores its own state locally; paired snapshot IDs coordinate restore without transferring

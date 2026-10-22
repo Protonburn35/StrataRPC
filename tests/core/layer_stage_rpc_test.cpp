@@ -106,7 +106,24 @@ public:
         }
         position_ += keep; pending_ = 0; ++commits; return true;
     }
+    bool commit_chain(uint64_t session, uint64_t generation, uint64_t, uint32_t keep, const int32_t* force,
+                      uint32_t n_force, uint32_t n_out, LayerStageMtpReply* reply, std::string& err) override {
+        if (session != session_ || generation != generation_ || keep == 0 || keep > pending_ || reply == nullptr ||
+            n_force > n_out) {
+            err = "fake stage received an invalid chain commit"; return false;
+        }
+        // forced steps echo their inputs; free-running steps continue from the verified token
+        reply->count = n_out;
+        for (uint32_t i = 0; i < n_out; ++i) {
+            reply->tokens[i] = i < n_force ? force[i] : last_verify_token_ + 100 + (int32_t)i;
+            reply->probabilities[i] = 0.5f;
+        }
+        last_force.assign(force, force + n_force);
+        position_ += keep; pending_ = 0; ++chain_commits; return true;
+    }
     bool abort(uint64_t, uint64_t, uint64_t, std::string&) override { ++aborts; pending_ = 0; return true; }
+    std::vector<int32_t> last_force;
+    int chain_commits = 0;
     bool health(std::string&) override { ++health_checks; return true; }
 
     int resets = 0, resumes = 0, prefills = 0, verifies = 0, commits = 0, aborts = 0, health_checks = 0;
@@ -943,6 +960,106 @@ bool test_mtp_commit_response(const LayerStageSpec& base, std::string& err) {
     }
     return true;
 }
+
+// Pipelined decode: a chain commit and the next verify go out back to back and their replies are read in order.
+bool test_pipelined_commit_and_verify(const LayerStageSpec& base, std::string& err) {
+    LayerStageSpec spec = base;
+    spec.capabilities |= kLayerStageCapabilityMtp | kLayerStageCapabilityPipeline;
+    LayerStageSpec no_mtp = base;
+    no_mtp.capabilities |= kLayerStageCapabilityPipeline;
+    {
+        LayerStageClient refused;
+        std::string why;
+        if (refused.connect("127.0.0.1:1", "test-token", no_mtp, why) || why.empty()) {
+            err = "a pipelined stage without MTP was accepted"; return false;
+        }
+    }
+    rpc::Socket listener = rpc::kInvalidSocket;
+    uint32_t port = 0;
+    if (!open_listener(listener, port, err)) return false;
+    FakeStage executor;
+    LayerStageServer service("test-token", spec, executor);
+    bool server_ok = false;
+    std::string server_err;
+    std::thread server([&] {
+        rpc::Socket accepted = rpc::kInvalidSocket;
+        if (rpc::accept(listener, accepted, server_err)) server_ok = service.serve(accepted, server_err);
+        else server_err = "accept failed: " + server_err;
+        rpc::close(listener);
+    });
+    LayerStageClient client;
+    bool ok = client.connect("127.0.0.1:" + std::to_string(port), "test-token", spec, err);
+    const int64_t prompt = 10;
+    const float residual[16] = {0.25f};
+    const size_t row = (size_t)(spec.hc * spec.n_embd + spec.n_embd + spec.hc);
+    std::vector<float> handoff(4 * row, 0.0f);
+    handoff[0] = -0.5f;
+    const int32_t first[1] = {20};
+    int32_t picks[4]{};
+    if (ok) ok = client.reset(42, 1, 0, err) && client.prefill(42, 1, 0, 1, &prompt, residual, err) &&
+                 client.verify(42, 1, 1, 1, first, handoff.data(), picks, err);
+    // window A (1 row at 1) kept whole; the next window (4 rows at 2) goes out behind its commit
+    LayerStageMtpReply chain;
+    const int32_t second[4] = {21, 120, 121, 122};
+    int32_t second_picks[4]{};
+    if (ok) ok = client.send_commit_chain(42, 1, 1, nullptr, 0, 7, err) &&
+                 client.send_verify(42, 1, 2, 4, second, handoff.data(), err) && client.outstanding() == 2 &&
+                 client.receive_commit_chain(chain, err) && client.outstanding() == 1 &&
+                 client.receive_verify(4, second_picks, err) && client.outstanding() == 0;
+    const bool free_chain = ok && chain.count == 7 && chain.tokens[0] == 120 && chain.tokens[6] == 126 &&
+                            second_picks[0] == 22 && second_picks[3] == 123;
+    // the 4-row window kept whole, its chain forced through the 2-row window that follows it
+    LayerStageMtpReply forced;
+    const int32_t third[2] = {123, 140};
+    int32_t third_picks[2]{};
+    const int32_t force[1] = {140};
+    if (ok) ok = client.send_commit_chain(42, 1, 4, force, 1, 7, err) &&
+                 client.send_verify(42, 1, 6, 2, third, handoff.data(), err) &&
+                 client.receive_commit_chain(forced, err) && client.receive_verify(2, third_picks, err);
+    const bool forced_chain = ok && forced.count == 7 && forced.tokens[0] == 140 && forced.tokens[1] == 21 + 101 &&
+                              executor.last_force.size() == 1 && executor.last_force[0] == 140 && third_picks[1] == 141;
+    // a plain synchronous request is refused while a pipelined reply is outstanding, and works after it
+    LayerStageMtpReply last;
+    if (ok) ok = client.send_commit_chain(42, 1, 2, nullptr, 0, 3, err) && !client.health(err) &&
+                 client.receive_commit_chain(last, err) && client.health(err) && last.count == 3;
+    if (ok) ok = client.abort(42, 1, err);
+    client.close();
+    server.join();
+    if (!ok || !server_ok || !server_err.empty() || !free_chain || !forced_chain || executor.chain_commits != 3 ||
+        executor.verifies != 3) {
+        if (err.empty()) err = server_err.empty() ? "pipelined chain commit and verify failed" : server_err;
+        return false;
+    }
+
+    // A rejected request with another one behind it drops the connection: the worker refuses the second as out
+    // of order, so the client must not read on.
+    rpc::Socket listener2 = rpc::kInvalidSocket;
+    if (!open_listener(listener2, port, err)) return false;
+    FakeStage executor2;
+    LayerStageServer service2("test-token", spec, executor2);
+    std::thread server2([&] {
+        rpc::Socket accepted = rpc::kInvalidSocket;
+        std::string ignored;
+        if (rpc::accept(listener2, accepted, ignored)) (void)service2.serve(accepted, ignored);
+        rpc::close(listener2);
+    });
+    LayerStageClient client2;
+    std::string why;
+    ok = client2.connect("127.0.0.1:" + std::to_string(port), "test-token", spec, why) &&
+         client2.reset(42, 1, 0, why) && client2.prefill(42, 1, 0, 1, &prompt, residual, why) &&
+         client2.verify(42, 1, 1, 1, first, handoff.data(), picks, why);
+    // keep 2 of a 1-row window: rejected
+    const bool rejected = ok && client2.send_commit_chain(42, 1, 2, nullptr, 0, 7, why) &&
+                          client2.send_verify(42, 1, 3, 1, first, handoff.data(), why) &&
+                          !client2.receive_commit_chain(chain, why) && !client2.connected() && client2.outstanding() == 0;
+    client2.close();
+    server2.join();
+    if (!rejected) {
+        err = "a rejected pipelined request did not drop the connection: " + why;
+        return false;
+    }
+    return true;
+}
 } // namespace
 
 int main() {
@@ -1028,7 +1145,8 @@ int main() {
     }
     if (!test_activation_codecs(err) || !test_reduced_precision_rpc(spec, LayerStageWireFormat::bf16, err) ||
         !test_reduced_precision_rpc(spec, LayerStageWireFormat::fp16, err) ||
-        !test_mtp_commit_response(spec, err) || !test_checkpoint_and_sampling(spec, err) ||
+        !test_mtp_commit_response(spec, err) || !test_pipelined_commit_and_verify(spec, err) ||
+        !test_checkpoint_and_sampling(spec, err) ||
         !test_vision_positions(spec, err) || !test_disk_sessions(spec, err) ||
         !test_replay_identity(spec, err) || !test_resume_identity(spec, err) ||
         !test_disconnect_clears_replay(spec, err) ||
@@ -1039,6 +1157,6 @@ int main() {
         std::fprintf(stderr, "layer-stage RPC safety regression failed: %s\n", err.c_str());
         return 1;
     }
-    std::puts("layer-stage handshake, reset guards, replay identity, checkpoint rewind/branch, sampling updates, output bounds, reconnect, boundary STOP/resume, immediate cancellation, partial-header timeout, malformed replies, prefill, verify, commit and abort passed");
+    std::puts("layer-stage handshake, reset guards, replay identity, checkpoint rewind/branch, sampling updates, output bounds, reconnect, boundary STOP/resume, immediate cancellation, partial-header timeout, malformed replies, prefill, verify, commit, pipelined chain commit and abort passed");
     return 0;
 }

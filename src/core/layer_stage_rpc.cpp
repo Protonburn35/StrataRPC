@@ -22,7 +22,7 @@ constexpr auto kOperationTimeout = std::chrono::minutes(5);
 
 enum Message : uint16_t {
     kHello = 1, kReset = 2, kPrefill = 3, kVerify = 4, kCommit = 5, kAbort = 6, kHealth = 7, kResume = 8,
-    kSampling = 9, kCheckpoint = 10, kPositions = 11, kSaveSnapshot = 12, kRestoreSnapshot = 13
+    kSampling = 9, kCheckpoint = 10, kPositions = 11, kSaveSnapshot = 12, kRestoreSnapshot = 13, kCommitChain = 14
 };
 constexpr size_t kMtpReplyBytes = sizeof(uint32_t) + kLayerStageMaxMtpDrafts * sizeof(int32_t) +
                                   kLayerStageMaxMtpDrafts * sizeof(float);
@@ -160,8 +160,10 @@ bool activation_frame_fits(const LayerStageSpec& s, uint32_t rows, bool prefill)
 bool valid_spec(const LayerStageSpec& s) {
     constexpr uint32_t known_capabilities = kLayerStageCapabilityBase | kLayerStageCapabilityReuse |
                                             kLayerStageCapabilityMtp | kLayerStageCapabilitySampling |
-                                            kLayerStageCapabilityVision | kLayerStageCapabilitySessions;
+                                            kLayerStageCapabilityVision | kLayerStageCapabilitySessions |
+                                            kLayerStageCapabilityPipeline;
     return s.model_fingerprint != 0 && s.config_fingerprint != 0 && s.max_context > 0 &&
+           ((s.capabilities & kLayerStageCapabilityPipeline) == 0 || (s.capabilities & kLayerStageCapabilityMtp) != 0) &&
            s.max_context <= (uint64_t)std::numeric_limits<int64_t>::max() && s.n_layers > 0 &&
            s.n_embd > 0 && s.n_expert > 0 && s.hc > 0 && s.layer_begin < s.layer_end &&
            s.layer_end <= s.n_layers && s.max_verify_rows > 0 && s.max_verify_rows <= 8 && s.max_prefill_rows > 0 &&
@@ -250,6 +252,7 @@ const char* message_name(uint16_t type) {
         case kPrefill: return "prefill";
         case kVerify: return "verify";
         case kCommit: return "commit";
+        case kCommitChain: return "commit-chain";
         case kAbort: return "abort";
         case kHealth: return "health";
         default: return "unknown";
@@ -640,15 +643,32 @@ void LayerStageClient::close() {
     socket_ = rpc::kInvalidSocket;
     broken_ = false;
     next_operation_ = 1;
+    in_flight_.clear();
+}
+
+void LayerStageClient::invalidate() {
+    broken_ = true;
+    in_flight_.clear();
+    if (socket_ != rpc::kInvalidSocket) rpc::close(socket_);
+    socket_ = rpc::kInvalidSocket;
 }
 
 bool LayerStageClient::request(uint16_t type, const uint8_t* metadata, size_t metadata_bytes, const void* body_a,
                                size_t body_a_bytes, const void* body_b, size_t body_b_bytes, void* response,
                                size_t response_bytes, std::string& err) {
+    if (!in_flight_.empty()) { err = "layer-stage request issued while pipelined replies are outstanding"; return false; }
+    return send_request(type, metadata, metadata_bytes, body_a, body_a_bytes, body_b, body_b_bytes, err) &&
+           receive_response(type, response, response_bytes, err);
+}
+
+bool LayerStageClient::send_request(uint16_t type, const uint8_t* metadata, size_t metadata_bytes, const void* body_a,
+                                    size_t body_a_bytes, const void* body_b, size_t body_b_bytes, std::string& err) {
     if (!connected()) { err = "layer-stage RPC is disconnected or was invalidated"; return false; }
     const bool health_req = type == kHealth;
+    if (health_req && !in_flight_.empty()) { err = "layer-stage health check issued behind pipelined requests"; return false; }
     const auto request_started = std::chrono::steady_clock::now();
-    const uint64_t operation = health_req ? 0 : next_operation_;
+    // Requests sent ahead of their predecessors' replies take the operation IDs those replies will advance to.
+    const uint64_t operation = health_req ? 0 : next_operation_ + (uint64_t)in_flight_.size();
     const auto deadline = rpc::deadline_after(health_req ? std::chrono::seconds(5) : kOperationTimeout, cancelled_);
     if (metadata_bytes > kMaxFrameBytes || body_a_bytes > kMaxFrameBytes - metadata_bytes ||
         body_b_bytes > kMaxFrameBytes - metadata_bytes - body_a_bytes) {
@@ -662,44 +682,60 @@ bool LayerStageClient::request(uint16_t type, const uint8_t* metadata, size_t me
         (metadata_bytes != 0 && !rpc::send_all(socket_, metadata, metadata_bytes, deadline, err)) ||
         (body_a_bytes != 0 && !rpc::send_all(socket_, body_a, body_a_bytes, deadline, err)) ||
         (body_b_bytes != 0 && !rpc::send_all(socket_, body_b, body_b_bytes, deadline, err))) {
-        broken_ = true;
-        rpc::close(socket_); socket_ = rpc::kInvalidSocket;
+        invalidate();
         return false;
     }
     bytes_sent_ += kHeaderBytes + payload_bytes;
+    in_flight_.push_back({type, operation, kHeaderBytes + payload_bytes, request_started});
+    return true;
+}
+
+bool LayerStageClient::receive_response(uint16_t type, void* response, size_t response_bytes, std::string& err) {
+    if (!connected()) { err = "layer-stage RPC is disconnected or was invalidated"; return false; }
+    if (in_flight_.empty() || in_flight_.front().type != type) {
+        err = "layer-stage reply read out of request order";
+        invalidate();
+        return false;
+    }
+    const InFlight sent = in_flight_.front();
+    const bool health_req = type == kHealth;
+    const auto deadline = rpc::deadline_after(health_req ? std::chrono::seconds(5) : kOperationTimeout, cancelled_);
     uint16_t response_type = 0;
     uint64_t response_op = 0, response_payload_bytes = 0;
     if (!receive_header(socket_, response_type, response_op, response_payload_bytes, deadline, err) ||
-        response_type != (0x8000u | type) || response_op != operation || response_payload_bytes > kMaxFrameBytes ||
+        response_type != (0x8000u | type) || response_op != sent.operation || response_payload_bytes > kMaxFrameBytes ||
         response_payload_bytes > 8ull + kMaxErrorBytes + response_bytes) {
         if (err.empty()) err = "layer-stage worker returned a mismatched response frame";
-        broken_ = true;
-        rpc::close(socket_); socket_ = rpc::kInvalidSocket;
+        invalidate();
         return false;
     }
     std::vector<uint8_t> frame((size_t)response_payload_bytes);
     if (!frame.empty() && !rpc::recv_all(socket_, frame.data(), frame.size(), deadline, err)) {
-        broken_ = true;
-        rpc::close(socket_); socket_ = rpc::kInvalidSocket;
+        invalidate();
         return false;
     }
     bytes_received_ += kHeaderBytes + response_payload_bytes;
     Reader reader{frame.data(), frame.size(), 0};
     const ParsedResponse parsed = parse_response(reader, response, response_bytes, err);
     if (parsed == ParsedResponse::malformed) {
-        broken_ = true;
-        rpc::close(socket_); socket_ = rpc::kInvalidSocket;
+        invalidate();
         return false;
     }
-    if (parsed == ParsedResponse::rejected) return false;   // a valid rejection is recoverable on this connection
+    in_flight_.erase(in_flight_.begin());
+    if (parsed == ParsedResponse::rejected) {
+        // A valid rejection is recoverable on this connection, unless later requests were sent behind it: the worker
+        // refuses those as out of order, so the connection is dropped and the next reset reconnects.
+        if (!in_flight_.empty()) invalidate();
+        return false;
+    }
     if (!health_req) ++next_operation_;
     if (layer_stage_stats_enabled()) {
         const double elapsed_ms = std::chrono::duration<double, std::milli>(
-                                      std::chrono::steady_clock::now() - request_started).count();
+                                      std::chrono::steady_clock::now() - sent.started).count();
         std::fprintf(stderr,
                      "strata layer-stage RPC stats: %s op=%llu tx=%llu B rx=%llu B elapsed=%.2f ms cumulative_tx=%llu B cumulative_rx=%llu B wire=%s\n",
-                     message_name(type), (unsigned long long)operation,
-                     (unsigned long long)(kHeaderBytes + payload_bytes),
+                     message_name(type), (unsigned long long)sent.operation,
+                     (unsigned long long)sent.sent_bytes,
                      (unsigned long long)(kHeaderBytes + response_payload_bytes), elapsed_ms,
                      (unsigned long long)bytes_sent_, (unsigned long long)bytes_received_,
                      spec_.wire_format == LayerStageWireFormat::fp32 ? "fp32" :
@@ -819,9 +855,11 @@ bool LayerStageClient::prefill(uint64_t session, uint64_t generation, int64_t po
                    nullptr, 0, err);
 }
 
-bool LayerStageClient::verify(uint64_t session, uint64_t generation, int64_t position, uint32_t rows,
-                              const int32_t* tokens, const float* handoff, int32_t* picks, std::string& err) {
-    if (rows == 0 || rows > spec_.max_verify_rows || tokens == nullptr || handoff == nullptr || picks == nullptr) {
+bool LayerStageClient::encode_verify(uint64_t session, uint64_t generation, int64_t position, uint32_t rows,
+                                     const int32_t* tokens, const float* handoff, std::vector<uint8_t>& metadata,
+                                     const void*& activation_body, size_t& token_bytes, size_t& activation_bytes,
+                                     std::string& err) {
+    if (rows == 0 || rows > spec_.max_verify_rows || tokens == nullptr || handoff == nullptr) {
         err = "layer-stage verify has invalid rows or null input";
         return false;
     }
@@ -830,14 +868,12 @@ bool LayerStageClient::verify(uint64_t session, uint64_t generation, int64_t pos
         err = "layer-stage verify shape overflows the protocol range";
         return false;
     }
-    size_t token_bytes = 0, activation_bytes = 0, pick_bytes = 0;
     if (!checked_bytes(rows, sizeof(int32_t), token_bytes) ||
-        !checked_bytes(floats, layer_stage_wire_element_bytes(spec_.wire_format), activation_bytes) ||
-        !checked_bytes(rows, sizeof(int32_t), pick_bytes)) {
+        !checked_bytes(floats, layer_stage_wire_element_bytes(spec_.wire_format), activation_bytes)) {
         err = "layer-stage verify size overflows this host";
         return false;
     }
-    const void* activation_body = handoff;
+    activation_body = handoff;
     if (spec_.wire_format == LayerStageWireFormat::fp32) {
         for (uint64_t i = 0; i < floats; ++i) if (!std::isfinite(handoff[i])) {
             err = "layer-stage FP32 verifier activation contains a non-finite value";
@@ -848,8 +884,69 @@ bool LayerStageClient::verify(uint64_t session, uint64_t generation, int64_t pos
         activation_body = activation_wire_.data();
     }
     Writer m; m.u64(session); m.u64(generation); m.i64(position); m.u32(rows); m.u64(floats); m.u64(activation_bytes);
-    return request(kVerify, m.bytes.data(), m.bytes.size(), tokens, token_bytes, activation_body, activation_bytes,
-                   picks, pick_bytes, err);
+    metadata = std::move(m.bytes);
+    return true;
+}
+
+bool LayerStageClient::verify(uint64_t session, uint64_t generation, int64_t position, uint32_t rows,
+                              const int32_t* tokens, const float* handoff, int32_t* picks, std::string& err) {
+    if (picks == nullptr) { err = "layer-stage verify has invalid rows or null input"; return false; }
+    std::vector<uint8_t> metadata;
+    const void* activation_body = nullptr;
+    size_t token_bytes = 0, activation_bytes = 0;
+    if (!encode_verify(session, generation, position, rows, tokens, handoff, metadata, activation_body, token_bytes,
+                       activation_bytes, err)) return false;
+    return request(kVerify, metadata.data(), metadata.size(), tokens, token_bytes, activation_body, activation_bytes,
+                   picks, token_bytes, err);
+}
+
+bool LayerStageClient::send_verify(uint64_t session, uint64_t generation, int64_t position, uint32_t rows,
+                                   const int32_t* tokens, const float* handoff, std::string& err) {
+    if ((spec_.capabilities & kLayerStageCapabilityPipeline) == 0) {
+        err = "pipelined layer-stage requests need --layer-stage-pipeline on both PCs"; return false;
+    }
+    std::vector<uint8_t> metadata;
+    const void* activation_body = nullptr;
+    size_t token_bytes = 0, activation_bytes = 0;
+    if (!encode_verify(session, generation, position, rows, tokens, handoff, metadata, activation_body, token_bytes,
+                       activation_bytes, err)) return false;
+    return send_request(kVerify, metadata.data(), metadata.size(), tokens, token_bytes, activation_body,
+                        activation_bytes, err);
+}
+
+bool LayerStageClient::receive_verify(uint32_t rows, int32_t* picks, std::string& err) {
+    if (rows == 0 || rows > spec_.max_verify_rows || picks == nullptr) {
+        err = "layer-stage verify reply has invalid rows or null output";
+        invalidate();
+        return false;
+    }
+    return receive_response(kVerify, picks, (size_t)rows * sizeof(int32_t), err);
+}
+
+bool LayerStageClient::send_commit_chain(uint64_t session, uint64_t generation, uint32_t keep, const int32_t* force,
+                                         uint32_t n_force, uint32_t n_out, std::string& err) {
+    if ((spec_.capabilities & kLayerStageCapabilityPipeline) == 0) {
+        err = "pipelined layer-stage requests need --layer-stage-pipeline on both PCs"; return false;
+    }
+    if (keep == 0 || n_out == 0 || n_out > kLayerStageMaxMtpDrafts || n_force > n_out ||
+        (n_force != 0 && force == nullptr)) {
+        err = "layer-stage chain commit has an invalid count or null input"; return false;
+    }
+    std::array<int32_t, kLayerStageMaxMtpDrafts> forced{};
+    for (uint32_t i = 0; i < n_force; ++i) {
+        if (force[i] < 0) { err = "layer-stage chain commit forces an invalid token"; return false; }
+        forced[i] = force[i];
+    }
+    Writer m; m.u64(session); m.u64(generation); m.u32(keep); m.u32(n_force); m.u32(n_out);
+    for (int32_t t : forced) m.u32((uint32_t)t);
+    return send_request(kCommitChain, m.bytes.data(), m.bytes.size(), nullptr, 0, nullptr, 0, err);
+}
+
+bool LayerStageClient::receive_commit_chain(LayerStageMtpReply& reply, std::string& err) {
+    std::array<uint8_t, kMtpReplyBytes> body{};
+    if (!receive_response(kCommitChain, body.data(), body.size(), err)) return false;
+    if (!decode_mtp_reply(body.data(), body.size(), reply, err)) { invalidate(); return false; }
+    return true;
 }
 
 bool LayerStageClient::commit(uint64_t session, uint64_t generation, uint32_t keep, bool draft_next, float min_p,
@@ -1140,6 +1237,31 @@ bool LayerStageServer::dispatch(uint16_t type, uint64_t operation, const uint8_t
                 response = response_payload(true, std::string(), body.data(), body.size());
             }
         }
+    } else if (type == kCommitChain) {
+        uint32_t n_force = 0, n_out = 0;
+        std::array<int32_t, kLayerStageMaxMtpDrafts> force{};
+        if ((spec_.capabilities & kLayerStageCapabilityPipeline) == 0 || !r.u32(keep) || !r.u32(n_force) ||
+            !r.u32(n_out) || keep == 0 || keep > pending_verify_rows_ || keep > spec_.max_verify_rows ||
+            (uint64_t)position_ + keep > spec_.max_context || n_out == 0 || n_out > kLayerStageMaxMtpDrafts ||
+            n_force > n_out)
+            return fail("layer-stage chain commit is invalid or pipelined decode was not negotiated");
+        for (auto& t : force) {
+            uint32_t bits = 0;
+            if (!r.u32(bits)) return fail("layer-stage chain commit is truncated");
+            t = (int32_t)bits;
+        }
+        if (r.left() != 0) return fail("layer-stage chain commit has unexpected data");
+        for (uint32_t i = 0; i < n_force; ++i)
+            if (force[i] < 0) return fail("layer-stage chain commit forces an invalid token");
+        LayerStageMtpReply mtp_reply;
+        ok = executor_.commit_chain(session, generation, operation, keep, force.data(), n_force, n_out, &mtp_reply, err);
+        if (ok && !valid_mtp_reply(mtp_reply, n_out, err)) ok = false;
+        if (ok) {
+            for (uint32_t i = 0; i < keep; ++i) committed_tokens_.push_back(verify_tokens_[i]);
+            position_ += keep; pending_verify_rows_ = 0;
+            const std::vector<uint8_t> body = encode_mtp_reply(mtp_reply);
+            response = response_payload(true, std::string(), body.data(), body.size());
+        }
     } else if (type == kAbort) {
         if (r.left() != 0) return fail("layer-stage abort frame has unexpected data");
         ok = executor_.abort(session, generation, operation, err);
@@ -1220,7 +1342,7 @@ bool LayerStageServer::serve(rpc::Socket client, std::string& err) {
             if (!disconnected) close_error = err;
             break;
         }
-        if (type < kReset || type > kRestoreSnapshot || op_bytes > max_operation_payload(spec_)) {
+        if (type < kReset || type > kCommitChain || op_bytes > max_operation_payload(spec_)) {
             err = "layer-stage worker received an invalid operation frame";
             break;
         }

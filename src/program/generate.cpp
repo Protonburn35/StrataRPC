@@ -470,6 +470,7 @@ struct Options {
     std::string layer_stage_wire = "fp32"; ///< negotiated activation boundary representation (fp32 default)
     bool layer_stage_reuse = false; ///< keep one active remote sequence for exact append-only conversation continuation
     bool layer_stage_mtp = false; ///< run native MTP on the terminal layer-stage worker
+    bool layer_stage_pipeline = false; ///< overlap the coordinator's next decode window with the worker's verify
     bool layer_stage_sessions = false; ///< paired snapshots on each PC's local disk
     std::string layer_stage_session_dir; ///< worker-owned snapshot directory (never supplied over RPC)
     std::string expert_cache_rpc_layers; ///< complete remote expert blocks; host cache is packed around these layers
@@ -871,6 +872,8 @@ void usage() {
                  "  --layer-stage-wire fp32|bf16|fp16  negotiated activation wire dtype (default fp32; lossy formats opt in)\n"
                  "  --layer-stage-reuse        --serve: retain coordinated prompt/decode checkpoints for chat continuation\n"
                  "  --layer-stage-mtp          --serve: place --mtp drafting on the suffix worker\n"
+                 "  --layer-stage-pipeline     --serve, with --layer-stage-mtp on both PCs: run this PC's layers of the\n"
+                 "                       next decode window while the worker verifies the current one (same tokens)\n"
                  "  --layer-stage-sessions     --serve: opt in to paired disk save/restore on both PCs\n"
                  "  --layer-stage-session-dir P  worker only: local directory for paired snapshots\n"
                  "  --expert-profile-save P  --serve, #477: save what the adaptive tier learned (the experts in\n"
@@ -1547,6 +1550,55 @@ public:
             }
             if (!draft_next) pending_mtp_cell_ = position_ - 1;
         }
+        last_verify_rows_ = 0;
+        last_verify_tokens_.clear();
+        last_verify_picks_.clear();
+        return true;
+    }
+
+    /// --layer-stage-pipeline: the commit, then the drafter's chain from the last kept row (the round over the window's
+    /// rows, as draft() runs it) for `n_out` outputs, its first `n_force` steps fed the drafts of the window the
+    /// coordinator already runs behind this one. Synchronous: the reply carries the chain.
+    bool commit_chain(uint64_t session, uint64_t generation, uint64_t, uint32_t keep, const int32_t* force,
+                      uint32_t n_force, uint32_t n_out, strata::core::LayerStageMtpReply* reply,
+                      std::string& err) override {
+        if (!matches(session, generation, position_, err) || pending_ == 0 || keep == 0 || keep > pending_) return false;
+        if (mtp_ == nullptr || reply == nullptr || n_force > n_out || (n_force > 0 && force == nullptr)) {
+            err = "layer-stage chain commit needs the worker's MTP drafter (--layer-stage-mtp --layer-stage-pipeline)";
+            return false;
+        }
+        if (!verifier_.commit((int) keep, err) || !verifier_.wait_commit(err)) { valid_ = false; return false; }
+        if (session_.ple.ready()) {
+            for (uint32_t t = 0; t < keep; ++t) {
+                session_.ple_prev[0] = session_.ple_prev[1];
+                session_.ple_prev[1] = last_verify_tokens_[t];
+            }
+        }
+        position_ += keep;
+        pending_ = 0;
+        const int a = (int) keep - 1;
+        // output j writes the drafter's K/V at cell p + a + j: near the context's end only the cells that exist
+        const int64_t room = mtp_->kv_state().max_cells - (last_verify_position_ + a);
+        const int n = (int) std::min<int64_t>((int64_t) n_out, std::max<int64_t>(room, 0));
+        reply->count = 0;
+        if (n > 0) {
+            const strata::core::OnDevice on_mtp(mtp_->device());
+            const int nf = std::min((int) n_force, n);
+            if (!mtp_->chain_launch((int) last_verify_rows_, last_verify_picks_.data(), last_verify_position_, a, force,
+                                    nf, n, 0, err) ||
+                !mtp_->idle(err)) { valid_ = false; return false; }
+            int done = 0;
+            while ((done = mtp_->chain_poll(err)) == 0) std::this_thread::yield();
+            if (done < 0) { valid_ = false; return false; }
+            reply->count = (uint32_t) n;
+            for (int i = 0; i < n; ++i) {
+                reply->tokens[(size_t) i] = mtp_->chain_tok()[i];
+                reply->probabilities[(size_t) i] = mtp_->chain_prob()[i];
+            }
+        }
+        // as a commit that drafts: the last kept row's residual waits for the next window's first token
+        const size_t row_floats = (size_t) geometry_.hc * (size_t) geometry_.n_embd;
+        if (!mtp_->save_prefill_tail(verifier_.final_R_all() + (size_t) a * row_floats, err)) { valid_ = false; return false; }
         last_verify_rows_ = 0;
         last_verify_tokens_.clear();
         last_verify_picks_.clear();
@@ -2420,6 +2472,7 @@ int main(int argc, char** argv) {
         else if (a == "--layer-stage-wire") o.layer_stage_wire = next("--layer-stage-wire");
         else if (a == "--layer-stage-reuse") o.layer_stage_reuse = true;
         else if (a == "--layer-stage-mtp") o.layer_stage_mtp = true;
+        else if (a == "--layer-stage-pipeline") o.layer_stage_pipeline = true;
         else if (a == "--layer-stage-sessions") o.layer_stage_sessions = true;
         else if (a == "--layer-stage-session-dir") o.layer_stage_session_dir = next("--layer-stage-session-dir");
         else if (a == "--expert-cache-rpc-layers") o.expert_cache_rpc_layers = next("--expert-cache-rpc-layers");
@@ -2956,6 +3009,10 @@ int main(int argc, char** argv) {
     }
     if (o.layer_stage_mtp && (o.mtp.empty() || o.spec < 2)) {
         std::fprintf(stderr, "strata generate: --layer-stage-mtp requires --mtp PATH and --spec >= 2 on both PCs\n");
+        return 2;
+    }
+    if (o.layer_stage_pipeline && (!layer_stage_mode || !o.layer_stage_mtp)) {
+        std::fprintf(stderr, "strata generate: --layer-stage-pipeline requires a layer-stage endpoint and --layer-stage-mtp on both PCs\n");
         return 2;
     }
     if (layer_stage_mode && o.pipeline_windows > 0) {
@@ -5278,8 +5335,10 @@ int main(int argc, char** argv) {
         const strata::core::OnDevice on_mtp(last_st ? last_st->dev : -1);
         // --pipeline-windows 2: 8 rows (the chain runs on past the window in flight: its drafts, its bonus token and
         // the next window's drafts), and the round/step graphs carry the forcing kernel
-        const int mtp_t = o.pipeline_windows >= 2 ? strata::kernels::kVerifyMaxT : o.spec;
-        if (o.pipeline_windows >= 2) mtp.set_force_capture(true);
+        // --layer-stage-pipeline on the worker: its chain commits run on past the next window the same way
+        const bool stage_chain = layer_stage_server && o.layer_stage_pipeline;
+        const int mtp_t = o.pipeline_windows >= 2 || stage_chain ? strata::kernels::kVerifyMaxT : o.spec;
+        if (o.pipeline_windows >= 2 || stage_chain) mtp.set_force_capture(true);
         if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, last_st ? last_st->ss : ss, mtp_t, err, o.mtp_window)) { std::fprintf(stderr, "strata generate: %s%s\n", err.c_str(), vram_free_note().c_str()); return 1; }
         if (layer_stage_server && o.layer_stage_mtp) {
             const int max_drafts = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) - 1 : o.spec - 1;
@@ -5629,9 +5688,15 @@ int main(int argc, char** argv) {
     const bool auto_cache = o.expert_cache < 0;
     bool reserve_adapted = false;   // #496: the auto sizing lowered the reserve so a small card's cache fits
     // --pipeline-windows: what it allocates on CUDA0 after the cache (see kPipeWindowMib)
-    const int64_t pipe_first = o.pipeline_windows <= 0 ? 0
+    // --layer-stage-pipeline (the coordinator): the same second verifier and one copy of this PC's GDN state
+    const bool stage_pipe = layer_stage_client && o.layer_stage_pipeline;
+    const int64_t pipe_first = stage_pipe ? (160ll << 20) + (int64_t) gdn_snapshot_bytes(ss)
+        : o.pipeline_windows <= 0 ? 0
         : (kPipeWindowMib << 20) + (o.pipeline_windows >= 2 ? 2 * (int64_t) gdn_snapshot_bytes(ss) : 0);
-    if (pipe_first > 0)
+    if (pipe_first > 0 && stage_pipe)
+        std::fprintf(stderr, "strata generate: --layer-stage-pipeline: %lld MiB of CUDA0 kept out of the expert cache "
+                             "(the second verifier, the GDN snapshot)\n", (long long) (pipe_first >> 20));
+    else if (pipe_first > 0)
         std::fprintf(stderr, "strata generate: --pipeline-windows %d: %lld MiB of CUDA0 kept out of the expert cache "
                              "(the second verifier%s)\n", o.pipeline_windows, (long long) (pipe_first >> 20),
                      o.pipeline_windows >= 2 ? ", the GDN snapshots" : "");
@@ -7797,6 +7862,12 @@ int main(int argc, char** argv) {
         }
         strata::prefill::Prefill sp;
         MappedLayerStageBuffer stage_handoff;
+        // --layer-stage-pipeline (coordinator): the odd windows' hand-off, one copy of this PC's GDN state for a wrong
+        // guess, and a switch that keeps `ver`'s RPC hooks quiet while the pipelined loop sends the requests itself
+        MappedLayerStageBuffer stage_handoff_b;
+        void* stage_snap = nullptr;
+        size_t stage_snap_bytes = 0;
+        bool stage_local_only = false;
         strata::core::LayerStageClient stage_client;
         uint64_t stage_session = (uint64_t) Clock::now().time_since_epoch().count() ^
                                  (uint64_t) (uintptr_t) &stage_client;
@@ -8487,11 +8558,16 @@ int main(int argc, char** argv) {
                 ver.set_stage(0, local_layer_end, nullptr, stage_handoff.device);
                 ver.set_remote_stage(
                     [&](int rows, const int32_t* tokens, int64_t position, int32_t* picks, std::string& e) {
+                        if (stage_local_only) return true;
                         return stage_client.verify(stage_session, stage_generation, position, (uint32_t) rows,
                                                   tokens, stage_handoff.host, picks, e);
                     },
                     [&](int keep, bool draft_next, float min_p, std::vector<int32_t>* draft_tokens,
                         std::vector<float>* draft_probabilities, std::string& e) {
+                        if (stage_local_only) {
+                            if (draft_next) e = "layer-stage MTP drafts were asked of a local-only commit";
+                            return !draft_next;
+                        }
                         strata::core::LayerStageMtpReply reply;
                         strata::core::LayerStageMtpReply* reply_ptr = o.layer_stage_mtp ? &reply : nullptr;
                         if (!stage_client.commit(stage_session, stage_generation, (uint32_t) keep, draft_next,
@@ -8516,6 +8592,22 @@ int main(int argc, char** argv) {
                         }
                         return true;
                     });
+                if (o.layer_stage_pipeline) {
+                    // the odd windows' verifier of this PC's layers: the pipelined loop sends every request itself,
+                    // so its hooks only end the local pass
+                    if (!stage_handoff_b.init(handoff_bytes, err)) {
+                        std::fprintf(stderr, "strata serve: --layer-stage-pipeline: %s\n", err.c_str());
+                        return 1;
+                    }
+                    ver_b.set_stage(0, local_layer_end, nullptr, stage_handoff_b.device);
+                    ver_b.set_remote_stage(
+                        [](int, const int32_t*, int64_t, int32_t*, std::string&) { return true; },
+                        [](int, bool draft_next, float, std::vector<int32_t>*, std::vector<float>*, std::string& e) {
+                            if (draft_next) e = "layer-stage MTP drafts were asked of a local-only commit";
+                            return !draft_next;
+                        });
+                    ver_b.set_remote_expert_opt(remote_opt.get());
+                }
             } else {
                 ver.set_stage(local_layer_begin, -1, stage_handoff.device, nullptr);
                 stage_executor = std::make_unique<ModelLayerStageExecutor>(ss, g, ver, sp, drive, stage_handoff,
@@ -8530,6 +8622,24 @@ int main(int argc, char** argv) {
             (use_local_mtp && !mtp.bind(last_st ? last_st->wt : wt, last_st ? &last_st->head : &native_head,
                                   pipe ? pl_mtp_R : ver.final_R_all(), err))) {
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
+            return 1;
+        }
+        if (layer_stage_client && o.layer_stage_pipeline) {
+            stage_snap_bytes = gdn_snapshot_bytes(ss);
+            if (!ver_b.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, std::max(o.spec, o.batch), err) ||
+                cudaMalloc(&stage_snap, stage_snap_bytes) != cudaSuccess) {
+                if (err.empty()) err = std::string("the GDN snapshot: ") + cudaGetErrorString(cudaGetLastError());
+                std::fprintf(stderr, "strata serve: --layer-stage-pipeline: the second verifier: %s (raise "
+                                     "--vram-reserve-mib by ~200, or drop --layer-stage-pipeline on both PCs)\n",
+                             err.c_str());
+                return 1;
+            }
+            std::fprintf(stderr, "strata serve: --layer-stage-pipeline: this PC runs its layers of the next decode window "
+                                 "while the worker verifies the current one (GDN snapshot %.1f MiB)\n",
+                         (double) stage_snap_bytes / 1048576.0);
+        }
+        if (layer_stage_server && o.layer_stage_pipeline && use_local_mtp && !mtp.prepare_chain(err)) {
+            std::fprintf(stderr, "strata serve: --layer-stage-pipeline: the drafter's chain graphs: %s\n", err.c_str());
             return 1;
         }
         // The layer-stage worker enters its accept loop below, before the normal request-loop setup. Bind the
@@ -8607,6 +8717,10 @@ int main(int argc, char** argv) {
         void* const win_pool_user = n_stages > 1 ? (void*) &split_drive : (void*) &drive;
         mem_mark("the verifier and the drafter's binding");
         ver.set_split(o.spec_split);
+        if (layer_stage_client && o.layer_stage_pipeline) {
+            ver_b.set_split(o.spec_split);
+            ver_b.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
+        }
         // auto: the copy kernel for every pack.  DMA (the native packs' default until 0.1.13) has the host call
         // cudaMemcpyAsync + cudaLaunchHostFunc inside a verify window while the GPU spins on the flag they raise;
         // issue #31's thread dumps show the host stuck in that cudaMemcpyAsync on a driver lock for good.  The copy
@@ -8853,7 +8967,8 @@ int main(int argc, char** argv) {
                 (o.layer_stage_reuse ? strata::core::kLayerStageCapabilityReuse : 0u) |
                 (o.vision ? strata::core::kLayerStageCapabilityVision : 0u) |
                 (o.layer_stage_sessions ? strata::core::kLayerStageCapabilitySessions : 0u) |
-                (o.layer_stage_mtp ? strata::core::kLayerStageCapabilityMtp : 0u);
+                (o.layer_stage_mtp ? strata::core::kLayerStageCapabilityMtp : 0u) |
+                (o.layer_stage_pipeline ? strata::core::kLayerStageCapabilityPipeline : 0u);
             layer_stage_spec.wire_format = o.layer_stage_wire == "bf16" ? strata::core::LayerStageWireFormat::bf16
                                            : o.layer_stage_wire == "fp16" ? strata::core::LayerStageWireFormat::fp16
                                                                            : strata::core::LayerStageWireFormat::fp32;
@@ -13191,6 +13306,273 @@ int main(int argc, char** argv) {
                             cal += b;
                         }
                     std::fprintf(stderr, "strata pipeline calibration (p_on decile: on/scored):%s\n", cal.c_str());
+                }
+            }
+            // ======== --layer-stage-pipeline: this PC's layers of the next window while the worker verifies this one ========
+            // Window A goes to the worker.  On the guess that A is accepted whole and that its bonus token is the one the
+            // worker's drafter predicted, this PC commits A at once (its GDN state copied first) and runs its own layers of
+            // the next window B while the worker still verifies A.  When the guess holds, A's commit and B's verify leave
+            // together, and the worker's draft chain, forced through B's drafts, guesses past B.  When it does not, this
+            // PC's state comes back from the copy, A's real commit replays and the next window is built from the real
+            // tokens.  The worker only verifies windows built on committed tokens and a window row computes what it would in
+            // any other window, so the emitted tokens are the serial loop's (a sampled request draws Philox(seed, position)
+            // on the worker either way).  STRATA_LAYER_STAGE_PIPELINE_THETA: the estimate a guess needs (default 0.2);
+            // STRATA_LAYER_STAGE_PIPELINE_FORCE_MISS=k (test): every k-th guess gets a wrong first token.
+            if (!pl_ran && layer_stage_client && o.layer_stage_pipeline && remote_mtp && !cancelled && produced_n < max_new) {
+                const char* lsp_serial = hist_n > 0 ? "repetition penalties (penalty_last_n)"
+                                       : ajob ? "--adapt-async 1"
+                                       : kvg.on ? "--kv-grow" : nullptr;
+                if (lsp_serial != nullptr) {
+                    static std::set<std::string> said;
+                    if (said.insert(lsp_serial).second)
+                        std::fprintf(stderr, "strata serve: --layer-stage-pipeline: a request with %s decodes serially\n",
+                                     lsp_serial);
+                } else {
+                    pl_ran = true;
+                    struct SW {
+                        int T = 0, par = 0;    // par: this PC's verifier (and hand-off) of the window
+                        int64_t p = 0;
+                        int32_t tok[8] = {};
+                        float p_on = 0.0f;     // the estimate that the window before is kept whole and tok[0] is its bonus
+                    };
+                    strata::core::Verifier* const HV[2] = {&ver, &ver_b};
+                    const float* const HB[2] = {stage_handoff.host, stage_handoff_b.host};
+                    static const float lsp_theta = [] {
+                        const char* v = std::getenv("STRATA_LAYER_STAGE_PIPELINE_THETA");
+                        return v != nullptr ? (float) std::atof(v) : 0.2f;
+                    }();
+                    static const int lsp_force_miss = [] {
+                        const char* v = std::getenv("STRATA_LAYER_STAGE_PIPELINE_FORCE_MISS");
+                        return v != nullptr ? std::max(0, std::atoi(v)) : 0;
+                    }();
+                    // the chain covers the window in flight's drafts and the next window: up to S_mtp - 1 + S_mtp outputs
+                    const int lsp_chain = std::min((int) strata::core::kLayerStageMaxMtpDrafts, 2 * S_mtp - 1);
+                    int64_t lsp_windows = 0, lsp_ahead = 0, lsp_kept = 0, lsp_undone = 0, lsp_gated = 0, lsp_guesses = 0;
+                    std::vector<int32_t> picks((size_t) S, 0), host_out((size_t) S, 0);
+                    int32_t snap_ple[2] = {-1, -1};
+                    // `ver`'s hooks end the local pass while this loop runs: it sends the requests itself
+                    struct LocalOnly {
+                        bool& on;
+                        explicit LocalOnly(bool& flag) : on(flag) { on = true; }
+                        ~LocalOnly() { on = false; }
+                    } local_only(stage_local_only);
+                    // the serial loop's window size over the chain's outputs from index `from` (`avail` of them)
+                    auto t_rule = [&](const float* pr, int from, int avail) {
+                        int T = S_mtp;
+                        if (req_spec_min_p > 0.0) {
+                            T = 1;
+                            while (T < S_mtp && from + T - 1 < avail && pr[from + T - 1] >= (float) req_spec_min_p) ++T;
+                        }
+                        return std::max(1, std::min(T, 1 + avail - from));
+                    };
+                    // a window at `pos` from its first token and the chain's outputs from index `from` as its drafts
+                    auto make_window = [&](SW& w, int64_t pos, int32_t first, const strata::core::LayerStageMtpReply& c,
+                                           int from, int par) {
+                        w = SW{};
+                        w.p = pos;
+                        w.par = par;
+                        w.tok[0] = first;
+                        w.T = t_rule(c.probabilities.data(), from, (int) c.count);
+                        if (w.p + w.T > o.max_context) w.T = (int) std::max<int64_t>(1, o.max_context - w.p);
+                        for (int i = 1; i < w.T; ++i) w.tok[i] = c.tokens[(size_t) (from + i - 1)];
+                    };
+                    // this PC's layers of a window (synchronous, as ver.run in the serial loop); the adaptive tier's
+                    // pending swaps land first, by the serial loop's rule
+                    auto host_run = [&](const SW& w) -> bool {
+                        if (adapt_nowait()) apply_pending(false);
+                        else if (pending.empty() || ++pending_age >= adapt_lag()) apply_pending(true);
+                        strata::core::Verifier& v = *HV[w.par];
+                        drive.d.plan = v.plan_sink();
+                        drive.d.layers = 0;
+                        drive.d.experts = 0;
+                        drive.d.failed = false;
+                        const bool ran = v.run(w.T, w.tok, w.p, win_pool_fn, win_pool_user, host_out.data(), err) &&
+                                         !drive.d.failed;
+                        drive.d.plan = ver.plan_sink();
+                        if (!ran && drive.d.failed && drive.d.fail != nullptr) err = drive.d.fail;
+                        return ran;
+                    };
+                    auto send_verify = [&](const SW& w) {
+                        return stage_client.send_verify(stage_session, stage_generation, w.p, (uint32_t) w.T, w.tok,
+                                                        HB[w.par], err);
+                    };
+                    auto local_commit = [&](const SW& w, int keep) {
+                        return HV[w.par]->commit(keep, err) && HV[w.par]->wait_commit(err);
+                    };
+                    // this PC's GDN state (and PLE history) before a commit made on a guess, and back after a wrong one
+                    auto snap = [&](bool restore) -> bool {
+                        const strata::core::OnDevice on(ver.device());
+                        if (restore) {
+                            ss.ple_prev[0] = snap_ple[0];
+                            ss.ple_prev[1] = snap_ple[1];
+                        } else {
+                            snap_ple[0] = ss.ple_prev[0];
+                            snap_ple[1] = ss.ple_prev[1];
+                        }
+                        void* const dst = restore ? (void*) ss.gdn_state : stage_snap;
+                        const void* const src = restore ? (const void*) stage_snap : (const void*) ss.gdn_state;
+                        if (cudaMemcpyAsync(dst, src, stage_snap_bytes, cudaMemcpyDeviceToDevice, ver.stream()) != cudaSuccess ||
+                            cudaStreamSynchronize(ver.stream()) != cudaSuccess) {
+                            err = std::string("the GDN snapshot: ") + cudaGetErrorString(cudaGetLastError());
+                            return false;
+                        }
+                        return true;
+                    };
+                    // the commit's reply, with the adaptive tier beside it as in the serial loop (no window of this PC is
+                    // in flight; the next one waits for its copies)
+                    auto receive_chain = [&](strata::core::LayerStageMtpReply& c) -> bool {
+                        std::thread adapt_thr;
+                        bool adapt_ok = true;
+                        if (!drive.d.usage.empty() && o.adapt_every > 0 && (rounds % o.adapt_every) == 0)
+                            adapt_thr = std::thread([&] { strata::aux_cpus::pin_current_thread(); adapt_ok = adapt(); });
+                        const bool got = stage_client.receive_commit_chain(c, err);
+                        if (adapt_thr.joinable()) adapt_thr.join();
+                        if (got && !adapt_ok) err = "an adaptive refill failed";
+                        return got && adapt_ok;
+                    };
+                    // a committed window's tokens out, as the serial loop emits them
+                    auto emit = [&](const SW& w, int a) {
+                        for (int i = 0; i <= a; ++i) consumed.push_back(w.tok[i]);
+                        draft_offered += w.T - 1;
+                        draft_accepted += a;
+                        ++dec_windows;
+                        dec_T += w.T;
+                        ++lsp_windows;
+                        if (drive.d.fs) drive.d.fs->completed.fetch_add(1, std::memory_order_release);
+                        bool eos = false;
+                        for (int i = 0; i <= a && produced_n < max_new && !eos; ++i) {
+                            std::printf("T %d\n", (int) picks[(size_t) i]);
+                            strata::core::progress_beat();
+                            ++produced_n;
+                            if (sfx_on) sfx.append(picks[(size_t) i]);
+                            if (o.lookup_chain > 0) extra_sources_append(&picks[(size_t) i], 1);
+                            eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) picks[(size_t) i]) != o.eos_ids.end();
+                        }
+                        std::fflush(stdout);
+                        first_window = false;
+                        x = picks[(size_t) a];
+                        p = w.p + a + 1;
+                        return eos;
+                    };
+                    // the guess behind window `w` from the chain: its row 0 at index `base`, its drafts after it
+                    auto make_guess = [&](SW& g_w, const SW& w, const strata::core::LayerStageMtpReply& c, int base,
+                                          float p_before) {
+                        make_window(g_w, w.p + w.T, c.tokens[(size_t) base], c, base + 1, w.par ^ 1);
+                        g_w.p_on = p_before * c.probabilities[(size_t) base];
+                        ++lsp_guesses;
+                        if (lsp_force_miss > 0 && lsp_guesses % lsp_force_miss == 0) g_w.tok[0] = g_w.tok[0] == 0 ? 1 : 0;
+                    };
+                    if (aflipped) apply_pending(true);
+                    SW A, B;
+                    bool b_ok = false;
+                    A.T = 1;
+                    A.p = p;
+                    A.tok[0] = x;
+                    bool failed = false;   // an error ends the engine, as in the serial loop
+                    const bool run = !stop_req.load() && A.p + A.T <= o.max_context;
+                    if (stop_req.load()) finish = "cancel";
+                    err.clear();
+                    if (run && !(host_run(A) && send_verify(A))) failed = true;
+                    while (run && !failed) {
+                        // ---- B on this PC while the worker verifies A: A committed here whole first, its state copied
+                        const bool spec = b_ok && B.p_on >= lsp_theta && B.p + B.T <= o.max_context && !stop_req.load();
+                        if (b_ok && !spec) ++lsp_gated;
+                        if (spec) {
+                            if (!snap(false) || !local_commit(A, A.T) || !host_run(B)) { failed = true; break; }
+                            ++lsp_ahead;
+                        }
+                        // ---- A's verdict
+                        if (!stage_client.receive_verify((uint32_t) A.T, picks.data(), err)) { failed = true; break; }
+                        int a = 0;
+                        while (a < A.T - 1 && A.tok[a + 1] == picks[(size_t) a]) ++a;
+                        a = (int) strata::core::layer_stage_output_commit_count(picks.data(), (uint32_t) a + 1,
+                                                                               max_new - produced_n, o.eos_ids) - 1;
+                        bool eos_in = false;
+                        for (int i = 0; i <= a; ++i)
+                            eos_in = eos_in || std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) picks[(size_t) i]) !=
+                                                   o.eos_ids.end();
+                        const bool stopping = stop_req.load();
+                        const bool last = eos_in || produced_n + (int64_t) a + 1 >= max_new || stopping;
+                        // a decode checkpoint is saved where nothing runs ahead: that window takes the plain path
+                        const bool ckpt_due = o.layer_stage_reuse && req_ckpt &&
+                                              (int64_t) consumed.size() + a + 1 >= stage_next_decode_checkpoint;
+                        const bool hold = spec && !last && !ckpt_due && a == A.T - 1 && picks[(size_t) a] == B.tok[0];
+                        if (spec && !hold) {   // a wrong guess: back to before A's commit here, then its real one
+                            if (!snap(true) || !local_commit(A, a + 1)) { failed = true; break; }
+                            ++lsp_undone;
+                        } else if (!spec && !local_commit(A, a + 1)) { failed = true; break; }
+                        ++rounds;
+                        if (last) {   // the serial loop's last commit: no drafts, the worker keeps its draft cell
+                            strata::core::LayerStageMtpReply none;
+                            if (!stage_client.commit(stage_session, stage_generation, (uint32_t) a + 1, false, 0.0f, &none,
+                                                     err)) { failed = true; break; }
+                            const bool eos = emit(A, a);
+                            if (eos) finish = "stop";
+                            else if (stopping) finish = "cancel";
+                            break;
+                        }
+                        strata::core::LayerStageMtpReply c;
+                        if (hold) {
+                            // A's commit and B's verify leave together; the chain re-predicts B's drafts from A's verified
+                            // rows (a disagreement means B is unlikely to be kept whole), then guesses B's bonus
+                            if (!stage_client.send_commit_chain(stage_session, stage_generation, (uint32_t) A.T, B.tok + 1,
+                                                                (uint32_t) (B.T - 1), (uint32_t) lsp_chain, err) ||
+                                !send_verify(B) || !receive_chain(c)) { failed = true; break; }
+                            (void) emit(A, a);
+                            ++lsp_kept;
+                            const int base = B.T - 1;
+                            SW C;
+                            b_ok = (int) c.count > base;
+                            if (b_ok) {
+                                float pb = 1.0f;
+                                bool agree = true;
+                                for (int i = 0; i < base; ++i) {
+                                    agree = agree && c.tokens[(size_t) i] == B.tok[i + 1];
+                                    pb *= c.probabilities[(size_t) i];
+                                }
+                                make_guess(C, B, c, base, agree ? pb : 0.0f);
+                            }
+                            A = B;
+                            B = C;
+                            continue;
+                        }
+                        // ---- the plain path: A's real commit, a chain from its last kept row, the next window from it
+                        if (!stage_client.send_commit_chain(stage_session, stage_generation, (uint32_t) a + 1, nullptr, 0,
+                                                            (uint32_t) lsp_chain, err) ||
+                            !receive_chain(c)) { failed = true; break; }
+                        (void) emit(A, a);
+                        if (ckpt_due) {
+                            if (!checkpoint_at((int64_t) consumed.size(), nullptr, true, &consumed)) {
+                                err = "saving a distributed decode checkpoint: " + err + ckpt_why;
+                                failed = true;
+                                break;
+                            }
+                            stage_next_decode_checkpoint = (int64_t) consumed.size() + 1024;
+                        }
+                        if (p + 1 > o.max_context) break;   // the context is full ("length"), both PCs committed
+                        SW A2, B2;
+                        make_window(A2, p, x, c, 0, A.par ^ 1);
+                        const int base = A2.T - 1;
+                        b_ok = (int) c.count > base;
+                        if (b_ok) {
+                            float pa = 1.0f;
+                            for (int i = 0; i < base; ++i) pa *= c.probabilities[(size_t) i];
+                            make_guess(B2, A2, c, base, pa);
+                        }
+                        if (!host_run(A2) || !send_verify(A2)) { failed = true; break; }
+                        A = A2;
+                        B = B2;
+                    }
+                    if (failed) {
+                        std::printf("ERR %s\n", err.empty() ? "the pipelined layer-stage decode failed" : err.c_str());
+                        return 1;
+                    }
+                    if (lsp_windows > 0)
+                        std::fprintf(stderr, "strata serve: --layer-stage-pipeline: %lld windows, %.2f tokens each; %lld run ahead "
+                                             "(%lld kept, %lld undone), %lld guesses held back by the estimate\n",
+                                     (long long) lsp_windows, (double) produced_n / (double) lsp_windows,
+                                     (long long) lsp_ahead, (long long) lsp_kept, (long long) lsp_undone,
+                                     (long long) lsp_gated);
                 }
             }
             while (!pl_ran && !cancelled && produced_n < max_new) {

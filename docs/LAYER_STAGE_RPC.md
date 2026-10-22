@@ -19,6 +19,57 @@ for each request. Batching, penalties, logit bias, cvec overrides, probabilistic
 and expert-cache RPC are not supported. The worker also requires the non-finite-logit
 guard; do not set STRATA_NAN_GUARD=0 on it.
 
+## Exp30: optional pipelined decode
+
+Without this option the two GPUs take turns on every decode window: the 4090 runs layers 0..K-1, sends the rows, and
+waits while the 5070 Ti runs the rest, picks the tokens and drafts the next window. `--layer-stage-pipeline` lets the
+4090 run its layers of the **next** window while the 5070 Ti still verifies the current one. The next window is a
+guess: that the current window is accepted whole and that its bonus token is the one the worker's draft layer
+predicted. When the guess holds, the 4090's share of that window is already done, and its commit and the next verify
+go out together, so the window also saves one round trip. When it does not hold, the 4090 copies its saved recurrent
+(GDN) state back, commits the real accepted count, and builds the next window from the real tokens. The discarded work
+ran while the 4090 would otherwise have waited. A guess is only run when the draft layer's own estimate that it holds
+is at least 0.2 (`STRATA_LAYER_STAGE_PIPELINE_THETA` on the host changes it).
+
+It is no quality trade. The worker only verifies windows built on committed tokens, and each row computes what it would
+in any other window, so the answer is the serial loop's. Single-PC Strata has the same caveat: greedy text can still
+differ in a near tie when a different window shape sends an expert to the CPU instead of the GPU (see "Reproducible greedy
+output" in [DETAILS.md](DETAILS.md)). Sampled requests draw each token on the worker from the request's seed and the
+token's position, as before.
+
+To turn it on:
+
+1. Upgrade **both PCs** to Exp30. The protocol version stays 5, so an Exp29 peer still connects while the option is off.
+2. Add `"--layer-stage-pipeline"` to the `args` of **both** JSONs. It needs `--layer-stage-mtp` and `--mtp` on both,
+   as in the MTP setup below.
+3. Restart the worker, then the host. The host log says `--layer-stage-pipeline: this PC runs its layers of the next
+   decode window ...` at start, and after every request:
+   `--layer-stage-pipeline: N windows, X tokens each; R run ahead (K kept, U undone), G guesses held back by the estimate`.
+
+What it costs:
+
+- The host keeps a second verifier and one copy of its GDN state out of its expert cache: 160 MiB plus about 3 MiB per
+  GDN layer it runs (the start-up log prints both).
+- The worker loads its draft layer for 8 rows instead of the verify width, and every commit runs a draft chain of up
+  to 7 steps instead of 3, because the chain also guesses the window after the next one. This adds draft-layer time on
+  the 5070 Ti to every window; it has not been measured.
+- The bytes per window are unchanged.
+
+What it leaves alone: prompt reading, the serial loop (the default), and every other option. While it decodes, windows
+come from the draft layer only: prompt-lookup windows (`--suffix-draft`) and `--lookup-chain` are not used. A request
+with repetition penalties, `--adapt-async 1` or `--kv-grow` decodes serially (the log says so once). Decode checkpoints
+for `--layer-stage-reuse` are saved at windows that have nothing running ahead, and disk save/restore works as in
+Exp29.
+
+What was checked: the engine builds with the option, and the protocol tests cover a chain commit sent together with the
+next verify (replies read in order, a forced chain, a rejection with a request behind it closing the connection). The
+pipelined loop has **not** been run on a GPU, on two PCs, or timed. Before relying on it, send the same temperature-0
+request with and without the option (restart both PCs between runs), and once more with
+`STRATA_LAYER_STAGE_PIPELINE_FORCE_MISS=2` set on the host, which makes every second guess wrong on purpose. All
+three answers should match. For a byte-exact comparison, also set `STRATA_IQ_MT_MIN=1` on both PCs and add
+`"--adapt-swaps", "0", "--pcie-frac", "0"` to both `args`, as described in [DETAILS.md](DETAILS.md). Then measure
+output tokens/s with and without the option on the same prompts.
+
 ## Exp29: optional disk save/restore, with vision included
 
 Exp29 includes Exp28's vision support and adds paired disk snapshots. Both features remain opt-in and can be used
