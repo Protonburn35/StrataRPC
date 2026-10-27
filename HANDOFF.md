@@ -83,9 +83,9 @@ The Qwen layer-stage code (`layer_stage_rpc.cpp`, the `generate.cpp` hooks, Exp2
 | Transport + codec copied, CMake `strata_stage_net` library | done |
 | Stage protocol `src/dsv41/ds4_stage.{hpp,cpp}` | done |
 | GPU-free test `tests/dsv41/ds4_stage_test.cpp` | passes, also under ASan/UBSan |
-| Engine stage mode in `ds4_model.cu` | written; passes a clang CUDA syntax check (host + sm_89); not run on a GPU yet |
-| `ds4_main.cpp` flags and worker mode | written; compiles with g++ (`-fsyntax-only`) |
-| Windows workflow `.github/workflows/stratarpcd-windows.yml` | scripts and protocol tests pass on Windows; the engine compiles and links (run 6); packaging fix in run 7 |
+| Engine stage mode in `ds4_model.cu` | built with nvcc 13.2 + MSVC 14.44 for sm_89 + sm_120 (run 7); not run on a GPU yet |
+| `ds4_main.cpp` flags and worker mode | built on Windows (run 7); not run yet |
+| Windows workflow `.github/workflows/stratarpcd-windows.yml` | **green: run 7** (https://github.com/Protonburn35/StrataRPC/actions/runs/40593070051), artifact `StrataRPCD-engine-win-x64-cuda13-sm89-sm120` (https://github.com/Protonburn35/StrataRPC/actions/runs/40593070051/artifacts/12776846981, kept 30 days), `strata-dsv41 0.1.52 build a31d1b2cb` |
 | User guide `docs/STRATARPCD.md`, `scripts/stratarpcd/start-worker.ps1`, `start-coordinator.ps1` | written; the workflow parses them and dry-runs them under PowerShell 5.1 |
 
 What the engine changes do (see `git log -p src/dsv41/ds4_model.cu`):
@@ -144,6 +144,11 @@ Windows build notes:
 - **Run 6 compiled and linked `strata-dsv41.exe`** (the build step took 31 minutes). Only the Package step failed:
   `CONDA_PREFIX` is not set in a pwsh step (micromamba activates the environment for cmd only). Run 7 finds the
   environment under `MAMBA_ROOT_PREFIX\envs\cuda-build` instead.
+- **Run 7 is green** (31 minutes of compiling, then packaging and upload). The artifact (407 MB zipped) holds
+  `strata-dsv41.exe`, `cublas64_13.dll`, `cublasLt64_13.dll`, both start scripts, `README-STRATARPCD.md`, this file
+  and `BUILD.txt`. cudart is linked statically.
+- **Next step: the user runs it on A and C** (docs/STRATARPCD.md, "What to test, in order"). Nothing in stage mode has
+  run on a GPU yet, so the first logs are the first real test of `ds4_model.cu`'s stage hooks.
 - **If the dialect problem comes back:** the next thing to try is NVIDIA's installer CUDA 13.0 (as mainline's
   `packaging/build_dsv41_windows.bat` uses) instead of the conda packages; the network installers are at
   `https://developer.download.nvidia.com/compute/cuda/<13.x.y>/network_installers/cuda_<13.x.y>_windows_network.exe`.
