@@ -126,6 +126,12 @@ The Windows build (`stratarpcd-windows.yml`):
   sm_89 + sm_120, and uploads the artifact `StrataRPCD-engine-win-x64-cuda13-sm89-sm120`. The artifact holds the exe, the
   cuBLAS DLLs, the scripts, `README-STRATARPCD.md` and this file.
 
+Windows build notes:
+- **mainline's CUDA sources need C++20.** Run 1 forced C++17 and stopped in `iq_kernels.cu`. Run 2 gave no dialect,
+  so nvcc followed MSVC's default (C++14) and stopped at the first nested namespace.
+- **The workflow therefore passes `-DCMAKE_CUDA_FLAGS=--std=c++20`.** It uses the flag rather than
+  `CMAKE_CUDA_STANDARD`, which CMake may leave out when it takes nvcc's default as enough.
+
 Known limits of this first version (measure before changing):
 - **The worker takes a chunk's rows one 256-row piece at a time.** It waits for each piece's copy to the GPU, which
   is queued behind the previous chunk's work. So during a prompt, the network transfer does not overlap the worker's
