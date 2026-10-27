@@ -25,25 +25,47 @@ PCs yet: you test it first.
 2. **Get the engine.** Download the `StrataRPCD-engine-win-x64-cuda13-sm89-sm120` artifact from the newest green
    "StrataRPCD Windows engine" run (https://github.com/Protonburn35/StrataRPC/actions). Extract it into
    `C:\StrataRPCD\engine-rpcd\`. It holds `strata-dsv41.exe`, the CUDA DLLs and the two start scripts.
-3. **Download and prepare the model** with mainline's setup, pointed at this engine. In PowerShell:
+3. **Download the model** with the Hugging Face CLI (or let setup in step 4 download it).
+   - Every PC gets the same files in the same folder.
+   - `hf download` creates the folder itself.
+   - The revisions are the ones setup pins. A file from another revision fails setup's SHA-256 check, and setup then
+     downloads it again.
+
+   ```powershell
+   $d = "C:\StrataRPCD\models\deepseek-v4.1-flash-IST-DAS-2.00bpw"
+   hf download ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF --revision cb02422c900df489cea5833e8a92171224059b3c --include "*IQ2_XXS*" "DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf" --local-dir $d
+   hf download unsloth/DeepSeek-V4.1-Flash-1017-GGUF --revision f924b94f19c1fea02c06a65c8475b0a45e2b88b1 --include "UD-Q8_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00001-of-00009.gguf" "dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf" "mmproj-BF16.gguf" --local-dir $d
+   Move-Item "$d\UD-Q8_K_XL\DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00001-of-00009.gguf" $d
+   Get-ChildItem $d -Filter *.gguf | Format-Table Name, Length
+   ```
+
+   | File | Bytes |
+   |---|---:|
+   | `DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00001-of-00004.gguf` | 39,075,714,624 |
+   | `...-00002-of-00004.gguf` | 39,388,449,504 |
+   | `...-00003-of-00004.gguf` | 39,246,891,616 |
+   | `...-00004-of-00004.gguf` | 20,527,837,312 |
+   | `DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf` | 110,595,290,816 |
+   | `DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00001-of-00009.gguf` (only its metadata is read) | 5,780,589 |
+   | `dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf` | 7,976,914,240 |
+   | `mmproj-BF16.gguf` (pictures; the split does not use them yet) | 972,208,288 |
+
+   - **Copying instead of downloading:** a finished folder can be copied to another PC instead of downloading it again.
+4. **Prepare the model** with mainline's setup, pointed at this engine. It finds the files above, checks them, and
+   downloads only what is missing. In PowerShell:
 
    ```powershell
    cd C:\StrataRPCD
    $env:STRATA_DSV41_EXE = "C:\StrataRPCD\engine-rpcd\strata-dsv41.exe"
-   .\START-HERE.bat --family deepseek41 --model IST-DAS-2.00bpw --vision no --no-start
+   .\START-HERE.bat --family deepseek41 --model IST-DAS-2.00bpw --no-start
    ```
 
-   `--vision no` skips the picture reader (`mmproj-BF16.gguf`, 1 GB), which the two-PC split does not use. Setup would
-   otherwise put it at `C:\StrataRPCD\models\deepseek-v4.1-flash-shared\mmproj-BF16.gguf` and build it into the pack.
-   Either way the split works: the handshake ignores the vision weights.
-
-   - **Download:** setup fetches 257 GB into `C:\StrataRPCD\models\` (the 138 GB model, the 111 GB Engram table and
-     the 8 GB drafter).
-   - **Pack:** it builds the pack under `C:\StrataRPCD\packs\` and writes `strata-deepseek-v4.1-flash-ist-das-2.00bpw.json`.
+   - **Pack:** setup builds the pack under `C:\StrataRPCD\packs\` and writes
+     `strata-deepseek-v4.1-flash-ist-das-2.00bpw.json`, which the start scripts read.
    - **Test:** it then has this one PC answer a 16-word test question, which checks the new engine on its own.
-   - **If you already downloaded the GGUF files:** add `--gguf-dir <the folder with them>`.
-   - **To skip the test:** set `$env:STRATA_DSV41_NO_SMOKE = "1"` before running setup.
-4. **On C only, allow the worker's port** through the firewall for your home network. Run this in an
+   - **To skip the test:** set `$env:STRATA_DSV41_NO_SMOKE = "1"`.
+   - **Pictures:** setup builds the picture reader into the pack. The two-PC split leaves it off for now.
+5. **On C only, allow the worker's port** through the firewall for your home network. Run this in an
    **administrator** PowerShell:
 
    ```powershell
