@@ -11,12 +11,12 @@ user has tested phase 1.
 
 | PC | Hardware | Role |
 |---|---|---|
-| A | RTX 4090 24 GB, 7800X3D, 32 GB RAM | coordinator: API, embedding table, Engram, layers 0-19 |
+| A (192.168.50.206) | RTX 4090 24 GB, 7800X3D, 32 GB RAM | coordinator: API, embedding table, Engram, layers 0-19 |
 | C (192.168.50.143) | RTX 5070 Ti 16 GB, 9800X3D, 32 GB RAM | worker: layers 20-39, head, sampling |
 | B (192.168.50.129) | RTX 4060 Laptop 8 GB, HX 370, 32 GB RAM | phase 2 |
 
-Network: the worker listens on port 39501 (StrataRPC's qfn worker uses 39001). C's inbound firewall rule may list
-remote addresses (`-RemoteAddress`, A's IP and possibly the laptop's). When planning phase 2, check which PC connects to
+Network: the worker listens on port 39501 (StrataRPC's qfn worker uses 39001). C's inbound firewall rule lists
+remote addresses: `-RemoteAddress 192.168.50.206,192.168.50.129` (A and the laptop). When planning phase 2, check which PC connects to
 which: every listening PC needs an inbound rule, and a rule with an address list must include each PC that connects to it.
 
 The user keeps the whole model in a `StrataRPCD` folder on every PC: the GGUF shards, the Engram table, the DSpark GGUF
