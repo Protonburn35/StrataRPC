@@ -344,9 +344,35 @@ void test_wire_codec() {
     CHECK(parse_wire("bf16", f) && f == LayerStageWireFormat::bf16 && !parse_wire("int8", f));
 }
 
+// the split rules on DeepSeek-V4.1-Flash's own layout (pack_gguf's geometry: tests/terminal/test_pack_gguf_engram.py)
+void test_split_rules() {
+    Layout v41;
+    v41.n_layers = 40;
+    v41.kv_src = {2, 8, 14, 20};
+    v41.ix_src = {2, 8, 14, 20, 24, 28, 32, 36};
+    v41.eg_layers = {1, 14};
+    v41.cand_src = 20;
+    std::string why;
+    CHECK(check_split(v41, 20, why));
+    CHECK(!check_split(v41, 14, why) && why.find("Engram layer 14") != std::string::npos);
+    CHECK(!check_split(v41, 8, why) && why.find("Engram") != std::string::npos);
+    CHECK(!check_split(v41, 21, why) && why.find("own compressed KV") != std::string::npos);
+    CHECK(!check_split(v41, 24, why) && why.find("own compressed KV") != std::string::npos);
+    CHECK(!check_split(v41, 0, why) && !check_split(v41, 40, why));
+    Layout early = v41;   // (a split past the candidate source whose later index layers would read its candidates)
+    early.kv_src = {2, 8, 14, 20, 26};
+    early.ix_src = {2, 8, 14, 20, 26, 28};
+    CHECK(!check_split(early, 26, why) && why.find("candidates of layer 20") != std::string::npos);
+    CHECK(cut_layers(v41.kv_src, 20, 40) == std::vector<int>({0}));
+    CHECK(cut_layers(v41.kv_src, 0, 20) == std::vector<int>({2, 8, 14}));
+    CHECK(cut_layers(v41.ix_src, 20, 40) == std::vector<int>({0, 4, 8, 12, 16}));
+    CHECK(join(v41.eg_layers) == "1, 14");
+}
+
 }  // namespace
 
 int main() {
+    test_split_rules();
     const int base = port_base();
     test_wire_codec();
     test_fp32(base);

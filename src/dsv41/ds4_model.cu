@@ -1972,30 +1972,18 @@ struct Model::Impl {
             return false;
         }
         const int split = b > 0 ? b : e;
-        auto list = [](const std::vector<int>& v) {
-            std::string s;
-            for (int x : v) s += (s.empty() ? "" : ", ") + std::to_string(x);
-            return s;
-        };
-        auto has = [](const std::vector<int>& v, int x) { return std::find(v.begin(), v.end(), x) != v.end(); };
-        if (!has(g.kv_src, split) || (!g.ix_src.empty() && !has(g.ix_src, split))) {
-            err = "--layer-stage-split " + std::to_string(split) + ": the worker's first layer must write its own "
-                  "compressed KV and index keys - one of " + list(g.kv_src) + " (V4.1: 20)";
+        stage::Layout lay;
+        lay.n_layers = g.nl;
+        lay.kv_src = g.kv_src;
+        lay.ix_src = g.ix_src;
+        lay.eg_layers = g.eg_layers;
+        lay.cand_src = g.cand_src;
+        std::string why;
+        if (!stage::check_split(lay, split, why)) {
+            err = "--layer-stage-split " + std::to_string(split) + ": " + why;
             return false;
         }
-        for (int x : g.eg_layers)
-            if (x >= split) {
-                err = "--layer-stage-split " + std::to_string(split) + ": Engram layer " + std::to_string(x) +
-                      " would be the worker's; the split must come after the last Engram layer (" + list(g.eg_layers) + ")";
-                return false;
-            }
-        if (g.cand_src >= 0 && g.cand_src < split)
-            for (int x : g.ix_src)
-                if (x > g.cand_src && x >= split) {
-                    err = "--layer-stage-split " + std::to_string(split) + ": the worker's layer " + std::to_string(x) +
-                          " reads the candidates of layer " + std::to_string(g.cand_src) + " before the split";
-                    return false;
-                }
+        const auto list = [](const std::vector<int>& v) { return stage::join(v); };
         // the experts a word takes, decided here so both stages take the same: as asked, or the model's (full quality)
         if (o.experts < 1) o.experts = g.k_exp;
         {
@@ -2022,14 +2010,8 @@ struct Model::Impl {
         // the geometry of layers [b, e): the per-layer lists cut to the range and shifted; the drafter and the vision
         // tower off; the Engram (every layer of it the coordinator's) and the candidates where they are
         g.ratios = std::vector<int>(g.ratios.begin() + b, g.ratios.begin() + e);
-        auto cut = [b, e](std::vector<int>& v) {
-            std::vector<int> r;
-            for (int x : v)
-                if (x >= b && x < e) r.push_back(x - b);
-            v = r;
-        };
-        cut(g.kv_src);
-        cut(g.ix_src);
+        g.kv_src = stage::cut_layers(g.kv_src, b, e);
+        g.ix_src = stage::cut_layers(g.ix_src, b, e);
         g.cand_src = g.cand_src >= b && g.cand_src < e ? g.cand_src - b : -1;
         if (stage_in) {
             g.eg_layers.clear();

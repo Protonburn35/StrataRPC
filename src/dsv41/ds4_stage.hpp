@@ -49,6 +49,23 @@ const char* wire_name(LayerStageWireFormat f);
 /// A stable 128-bit hash of a text (the model identity the coordinator and the worker each build from their pack).
 void hash_text(const std::string& s, uint64_t& a, uint64_t& b);
 
+/// The model's cross-layer reads, as its geometry lists them (the model's layer numbers).
+struct Layout {
+    int n_layers = 0;
+    std::vector<int> kv_src;      // layers that write compressed KV and index keys (later layers read the latest one)
+    std::vector<int> ix_src;      // layers with an indexer of their own (later layers reuse its picks)
+    std::vector<int> eg_layers;   // Engram layers (read the n-gram tables: the coordinator's)
+    int cand_src = -1;            // the layer whose candidates later index layers use (-1: none)
+};
+/// Whether the model splits cleanly before layer `split` (the worker's first): nothing but the hand-off (h | pre)
+/// crosses - the worker's first layer writes its own KV and index keys, no worker layer reads candidates from before the
+/// split, and every Engram layer is the coordinator's.  V4.1 (sources 2, 8, 14, 20; Engram 1, 14; candidates 20): 20.
+bool check_split(const Layout& m, int split, std::string& why);
+/// The layer numbers of v in [b, e), shifted to start at 0 (a stage's own numbering).
+std::vector<int> cut_layers(const std::vector<int>& v, int b, int e);
+/// "2, 8, 14" (for messages and the identity).
+std::string join(const std::vector<int>& v);
+
 struct Sampling {
     float temperature = 0.0f, top_p = 1.0f, min_p = 0.0f;
     int32_t top_k = 0;

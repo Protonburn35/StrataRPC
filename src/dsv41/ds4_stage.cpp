@@ -234,6 +234,46 @@ void hash_text(const std::string& s, uint64_t& a, uint64_t& b) {
     b ^= b >> 31;
 }
 
+std::string join(const std::vector<int>& v) {
+    std::string s;
+    for (int x : v) s += (s.empty() ? "" : ", ") + std::to_string(x);
+    return s;
+}
+
+std::vector<int> cut_layers(const std::vector<int>& v, int b, int e) {
+    std::vector<int> r;
+    for (int x : v)
+        if (x >= b && x < e) r.push_back(x - b);
+    return r;
+}
+
+bool check_split(const Layout& m, int split, std::string& why) {
+    const auto has = [](const std::vector<int>& v, int x) { return std::find(v.begin(), v.end(), x) != v.end(); };
+    if (split < 1 || split >= m.n_layers) {
+        why = "the split must leave layers on both PCs (1 to " + std::to_string(m.n_layers - 1) + ")";
+        return false;
+    }
+    if (!has(m.kv_src, split) || (!m.ix_src.empty() && !has(m.ix_src, split))) {
+        why = "the worker's first layer must write its own compressed KV and index keys - one of " + join(m.kv_src) +
+              " (V4.1: 20)";
+        return false;
+    }
+    for (int x : m.eg_layers)
+        if (x >= split) {
+            why = "Engram layer " + std::to_string(x) + " would be the worker's; the split must come after the last "
+                  "Engram layer (" + join(m.eg_layers) + ")";
+            return false;
+        }
+    if (m.cand_src >= 0 && m.cand_src < split)
+        for (int x : m.ix_src)
+            if (x > m.cand_src && x >= split) {
+                why = "the worker's layer " + std::to_string(x) + " reads the candidates of layer " +
+                      std::to_string(m.cand_src) + " before the split";
+                return false;
+            }
+    return true;
+}
+
 // ------------------------------------------------------------------ the coordinator's end
 
 Client::~Client() { close(); }
