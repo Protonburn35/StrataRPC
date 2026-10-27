@@ -83,10 +83,10 @@ The Qwen layer-stage code (`layer_stage_rpc.cpp`, the `generate.cpp` hooks, Exp2
 | Transport + codec copied, CMake `strata_stage_net` library | done |
 | Stage protocol `src/dsv41/ds4_stage.{hpp,cpp}` | done |
 | GPU-free test `tests/dsv41/ds4_stage_test.cpp` | passes, also under ASan/UBSan |
-| Engine stage mode in `ds4_model.cu` | written; not compiled with nvcc or run on a GPU yet |
+| Engine stage mode in `ds4_model.cu` | written; passes a clang CUDA syntax check (host + sm_89); not run on a GPU yet |
 | `ds4_main.cpp` flags and worker mode | written; compiles with g++ (`-fsyntax-only`) |
-| Windows workflow `.github/workflows/stratarpcd-windows.yml` | written, not run yet |
-| User guide `docs/STRATARPCD.md` and scripts in `scripts/stratarpcd/` | todo; the workflow packages them |
+| Windows workflow `.github/workflows/stratarpcd-windows.yml` | first run pending (see below) |
+| User guide `docs/STRATARPCD.md`, `scripts/stratarpcd/start-worker.ps1`, `start-coordinator.ps1` | written; the workflow parses them and dry-runs them under PowerShell 5.1 |
 
 What the engine changes do (see `git log -p src/dsv41/ds4_model.cu`):
 - **`stage_cut()`, called in `load()` after the geometry checks:** builds `ident` and cuts `Geo` and `pk.t` to the
@@ -109,6 +109,22 @@ What the engine changes do (see `git log -p src/dsv41/ds4_model.cu`):
   - `Model::load` on a coordinator waits up to `STRATA_LAYER_STAGE_WAIT` seconds (1800) for the worker.
 - **`ds4_main.cpp`:** `--layer-stage-client/-server/-split/-wire`. `STRATA_RPC_TOKEN` is required. The worker mode
   is `stage_worker()` with `StageBackend` around `Model`.
+
+How to check without a GPU (Linux):
+- **Protocol tests:** the cmake commands above.
+- **Engine compile check:** `clang++ -x cuda -std=c++17 -fsyntax-only --cuda-path=<a CUDA root> --cuda-gpu-arch=sm_89
+  -DSTRATA_VERSION='"t"' -Iinclude -Isrc/dsv41 -Isrc/prefill -Ithird_party/ggml src/dsv41/ds4_model.cu`.
+  - The CUDA root used here was assembled from PyPI wheels: `nvidia-cuda-runtime-cu12`, `nvidia-cuda-nvcc-cu12` (headers
+    and libdevice only) and `nvidia-cuda-cccl-cu12`, plus `cublas_v2.h` from `nvidia-cublas-cu12` and an empty
+    `curand_mtgp32_kernel.h`.
+  - Without a GPU, this is as far as the engine can be checked.
+- **Engine main:** `g++ -std=c++17 -fsyntax-only -DSTRATA_VERSION='"t"' -Iinclude -Isrc/dsv41 src/dsv41/ds4_main.cpp`.
+
+The Windows build (`stratarpcd-windows.yml`):
+- **Trigger:** runs on pushes to this branch that touch the engine, unless the commit title has `[skip ci]`.
+- **Steps:** it dry-runs the scripts, runs the protocol tests on Windows, builds `strata-dsv41.exe` with CUDA 13.2 for
+  sm_89 + sm_120, and uploads the artifact `StrataRPCD-engine-win-x64-cuda13-sm89-sm120`. The artifact holds the exe, the
+  cuBLAS DLLs, the scripts, `README-STRATARPCD.md` and this file.
 
 Known limits of this first version (measure before changing):
 - **The worker takes a chunk's rows one 256-row piece at a time.** It waits for each piece's copy to the GPU, which

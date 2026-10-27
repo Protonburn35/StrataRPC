@@ -50,6 +50,31 @@ jobs:
         shell: pwsh
         run: python -c "import setup; setup.get_llama_cpp()"
 
+      - name: Check the StrataRPCD launch scripts (Windows PowerShell 5.1, dry runs on a made-up setup config)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          foreach ($f in Get-ChildItem scripts/stratarpcd/*.ps1) {
+            powershell -NoProfile -Command "`$e = `$null; [void][System.Management.Automation.Language.Parser]::ParseFile('$($f.FullName)', [ref]`$null, [ref]`$e); if (`$e) { `$e | ForEach-Object { Write-Output (`$_.Extent.StartLineNumber.ToString() + ': ' + `$_.Message) }; exit 1 }"
+            if ($LASTEXITCODE -ne 0) { throw "$($f.Name) does not parse in Windows PowerShell 5.1" }
+          }
+          $t = Join-Path $env:RUNNER_TEMP "rpcd"
+          New-Item -ItemType Directory -Force (Join-Path $t "engine-rpcd") | Out-Null
+          Copy-Item scripts/stratarpcd/*.ps1 (Join-Path $t "engine-rpcd")
+          Set-Content (Join-Path $t "engine-rpcd/strata-dsv41.exe") "not an exe"
+          $cfg = @{ exe = "C:/elsewhere/strata-dsv41.exe"; cwd = $t; port = 8080; log = "$t/strata.log"; arch = "deepseek41"
+                    args = @("--pack", "$t/packs/p", "--max-context", "8192", "--eos", "1", "--vision", "off", "--dspark", "auto") }
+          [System.IO.File]::WriteAllText((Join-Path $t "strata-deepseek-v4.1-flash-ist-das-2.00bpw.json"), ($cfg | ConvertTo-Json -Depth 5))
+          $env:STRATA_RPC_TOKEN = "test"
+          $w = powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $t "engine-rpcd/start-worker.ps1") -DryRun | Out-String
+          Write-Output $w
+          if ($w -notmatch "DRYRUN worker: .*--pack .*--max-context 8192 .*--layer-stage-server 0\.0\.0\.0:39501 --layer-stage-split 20 --layer-stage-wire fp32") { throw "start-worker.ps1 built the wrong command" }
+          $c = powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $t "engine-rpcd/start-coordinator.ps1") -Worker 10.0.0.2:39501 -Wire bf16 -Context 4096 -Port 8081 -DryRun | Out-String
+          Write-Output $c
+          if ($c -notmatch "DRYRUN coordinator: .*--port 8081") { throw "start-coordinator.ps1 did not stop at the dry run" }
+          python -c "import json,sys; c=json.load(open(sys.argv[1],encoding='utf-8')); a=c['args']; print(a); assert a.count('--max-context')==1 and a[a.index('--max-context')+1]=='4096'; assert a[-6:]==['--layer-stage-client','10.0.0.2:39501','--layer-stage-split','20','--layer-stage-wire','bf16']; assert c['exe'].endswith('engine-rpcd\\strata-dsv41.exe') and c['port']==8081" (Join-Path $t "strata-stratarpcd-coordinator.json")
+          if ($LASTEXITCODE -ne 0) { throw "the coordinator config is wrong" }
+
       - name: Layer-stage protocol tests (no GPU)
         shell: cmd /C call {0}
         run: |

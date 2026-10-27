@@ -9863,8 +9863,7 @@ struct Model::Impl {
                 stage_step_ms += now_ms() - t0;
                 stage_step_wait += link->wait_ms() - w0;
                 if (++stage_steps % 256 == 0) {
-                    std::fprintf(stderr, "ds4 stage: last 256 steps %.1f ms a token, %.1f of it waiting on the worker
-",
+                    std::fprintf(stderr, "ds4 stage: last 256 steps %.1f ms a token, %.1f of it waiting on the worker\n",
                                  stage_step_ms / 256, stage_step_wait / 256);
                     stage_step_ms = stage_step_wait = 0;
                 }
@@ -9887,8 +9886,7 @@ struct Model::Impl {
             return false;
         }
         if (stage_stats)
-            std::fprintf(stderr, "ds4 stage: prompt of %d tokens in %.0f ms: %.0f MB to the worker, %.0f ms waiting on it
-",
+            std::fprintf(stderr, "ds4 stage: prompt of %d tokens in %.0f ms: %.0f MB to the worker, %.0f ms waiting on it\n",
                          n, now_ms() - t0, (double) (link->bytes_sent() - b0) / 1e6, link->wait_ms() - w0);
         return true;
     }

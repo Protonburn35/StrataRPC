@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -776,8 +777,8 @@ bool Server::serve(rpc::Socket s, std::string& err) {
                             return false;
                         }
                         if (f_at > 0) {   // (the queue's taken front dropped before it grows)
-                            fh.erase(fh.begin(), fh.begin() + (long) (f_at * hf));
-                            fpre.erase(fpre.begin(), fpre.begin() + (long) (f_at * kPreFloats));
+                            fh.erase(fh.begin(), fh.begin() + (std::ptrdiff_t) (f_at * hf));
+                            fpre.erase(fpre.begin(), fpre.begin() + (std::ptrdiff_t) (f_at * kPreFloats));
                             f_at = 0;
                         }
                         fh.resize((f_n + rT) * hf);
