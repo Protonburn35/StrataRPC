@@ -85,7 +85,7 @@ The Qwen layer-stage code (`layer_stage_rpc.cpp`, the `generate.cpp` hooks, Exp2
 | GPU-free test `tests/dsv41/ds4_stage_test.cpp` | passes, also under ASan/UBSan |
 | Engine stage mode in `ds4_model.cu` | written; passes a clang CUDA syntax check (host + sm_89); not run on a GPU yet |
 | `ds4_main.cpp` flags and worker mode | written; compiles with g++ (`-fsyntax-only`) |
-| Windows workflow `.github/workflows/stratarpcd-windows.yml` | first run pending (see below) |
+| Windows workflow `.github/workflows/stratarpcd-windows.yml` | scripts and protocol tests pass on Windows; the engine build is not green yet (C++ dialect, see below) |
 | User guide `docs/STRATARPCD.md`, `scripts/stratarpcd/start-worker.ps1`, `start-coordinator.ps1` | written; the workflow parses them and dry-runs them under PowerShell 5.1 |
 
 What the engine changes do (see `git log -p src/dsv41/ds4_model.cu`):
@@ -128,9 +128,19 @@ The Windows build (`stratarpcd-windows.yml`):
 
 Windows build notes:
 - **mainline's CUDA sources need C++20.** Run 1 forced C++17 and stopped in `iq_kernels.cu`. Run 2 gave no dialect,
-  so nvcc followed MSVC's default (C++14) and stopped at the first nested namespace.
-- **The workflow therefore passes `-DCMAKE_CUDA_FLAGS=--std=c++20`.** It uses the flag rather than
-  `CMAKE_CUDA_STANDARD`, which CMake may leave out when it takes nvcc's default as enough.
+  so nvcc followed MSVC's default (C++14) and stopped at the first nested namespace (`device.hpp`, in `strata_core`).
+- **Run 3 passed `-DCMAKE_CUDA_FLAGS=--std=c++20` and failed exactly like run 2.** This nvcc (conda's 13.2, with VS 2022
+  Enterprise from `VsDevCmd`) seems to drop C++20 silently. Mainline's own note (setup.py, #3566) says nvcc does that
+  under VS 2019. Mainline builds with NVIDIA's installer toolkit and BuildTools `vcvars64` instead.
+- **Run 4 onward:** `.github/stratarpcd/nvcc-dialect.ps1` runs before CMake. It compiles a small C++20 file with several
+  flag sets, prints `cl.exe`'s version and any `NVCC_*` variables, and the build uses the first flag set that works.
+  When none works, it prints `nvcc --dryrun` (the `cudafe++` line shows the dialect nvcc really passed) and the step
+  stops there, a few minutes in.
+- **If no flag set works:** the next thing to try is NVIDIA's installer CUDA 13.0 (as mainline's
+  `packaging/build_dsv41_windows.bat` uses) instead of the conda packages.
+- **When the build fails,** the step prints the first failed command in full, so the flags nvcc got are visible.
+- **`strata-dsv41` now links `strata_stage_net`** (it did not before; that would have been a link error after
+  compiling).
 
 Known limits of this first version (measure before changing):
 - **The worker takes a chunk's rows one 256-row piece at a time.** It waits for each piece's copy to the GPU, which
