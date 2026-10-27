@@ -143,7 +143,10 @@ jobs:
           New-Item -ItemType Directory -Force $out | Out-Null
           Copy-Item build-dsv41/strata-dsv41.exe $out/
           # the NVIDIA DLLs the exe imports, from the toolkit it was built with
-          $bin = Join-Path $env:CONDA_PREFIX "Library/bin"
+          # (the micromamba environment is activated in the cmd steps only, so CONDA_PREFIX is not set in this one)
+          $prefix = if ($env:CONDA_PREFIX) { $env:CONDA_PREFIX } else { Join-Path $env:MAMBA_ROOT_PREFIX "envs/cuda-build" }
+          $bin = Join-Path $prefix "Library/bin"
+          if (-not (Test-Path $bin)) { throw "no CUDA bin folder at $bin" }
           $deps = Get-Content deps.txt | ForEach-Object { $_.Trim() } | Where-Object { $_ -match '^(cublas|cublasLt|cudart)\S*\.dll$' }
           foreach ($d in $deps) {
             $src = Join-Path $bin $d

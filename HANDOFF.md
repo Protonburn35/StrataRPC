@@ -85,7 +85,7 @@ The Qwen layer-stage code (`layer_stage_rpc.cpp`, the `generate.cpp` hooks, Exp2
 | GPU-free test `tests/dsv41/ds4_stage_test.cpp` | passes, also under ASan/UBSan |
 | Engine stage mode in `ds4_model.cu` | written; passes a clang CUDA syntax check (host + sm_89); not run on a GPU yet |
 | `ds4_main.cpp` flags and worker mode | written; compiles with g++ (`-fsyntax-only`) |
-| Windows workflow `.github/workflows/stratarpcd-windows.yml` | scripts and protocol tests pass on Windows; the engine build is not green yet (C++ dialect, see below) |
+| Windows workflow `.github/workflows/stratarpcd-windows.yml` | scripts and protocol tests pass on Windows; the engine compiles and links (run 6); packaging fix in run 7 |
 | User guide `docs/STRATARPCD.md`, `scripts/stratarpcd/start-worker.ps1`, `start-coordinator.ps1` | written; the workflow parses them and dry-runs them under PowerShell 5.1 |
 
 What the engine changes do (see `git log -p src/dsv41/ds4_model.cu`):
@@ -141,7 +141,10 @@ Windows build notes:
   stops a few minutes in.
 - **Run 5:** with the 14.4x toolset nvcc passed `--ms_c++20`; only the probe's own test file was wrong (it called a
   host function from a kernel). Fixed in run 6.
-- **If that still fails:** the next thing to try is NVIDIA's installer CUDA 13.0 (as mainline's
+- **Run 6 compiled and linked `strata-dsv41.exe`** (the build step took 31 minutes). Only the Package step failed:
+  `CONDA_PREFIX` is not set in a pwsh step (micromamba activates the environment for cmd only). Run 7 finds the
+  environment under `MAMBA_ROOT_PREFIX\envs\cuda-build` instead.
+- **If the dialect problem comes back:** the next thing to try is NVIDIA's installer CUDA 13.0 (as mainline's
   `packaging/build_dsv41_windows.bat` uses) instead of the conda packages; the network installers are at
   `https://developer.download.nvidia.com/compute/cuda/<13.x.y>/network_installers/cuda_<13.x.y>_windows_network.exe`.
 - **When the build fails,** the step prints the first failed command in full, so the flags nvcc got are visible.
