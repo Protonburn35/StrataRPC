@@ -72,6 +72,10 @@ PCs yet: you test it first.
    New-NetFirewallRule -DisplayName "StrataRPCD worker" -Direction Inbound -Protocol TCP -LocalPort 39501 -Action Allow -Profile Private
    ```
 
+   - **Limiting it to your PCs:** add `-RemoteAddress <A's IP>,192.168.50.129` (A and the laptop, which may connect
+     to C in the three-PC version), or `-RemoteAddress LocalSubnet` for any device on the home network. A changed IP
+     is then blocked (A shows `waiting for the worker at ...`); a DHCP reservation in the router keeps the IPs fixed.
+     To change the list: `Get-NetFirewallRule -DisplayName "StrataRPCD worker" | Set-NetFirewallAddressFilter -RemoteAddress <IPs>`.
    - **Reusing StrataRPC's rule instead:** StrataRPC (Qwen) uses port 39001. If C already allows that port, start C with
      `-Listen 0.0.0.0:39001` and A with `-Worker 192.168.50.143:39001`. Only one worker can hold the port, so stop the Qwen
      worker first. A rule that allows a program (`strata.exe`) rather than a port does not cover `strata-dsv41.exe`.
