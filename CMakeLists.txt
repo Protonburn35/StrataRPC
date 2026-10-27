@@ -285,6 +285,30 @@ if(STRATA_WERROR)
     $<$<COMPILE_LANGUAGE:HIP>:-Werror>)
 endif()
 
+# ---- StrataRPC: the layer-stage link ----------------------------------------
+# The TCP transport, the activation codec and the DeepSeek stage protocol (src/dsv41/ds4_stage.cpp, two PCs each
+# running part of the layers): plain C++, no GPU, so -DSTRATA_BUILD_STAGE_TESTS=ON builds and runs the protocol test
+# on any machine.  strata-dsv41 links it for --layer-stage-client / --layer-stage-server.
+option(STRATA_BUILD_STAGE_TESTS "Build the layer-stage protocol tests (no GPU needed)" OFF)
+if(STRATA_BUILD_DSV41 OR STRATA_BUILD_STAGE_TESTS)
+  find_package(Threads REQUIRED)
+  add_library(strata_stage_net STATIC src/core/rpc_transport.cpp src/core/layer_stage_codec.cpp src/dsv41/ds4_stage.cpp)
+  target_include_directories(strata_stage_net PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41)
+  target_link_libraries(strata_stage_net PUBLIC Threads::Threads PRIVATE strata_warnings)
+  if(WIN32)
+    target_link_libraries(strata_stage_net PUBLIC ws2_32)
+  endif()
+endif()
+if(STRATA_BUILD_STAGE_TESTS)
+  enable_testing()
+  add_executable(ds4_stage_test tests/dsv41/ds4_stage_test.cpp)
+  target_link_libraries(ds4_stage_test PRIVATE strata_stage_net strata_warnings)
+  add_test(NAME ds4_stage_test COMMAND ds4_stage_test)
+  add_executable(rpc_transport_test tests/core/rpc_transport_test.cpp)
+  target_link_libraries(rpc_transport_test PRIVATE strata_stage_net strata_warnings)
+  add_test(NAME rpc_transport_test COMMAND rpc_transport_test)
+endif()
+
 # ---- strata_artifact -------------------------------------------------------
 # Header-only, and that is a deliberate property rather than an unfinished split: the GGUF reader and the
 # scalar dequantizers hold no state worth hiding, and a header-only boundary cannot introduce a
