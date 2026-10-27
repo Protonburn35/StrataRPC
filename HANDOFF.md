@@ -151,6 +151,11 @@ Windows build notes:
 - **Run 7 is green** (31 minutes of compiling, then packaging and upload). The artifact (407 MB zipped) holds
   `strata-dsv41.exe`, `cublas64_13.dll`, `cublasLt64_13.dll`, both start scripts, `README-STRATARPCD.md`, this file
   and `BUILD.txt`. cudart is linked statically.
+- **PC A setup passed (2026-10-27)** with run 7's exe: SHA-256 of the `hf download` files, pack built (with DSpark and
+  the vision tower), and setup's single-PC test question answered sensibly on the RTX 4090 (sm_89, stage mode off).
+  Setup moved the files from `C:\StrataRPCD\models` to `C:\Strata-data\models\deepseek-v4.1-flash-IST-DAS-2.00bpw`
+  (its shared data folder; the user is fine with that) and the pack is in `C:\Strata-data\packs\`. The config is
+  `C:\StrataRPCD\strata-deepseek-v4.1-flash-ist-das-2.00bpw.json` (API port 8080). PC C's setup is next (sm_120).
 - **Next step: the user runs it on A and C** (docs/STRATARPCD.md, "What to test, in order"). Nothing in stage mode has
   run on a GPU yet, so the first logs are the first real test of `ds4_model.cu`'s stage hooks.
 - **If the dialect problem comes back:** the next thing to try is NVIDIA's installer CUDA 13.0 (as mainline's
