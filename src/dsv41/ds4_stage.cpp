@@ -192,7 +192,7 @@ double ms_since(std::chrono::steady_clock::time_point t0) {
 bool same_spec(const Spec& a, const Spec& b, std::string& why) {
     why.clear();
     if (a.identity_a != b.identity_a || a.identity_b != b.identity_b)
-        why = "the two PCs load different models (their packs' geometry or tensors differ)";
+        why = "the two PCs load different models (their packs' geometry or tensors differ) or --experts differs";
     else if (a.n_layers != b.n_layers || a.dim != b.dim || a.hc != b.hc || a.vocab != b.vocab)
         why = "the model geometry differs";
     else if (a.split != b.split)

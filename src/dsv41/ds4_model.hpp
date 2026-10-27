@@ -61,6 +61,15 @@ struct Options {
     bool vision = true;               // the vision tower (the checkpoint's vision.* / aligner.*), when it has one
     bool vision_only = false;         // (tests) load the vision tower alone: encode_image() and nothing else
     bool verbose = false;
+    // StrataRPC layer stage (ds4_stage.hpp): this process runs the model's layers [stage_begin, stage_end) (-1: to the
+    // last).  The coordinator (stage_begin 0, stage_end the split) holds the embedding table and the Engram tables and
+    // hands its last layer's rows to the worker at stage_client; the worker (stage_begin the split) holds the rest and
+    // the head, and gets its rows through set_stage_rows().  DSpark, vision and conversation slots are off in a stage;
+    // experts per word default to the model's (full quality) so both stages agree.  0 / -1: the whole model, as before.
+    int stage_begin = 0, stage_end = -1;
+    std::string stage_client;         // the coordinator: the worker's host:port
+    std::string stage_token;          // the shared secret (STRATA_RPC_TOKEN)
+    int stage_wire = 0;               // h on the link: 0 FP32 (exact), 1 BF16, 2 FP16 (both lossy)
 };
 
 /// A picture in the prompt: its span's rows (every position of the span carries the image token), BF16 [span][dim]
@@ -185,6 +194,16 @@ public:
     /// The pictures of the prompt about to be fed ({}: none): positions inside a span read its rows (and route with
     /// the image bias, and take no part in the Engram n-grams); the rest the embedding table's.
     void set_images(std::vector<Image> images);
+
+    /// StrataRPC worker: where the next feeds' input rows come from - h [T][hc * dim] then pre [T][8] for positions
+    /// p0 .. p0 + T - 1, in order (the coordinator's last layer's hand-off).  false with err: they did not come.
+    using StageRows = std::function<bool(int64_t p0, int T, float* h, float* pre, std::string& err)>;
+    void set_stage_rows(StageRows f);
+    /// The layer-stage handshake's values: the whole model's identity (geometry, tensors, experts per word), its layer
+    /// count, the residual streams a row holds (hc)
+    const std::string& stage_identity() const;
+    int stage_layers() const;
+    int hc() const;
 
     void save_profile() const;
     const Stats& stats() const;

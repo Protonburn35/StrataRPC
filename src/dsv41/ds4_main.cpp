@@ -23,6 +23,7 @@
 #include "ds4_os.hpp"
 #include "ds4_packinfo.hpp"
 #include "ds4_slotmeta.hpp"
+#include "ds4_stage.hpp"   // StrataRPC: --layer-stage-client / --layer-stage-server
 
 #include <algorithm>
 #include <cmath>
@@ -91,7 +92,60 @@ void usage() {
                  "           [--vision on|off] [--mmap-experts on|off|auto]\n"
                  "           (--ids I,J,... [--images FILE] [--n N] [--dump-logits FILE] | --serve\n"
                  "           | --encode-image FILE.rgb --size WxH --dump-image OUT\n"
-                 "           | --pack-info)\n");
+                 "           | --pack-info)\n"
+                 "  StrataRPC layer stage (two PCs, the model split by layers; both need STRATA_RPC_TOKEN set to the same secret):\n"
+                 "           --layer-stage-split K           the worker's first layer (V4.1: 20)\n"
+                 "           --layer-stage-server HOST:PORT  the worker: layers K.. and the head, serving the coordinator\n"
+                 "           --layer-stage-client HOST:PORT  the coordinator (with --serve): layers ..K-1, the worker at HOST:PORT\n"
+                 "           --layer-stage-wire fp32|bf16|fp16  the rows on the link (fp32 exact, the default; the others lossy)\n");
+}
+
+// StrataRPC: the worker stage's model as the layer-stage server drives it (ds4_stage.hpp) - its feeds take their rows from
+// the coordinator, which owns the conversation; the profile is written back whenever a coordinator starts over
+struct StageBackend : strata::ds4::stage::Backend {
+    strata::ds4::Model& m;
+    explicit StageBackend(strata::ds4::Model& mm) : m(mm) {}
+    int64_t pos() const override { return m.pos(); }
+    void reset() override {
+        if (m.pos() > 0) m.save_profile();
+        m.reset();
+    }
+    void checkpoint(int slot) override { m.checkpoint(slot); }
+    bool restore(int64_t limit) override { return m.restore(limit); }
+    void pin() override { m.pin(); }
+    bool feed(const int32_t* t, int n, int logits_rows, int snap_slot, const strata::ds4::stage::RowFn& rows,
+              std::string& err) override {
+        m.set_stage_rows(rows);
+        const bool ok = snap_slot >= 0 ? m.feed_mark(t, n, logits_rows, snap_slot, err) : m.feed(t, n, logits_rows, err);
+        m.set_stage_rows(nullptr);
+        return ok;
+    }
+    int sample(const strata::ds4::stage::Sampling& s) override {
+        return m.sample(s.temperature, s.top_p, s.top_k, s.min_p, s.seed, s.counter);
+    }
+    bool logits(std::vector<float>& out) override { return m.logits(out); }
+};
+
+int stage_worker(strata::ds4::Model& m, const strata::ds4::Options& o, const std::string& endpoint) {
+    namespace st = strata::ds4::stage;
+    st::Spec spec;
+    spec.n_layers = (uint32_t) m.stage_layers();
+    spec.split = (uint32_t) o.stage_begin;
+    spec.dim = (uint32_t) m.dim();
+    spec.hc = (uint32_t) m.hc();
+    spec.vocab = (uint32_t) m.vocab();
+    spec.max_context = (uint64_t) m.max_context();
+    spec.wire = (st::LayerStageWireFormat) o.stage_wire;
+    st::hash_text(m.stage_identity(), spec.identity_a, spec.identity_b);
+    StageBackend backend(m);
+    st::Server server(o.stage_token, spec, backend);
+    std::printf("READY layer-stage worker %s\n", endpoint.c_str());
+    std::fflush(stdout);
+    std::string err;
+    server.serve_forever(endpoint, err);
+    std::fprintf(stderr, "maya-ds4: the layer-stage worker stopped: %s\n", err.c_str());
+    m.save_profile();
+    return 1;
 }
 
 // stdin lines on a thread, so a request can see STOP while it decodes
@@ -1199,6 +1253,8 @@ int main(int argc, char** argv) {
     std::string images, enc_rgb, enc_out;
     std::string score_ids, score_out, prof_ids, spec_ids;
     int enc_w = 0, enc_h = 0;
+    std::string stage_server, stage_wire = "fp32";   // StrataRPC layer stage
+    int stage_split = -1;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto val = [&](const char* what) -> std::string {
@@ -1269,6 +1325,10 @@ int main(int argc, char** argv) {
         else if (a == "--serve") serve_mode = true;
         else if (a == "--pack-info") pack_info_mode = true;
         else if (a == "--layer-split") (void) val("--layer-split");   // the server's (this engine balances its own split)
+        else if (a == "--layer-stage-client") o.stage_client = val("--layer-stage-client");
+        else if (a == "--layer-stage-server") stage_server = val("--layer-stage-server");
+        else if (a == "--layer-stage-split") stage_split = std::atoi(val("--layer-stage-split").c_str());
+        else if (a == "--layer-stage-wire") stage_wire = val("--layer-stage-wire");
         else if (a == "--help" || a == "-h") {
             usage();
             return 0;
@@ -1285,9 +1345,39 @@ int main(int argc, char** argv) {
         }
         return strata::ds4::pack_info(o.pack, stdout);
     }
-    if (o.pack.empty() || (!serve_mode && ids_s.empty() && enc_rgb.empty() && score_ids.empty() && prof_ids.empty() && spec_ids.empty())) {
+    if (o.pack.empty() || (!serve_mode && stage_server.empty() && ids_s.empty() && enc_rgb.empty() && score_ids.empty() &&
+                           prof_ids.empty() && spec_ids.empty())) {
         usage();
         return 2;
+    }
+    if (!o.stage_client.empty() || !stage_server.empty()) {   // StrataRPC: this PC's part of a layer stage split
+        strata::core::LayerStageWireFormat wf;
+        if (!o.stage_client.empty() && !stage_server.empty()) {
+            std::fprintf(stderr, "maya-ds4: --layer-stage-client and --layer-stage-server are the two PCs' roles: one each\n");
+            return 2;
+        }
+        if (stage_split < 1) {
+            std::fprintf(stderr, "maya-ds4: --layer-stage-split K (the worker's first layer; V4.1: 20) on both PCs\n");
+            return 2;
+        }
+        if (!strata::ds4::stage::parse_wire(stage_wire, wf)) {
+            std::fprintf(stderr, "maya-ds4: --layer-stage-wire fp32, bf16 or fp16\n");
+            return 2;
+        }
+        const char* tok = std::getenv("STRATA_RPC_TOKEN");
+        if (tok == nullptr || tok[0] == '\0') {
+            std::fprintf(stderr, "maya-ds4: set STRATA_RPC_TOKEN to the same secret on both PCs\n");
+            return 2;
+        }
+        if (!stage_server.empty() && (serve_mode || !ids_s.empty() || !score_ids.empty() || !prof_ids.empty() ||
+                                      !spec_ids.empty() || !enc_rgb.empty())) {
+            std::fprintf(stderr, "maya-ds4: --layer-stage-server runs the worker only (the coordinator serves the API)\n");
+            return 2;
+        }
+        o.stage_token = tok;
+        o.stage_wire = (int) wf;
+        o.stage_begin = stage_server.empty() ? 0 : stage_split;
+        o.stage_end = stage_server.empty() ? stage_split : -1;
     }
     if (o.profile.empty()) o.profile = o.pack + "/expert-profile.bin";   // "none": no profile
     if (o.profile == "none") o.profile.clear();
@@ -1300,6 +1390,7 @@ int main(int argc, char** argv) {
     }
     if (!o.vision_only) std::fprintf(stderr, "%s", m.describe().c_str());
     if (const char* idle = std::getenv("DS4_TEST_IDLE_MS")) std::this_thread::sleep_for(std::chrono::milliseconds(std::atoi(idle)));   // (tests: a person typing)
+    if (!stage_server.empty()) return stage_worker(m, o, stage_server);
     if (serve_mode) return serve(m, eos, spec, o.dspark_conf, o.pack);
     const int window_given = window;
     if (window == 0) window = 16;   // (the scoring / profiling runs; the plain run below takes the model's feed unit)

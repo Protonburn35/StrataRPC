@@ -83,18 +83,40 @@ The Qwen layer-stage code (`layer_stage_rpc.cpp`, the `generate.cpp` hooks, Exp2
 | Transport + codec copied, CMake `strata_stage_net` library | done |
 | Stage protocol `src/dsv41/ds4_stage.{hpp,cpp}` | done |
 | GPU-free test `tests/dsv41/ds4_stage_test.cpp` | passes, also under ASan/UBSan |
-| Engine stage mode in `ds4_model.cu` (load only own layers, import/export rows) | **next** |
-| `ds4_main.cpp` flags and the worker main loop | todo |
-| Windows CUDA workflow building `strata-dsv41.exe` + package | todo |
-| User guide (StrataRPCD folder, model download, pack, commands, test plan) | todo |
+| Engine stage mode in `ds4_model.cu` | written; not compiled with nvcc or run on a GPU yet |
+| `ds4_main.cpp` flags and worker mode | written; compiles with g++ (`-fsyntax-only`) |
+| Windows workflow `.github/workflows/stratarpcd-windows.yml` | written, not run yet |
+| User guide `docs/STRATARPCD.md` and scripts in `scripts/stratarpcd/` | todo; the workflow packages them |
 
-Run the GPU-free tests (Linux or Windows, no CUDA needed):
+What the engine changes do (see `git log -p src/dsv41/ds4_model.cu`):
+- **`stage_cut()`, called in `load()` after the geometry checks:** builds `ident` and cuts `Geo` and `pk.t` to the
+  stage's layers.
+  - `lb` is the global index of local layer 0; layer names use `il + lb`.
+  - DSpark and vision are off; experts per word default to the model's (full quality).
+- **Coordinator (`stage_out`):** no head (`head_b` 0, no `head`/`norm.weight`/`d.logits`). Its last layer's rows go
+  through `stage_export()` in `forward_serial`, `run_dev`, `run_dev_chunks` and `run_dev_layers`.
+- **Worker (`stage_in`):** no embedding table and no Engram. Its first layer's rows come through `stage_import()` from
+  `stage_rows` at the same four places. `yoco_layer()` accepts `yl == 0` on a worker, so layers 21-39 keep the
+  long-prompt shortcut.
+- **Rows** move in pieces of 256 through pinned `sx_h` / `sx_pre`.
+- **One GPU per stage is required** (`--gpu N` picks it).
+- **Public wrappers at the end of `ds4_model.cu`:**
+  - `feed` / `feed_mark` / `step` go through `Impl::stage_feed` on a coordinator: WINDOW for n <= 16 without a
+    checkpoint mark, otherwise PROMPT + ROWS.
+  - `sample` / `logits` are answered by the worker.
+  - `reset` / `checkpoint` / `restore` / `pin` act on both ends; `reset` reconnects after a failure.
+  - `slot_save` / `slot_load` are refused.
+  - `Model::load` on a coordinator waits up to `STRATA_LAYER_STAGE_WAIT` seconds (1800) for the worker.
+- **`ds4_main.cpp`:** `--layer-stage-client/-server/-split/-wire`. `STRATA_RPC_TOKEN` is required. The worker mode
+  is `stage_worker()` with `StageBackend` around `Model`.
 
-```sh
-cmake -S . -B build-stage -DSTRATA_ENABLE_CUDA=OFF -DSTRATA_ENABLE_HIP=OFF -DSTRATA_BUILD_STAGE_TESTS=ON
-cmake --build build-stage --target ds4_stage_test rpc_transport_test
-ctest --test-dir build-stage -R "ds4_stage_test|rpc_transport_test" --output-on-failure
-```
+Known limits of this first version (measure before changing):
+- **The worker takes a chunk's rows one 256-row piece at a time.** It waits for each piece's copy to the GPU, which
+  is queued behind the previous chunk's work. So during a prompt, the network transfer does not overlap the worker's
+  compute.
+- **The coordinator's device thread sends each chunk before it starts the next.** The fix for both is a receiver or
+  sender thread with a host buffer.
+- **Each decode step is two round trips** (WINDOW, then SAMPLE); folding SAMPLE into WINDOW would make it one.
 
 ## Plan for the engine changes (`src/dsv41/ds4_model.cu`, mainline line numbers at 5e8a4cc)
 
