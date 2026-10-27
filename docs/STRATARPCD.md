@@ -30,8 +30,12 @@ PCs yet: you test it first.
    ```powershell
    cd C:\StrataRPCD
    $env:STRATA_DSV41_EXE = "C:\StrataRPCD\engine-rpcd\strata-dsv41.exe"
-   .\START-HERE.bat --family deepseek41 --model IST-DAS-2.00bpw --no-start
+   .\START-HERE.bat --family deepseek41 --model IST-DAS-2.00bpw --vision no --no-start
    ```
+
+   `--vision no` skips the picture reader (`mmproj-BF16.gguf`, 1 GB), which the two-PC split does not use. Setup would
+   otherwise put it at `C:\StrataRPCD\models\deepseek-v4.1-flash-shared\mmproj-BF16.gguf` and build it into the pack.
+   Either way the split works: the handshake ignores the vision weights.
 
    - **Download:** setup fetches 257 GB into `C:\StrataRPCD\models\` (the 138 GB model, the 111 GB Engram table and
      the 8 GB drafter).
