@@ -12,7 +12,7 @@ $src = Join-Path $d "probe.cu"
 $obj = Join-Path $d "probe.obj"
 # a nested namespace (C++17: device.hpp), a concept and a lambda with template parameters (C++20: iq_kernels.cu)
 [System.IO.File]::WriteAllText($src, @'
-namespace a::b { inline int one() { return 1; } }
+namespace a::b { __host__ __device__ inline int one() { return 1; } }
 template <class T> concept word = sizeof(T) <= 8;
 template <word T> __device__ T same(T x) { return x; }
 __global__ void k(int* p) { auto g = []<class T>(T x) { return x; }; *p = g(same(a::b::one())); }

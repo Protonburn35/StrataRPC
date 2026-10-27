@@ -139,6 +139,8 @@ Windows build notes:
   (`-vcvars_ver=`). The probe still runs first: the build uses the first flag set that compiles, and when none does it
   prints `nvcc --dryrun` (the `cudafe++` line shows the dialect nvcc really passed: `--ms_c++14` was the bad sign) and
   stops a few minutes in.
+- **Run 5:** with the 14.4x toolset nvcc passed `--ms_c++20`; only the probe's own test file was wrong (it called a
+  host function from a kernel). Fixed in run 6.
 - **If that still fails:** the next thing to try is NVIDIA's installer CUDA 13.0 (as mainline's
   `packaging/build_dsv41_windows.bat` uses) instead of the conda packages; the network installers are at
   `https://developer.download.nvidia.com/compute/cuda/<13.x.y>/network_installers/cuda_<13.x.y>_windows_network.exe`.
