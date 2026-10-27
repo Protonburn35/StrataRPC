@@ -129,15 +129,19 @@ The Windows build (`stratarpcd-windows.yml`):
 Windows build notes:
 - **mainline's CUDA sources need C++20.** Run 1 forced C++17 and stopped in `iq_kernels.cu`. Run 2 gave no dialect,
   so nvcc followed MSVC's default (C++14) and stopped at the first nested namespace (`device.hpp`, in `strata_core`).
-- **Run 3 passed `-DCMAKE_CUDA_FLAGS=--std=c++20` and failed exactly like run 2.** This nvcc (conda's 13.2, with VS 2022
-  Enterprise from `VsDevCmd`) seems to drop C++20 silently. Mainline's own note (setup.py, #3566) says nvcc does that
-  under VS 2019. Mainline builds with NVIDIA's installer toolkit and BuildTools `vcvars64` instead.
-- **Run 4 onward:** `.github/stratarpcd/nvcc-dialect.ps1` runs before CMake. It compiles a small C++20 file with several
-  flag sets, prints `cl.exe`'s version and any `NVCC_*` variables, and the build uses the first flag set that works.
-  When none works, it prints `nvcc --dryrun` (the `cudafe++` line shows the dialect nvcc really passed) and the step
-  stops there, a few minutes in.
-- **If no flag set works:** the next thing to try is NVIDIA's installer CUDA 13.0 (as mainline's
-  `packaging/build_dsv41_windows.bat` uses) instead of the conda packages.
+- **Run 3 passed `-DCMAKE_CUDA_FLAGS=--std=c++20` and failed exactly like run 2.**
+- **Run 4 found why.** `.github/stratarpcd/nvcc-dialect.ps1` (it runs before CMake: it compiles a small C++20 file with
+  several flag sets and prints `cl.exe`'s version) showed `cl.exe` 19.29, the VS 2019 toolset (MSVC 14.29) that the VS
+  2022 image also has. The conda CUDA environment's activation selects it, and `VsDevCmd` kept it. With it, nvcc prints
+  "The -std=c++20 flag is not supported with the configured host compiler. Flag will be ignored." This is mainline's
+  #3566 (setup.py), which is why mainline builds with VS 2022's own toolset.
+- **Run 5 onward:** both Windows steps pick the newest `14.4x` toolset under VS 2022 by name and pass it to `VsDevCmd`
+  (`-vcvars_ver=`). The probe still runs first: the build uses the first flag set that compiles, and when none does it
+  prints `nvcc --dryrun` (the `cudafe++` line shows the dialect nvcc really passed: `--ms_c++14` was the bad sign) and
+  stops a few minutes in.
+- **If that still fails:** the next thing to try is NVIDIA's installer CUDA 13.0 (as mainline's
+  `packaging/build_dsv41_windows.bat` uses) instead of the conda packages; the network installers are at
+  `https://developer.download.nvidia.com/compute/cuda/<13.x.y>/network_installers/cuda_<13.x.y>_windows_network.exe`.
 - **When the build fails,** the step prints the first failed command in full, so the flags nvcc got are visible.
 - **`strata-dsv41` now links `strata_stage_net`** (it did not before; that would have been a link error after
   compiling).
