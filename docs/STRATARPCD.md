@@ -72,6 +72,15 @@ PCs yet: you test it first.
    New-NetFirewallRule -DisplayName "StrataRPCD worker" -Direction Inbound -Protocol TCP -LocalPort 39501 -Action Allow -Profile Private
    ```
 
+   - **Reusing StrataRPC's rule instead:** StrataRPC (Qwen) uses port 39001. If C already allows that port, start C with
+     `-Listen 0.0.0.0:39001` and A with `-Worker 192.168.50.143:39001`. Only one worker can hold the port, so stop the Qwen
+     worker first. A rule that allows a program (`strata.exe`) rather than a port does not cover `strata-dsv41.exe`.
+   - **To see what C's rules allow:**
+
+     ```powershell
+     Get-NetFirewallRule -Direction Inbound | Where-Object DisplayName -like "*Strata*" | ForEach-Object { "{0}: port {1}, program {2}" -f $_.DisplayName, ($_ | Get-NetFirewallPortFilter).LocalPort, ($_ | Get-NetFirewallApplicationFilter).Program }
+     ```
+
 ## Each time
 
 Pick a long random secret and use the same one on both PCs, in every window you start them from.
