@@ -60,8 +60,16 @@ PCs yet: you test it first.
    .\START-HERE.bat --family deepseek41 --model IST-DAS-2.00bpw --no-start
    ```
 
-   - **Pack:** setup builds the pack under `C:\StrataRPCD\packs\` and writes
-     `strata-deepseek-v4.1-flash-ist-das-2.00bpw.json`, which the start scripts read.
+   - **Where the files end up:** setup first moves `C:\StrataRPCD\models` into Strata's shared data folder,
+     `C:\Strata-data` (it prints `model files from C:\StrataRPCD moved to C:\Strata-data`). On the same drive this is
+     instant and copies nothing. The Qwen setup's files there are not touched. The pack goes to `C:\Strata-data\packs\`.
+   - **"Download: 138 GB to fetch" is not a download:** files from `hf download` lack setup's `.done` marks, so setup
+     counts them first. In step 5 it finds each file complete (by its size on Hugging Face), checks its SHA-256 (about
+     5 minutes for all of them) and marks it. It downloads only a file that is missing, short, or fails the check.
+   - **The RAM warning:** with 32 GB of RAM setup warns that one PC alone is slow and asks `Install it anyway?`.
+     Answer `y`: the split is what makes it fit.
+   - **Config:** setup writes `C:\StrataRPCD\strata-deepseek-v4.1-flash-ist-das-2.00bpw.json`, which the start
+     scripts read.
    - **Test:** it then has this one PC answer a 16-word test question, which checks the new engine on its own.
    - **To skip the test:** set `$env:STRATA_DSV41_NO_SMOKE = "1"`.
    - **Pictures:** setup builds the picture reader into the pack. The two-PC split leaves it off for now.
