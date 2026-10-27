@@ -1376,6 +1376,13 @@ int main(int argc, char** argv) {
         }
         o.stage_token = tok;
         o.stage_wire = (int) wf;
+        // conversation slots are off in a stage (Model::slot_save refuses): off here too, so the serve loop neither tries
+        // them nor clears the slot folder of a single-PC run's slots (another model identity to it)
+#if defined(_WIN32)
+        _putenv_s("STRATA_DS4_SLOT_KEEP", "0");
+#else
+        setenv("STRATA_DS4_SLOT_KEEP", "0", 1);
+#endif
         o.stage_begin = stage_server.empty() ? 0 : stage_split;
         o.stage_end = stage_server.empty() ? stage_split : -1;
     }
