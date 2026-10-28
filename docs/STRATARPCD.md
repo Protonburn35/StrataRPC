@@ -113,6 +113,11 @@ $env:STRATA_RPC_TOKEN = "replace-with-a-long-random-secret"
 powershell -NoProfile -ExecutionPolicy Bypass -File .\engine-rpcd\start-coordinator.ps1 -Worker 192.168.50.143:39501 -Port 8081
 ```
 
+- **Starting C from A over SSH:** `ssh` into C, type `powershell` if the session opens in cmd, then run the three lines
+  above in it (add `-Listen 192.168.50.143:39501` to listen on C's network address only). Keep that window open:
+  closing it stops the worker. If the worker reports no CUDA device there, start it from C's own desktop instead.
+- **The secret:** any long random text, the same on both PCs. One way to make one:
+  `[guid]::NewGuid().ToString("N") + [guid]::NewGuid().ToString("N")`. Setup does not need it; the start scripts do.
 - **A's engine** loads its half, then connects to C. If C is still loading, A waits for it, up to 30 minutes.
 - **The API** is then at `http://127.0.0.1:8081/v1` (OpenAI) and `http://127.0.0.1:8081/v1/messages` (Anthropic), as
   with Strata.
