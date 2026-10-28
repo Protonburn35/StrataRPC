@@ -184,11 +184,20 @@ Windows build notes:
   - **The worker's split of the prompt's 135.4 s:** 4,940 MB of rows in 41.9 s (**118 MB/s: gigabit Ethernet, full**),
     71.6 s waiting for A (A's 20 layers), 21.9 s C's own work (the skip works: layer 20's KV for most rows, the full
     layers only for the tail). The three add up to the total: nothing overlaps.
-  - **The overlap is NOT the win it first looked like (corrected 2026-10-28).** A runs a long prompt layer-major
-    (`lm_begin`: all chunks through layer 0, then layer 1, ...; it reads each layer's experts from the files once
-    instead of once per chunk, mainline measured 6x on an 8K prompt). Its rows for C only come out in its last layer's
-    pass, so a sender thread could hide the link behind ~1/20 of A's work plus C's light kv_only work: a few seconds.
-    Chunk-major on A to free the overlap would re-read A's 57 GB of in-place experts per chunk: far slower.
+  - **Correction (DS4_FLOW_STATS run, 2.00, BF16, 1M, logs 09:42): A does NOT run the prompt layer-major.** Its stream
+    line: 60,283 tokens in 93.3 s; 45,085 experts streamed: 38,669 from the files (**320 GB** unbuffered, 3.43 GB/s)
+    and 6,416 from RAM (49.8 GB); **the compute waited 44.0 s for reads**; no "again from the layer cache" part. That
+    is A's ~5,738 off-GPU experts re-read for each of the 8 chunks. `lm_begin` refuses layer-major because it needs
+    `state_b` (every chunk's state on the host: chunk_hand_bytes ~84 KB a row, ~5.5 GB for 64K rows) plus at least one
+    expert of layer cache within `ram_avail() - kRamMargin` (8 GB); A has ~12 GB free after its 7.6 GB store.
+    C's line: 5,959 experts streamed (44.9 GB from the files, 7.5 GB from RAM: one pass, the skip leaves it only the
+    tail), the compute waited 11.5 s for reads.
+  - **So the overlap is still small** (rows come per chunk, but A's time is reads), and **the real prompt lever is
+    layer-major on A**: one pass over its ~47 GB instead of eight would cut A's reads from 320 GB to ~40-50 GB.
+    Cheap test, no code: `DS4_LAYER_CACHE_MB=2048` on A forces `lm_begin` past the RAM check (it then allocates the
+    5.5 GB state, pinned or pageable, and a 2 GB layer cache per prompt; watch for paging on a 32 GB PC). It does not
+    bound the state by RAM, so it is unsafe for very long prompts (200K tokens ~17 GB of state). The proper fix if it
+    pays off: layer-major over groups of chunks whose state fits the free RAM (reads once per group, not per chunk).
   - **What does cut the 42 s link:** C on 2.5 GbE (118 MB/s is a 1 Gbps link; A and the switch are 2.5 Gbps; ask the
     user what C's adapter is: `Get-NetAdapter`), ~17 s, lossless; `-Wire bf16` halves it (slightly lossy); both ~8.5 s.
 - **2.25 at 1M context, same 60,283-token prompt (logs 08:20):** 146.7 s (411 tok/s): link 41.9 s (118 MB/s), waiting
@@ -220,7 +229,8 @@ Windows build notes:
   plans to delete 2.00) - each at 1M context, BF16 rows (the scripts' default), default prompt chunks, `-Stats`.
   Answer-speed levers left are all small (the head on A: likely ~0-2% after the 256K test; one round trip a token: <1%). Prompt-side: saved
   conversation slots in the split (each PC saving its half of the cache) would spare re-reading a long prompt after
-  switching conversations; the overlap is worth a few seconds (A runs prompts layer-major).
+  switching conversations; the overlap is worth a few seconds. **Biggest prompt lever found: A runs chunk-major
+  (re-reads its experts per chunk), see the DS4_FLOW_STATS correction below.**
 - **Saved chats, later (user, 2026-10-28):** instead of automatic slots, port the manual "save chat" the user says
   "Astra" implemented (invoked by hand). Unclear which code: possibly mainline Strata's conversation files
   (`src/core/conversation_file.cpp`), possibly a separate project; ask before starting. In the split, both PCs would
