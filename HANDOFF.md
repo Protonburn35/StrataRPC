@@ -207,7 +207,8 @@ Windows build notes:
   adding to the split. **The 4090 alone answers nearly as fast as the split** (2.00, 8K: 9.02 tok/s with 3,098 GPU
   experts): the split's answer gain is ~12%, so its value is mainly prompts and room for 2.25 at 1M. Next comparison
   asked of the user: the 4090 alone on 2.25, 1M, the 60K prompt (`single-4090-2.25.json`, slots off).
-- **Settled setup (2026-10-28):** 2.25, 1M context, BF16 rows (the scripts' default), default prompt chunks, `-Stats`.
+- **Settled setup (2026-10-28, revised):** both sets stay - **2.25 for quality, 2.00 for speed** (the user no longer
+  plans to delete 2.00) - each at 1M context, BF16 rows (the scripts' default), default prompt chunks, `-Stats`.
   Answer-speed levers left are all small (the head on A: likely ~0-2% after the 256K test; one round trip a token: <1%). Prompt-side: saved
   conversation slots in the split (each PC saving its half of the cache) would spare re-reading a long prompt after
   switching conversations; the overlap is worth a few seconds (A runs prompts layer-major).
@@ -245,7 +246,7 @@ Windows build notes:
   `--layer-stage-wire`) is still fp32; the scripts always pass it. FP16 is offered as the more precise alternative,
   with the codec's refusal above 65,504 (a failed prompt, never silent). Not measured yet: the largest value at the
   split, which would say whether FP16 is safe.
-- **The user chose the 2.25 set (2026-10-28)** and will delete 2.00 later. DSpark and vision stay off in the split.
+- **The user chose the 2.25 set (2026-10-28)**; later the same day: keep 2.00 too, as the speed set. DSpark and vision stay off in the split.
 - **The user is adding the 2.25 set** (docs/STRATARPCD.md, "Adding the 2.25 bpw set"). On A the shared files were
   downloaded with `hf download` beside the 2.00 shards, and setup only looks for them in
   `models/deepseek-v4.1-flash-shared` (`dsv41_find_shared`): hard links put them there. With two configs the start
