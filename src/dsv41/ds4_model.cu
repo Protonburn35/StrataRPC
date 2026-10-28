@@ -8039,8 +8039,21 @@ struct Model::Impl {
             c.io_b0 = c.io->buffered_bytes();
             c.io_busy0 = c.io->busy_ms();
             if (!c.fl_layers.empty()) {
-                flow_spec(c, 0, c.fl_layers[0], run.T[0]);
-                if (!flow_pump(c, err)) return false;
+                // the first (chunk, layer) that streams experts.  StrataRPC: on a layer-stage worker the long prompt's skip
+                // layer can be the device's first, and its chunks before the cut are kv_only there (no experts), so the
+                // stream starts where flow_next would go next, not at chunk 0
+                int k0 = 0, il0 = c.fl_layers[0];
+                bool any = true;
+                if (c.fl_yoco >= 0 && k0 < c.fl_cut_k && il0 >= c.fl_yoco) {
+                    int k2 = 0, il2 = 0;
+                    any = flow_next(c, k0, il0, k2, il2);
+                    k0 = k2;
+                    il0 = il2;
+                }
+                if (any) {
+                    flow_spec(c, k0, il0, fl_rows(c, k0, il0));
+                    if (!flow_pump(c, err)) return false;
+                }
             }
             if (c.lm) return run_dev_layers(di, run, err);
         }

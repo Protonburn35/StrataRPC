@@ -158,6 +158,14 @@ Windows build notes:
   `C:\StrataRPCD\strata-deepseek-v4.1-flash-ist-das-2.00bpw.json` (API port 8080). PC C's setup is next (sm_120).
 - **The A + C split works (2026-10-28, user report: "working way better than expected")** with the 2.00 set, FP32
   rows, `-Stats` on both. The numbers are not in yet: ask the user for A's log and C's worker log.
+- **Bug found by the user's 69,701-token prompt (2026-10-28), fixed in `run_dev_chunks`:** the worker failed every
+  prompt longer than one chunk with "the prompt path's expert stream is out of step (layer 0)". On the worker the long
+  prompt's skip layer (the model's layer 20) is the device's first layer, and its chunks before the cut are `kv_only`
+  (no experts); the stream's first prediction was always (chunk 0, first layer), so the first real expert layer,
+  (cut chunk, layer 0), did not match. The first prediction now follows `flow_next`'s skip rule. Mainline (skip at
+  layer 20 of 40) and the coordinator (no skip) never take the new branch. A Python model of the prediction against the
+  call order (chunk-major and layer-major) reproduced the failure and passes with the fix. Until the user has the new
+  build, `STRATA_DS4_PROMPT_SKIP=0` on the worker avoids it (no skip: the same answers, slower long prompts).
 - **The user is adding the 2.25 set** (docs/STRATARPCD.md, "Adding the 2.25 bpw set"). On A the shared files were
   downloaded with `hf download` beside the 2.00 shards, and setup only looks for them in
   `models/deepseek-v4.1-flash-shared` (`dsv41_find_shared`): hard links put them there. With two configs the start
