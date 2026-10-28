@@ -136,6 +136,18 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\engine-rpcd\start-coordina
 | `-Listen` (C) | `0.0.0.0:39501` | The worker's address and port. |
 | `-Port` (A) | setup's | The API port. |
 
+## The speed config (optional)
+
+Add `-Wire bf16` to **both** start scripts. The rows on the link become BF16: half the bytes, so on gigabit Ethernet
+a 60K prompt's 42 s of transfer becomes about 21 s. Answers are as fast as before (a token's row was under 1 ms either
+way). The rows are rounded to BF16 (about 0.1-0.4% per value) once, at the split: slightly lossy, which is why FP32
+stays the default.
+
+- **`-Wire fp16` instead:** the same speed and about 8x the precision of BF16, but it cannot hold a value above
+  65,504. If the model's running value at the split ever goes past that, that prompt stops with
+  `layer-stage FP16 activation ... exceeds the finite range 65504` (an error, never a wrong answer). If it never
+  happens on your work, FP16 is the better speed config.
+
 ## Adding the 2.25 bpw set
 
 The 2.25 set (155 GB of model) has better quality than 2.00: about 7.3% above the original model's perplexity instead of

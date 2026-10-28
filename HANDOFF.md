@@ -218,6 +218,10 @@ Windows build notes:
   `init-shell: cmd.exe` sets cmd's AutoRun to the conda activation, which selects VS 2019's toolset, and the build's own
   cmd.exe children ran it before each compile. The workflow now removes that AutoRun before the build; the script warns
   when a PC has one. **Build 11 (8ce0e5b0) is green through the script.**
+- **C's adapter is 1 Gbps (user, 2026-10-28):** no 2.5 GbE. The user's "speed config" is `-Wire bf16` on both PCs
+  (docs/STRATARPCD.md, "The speed config"); FP32 stays the default. FP16 is offered as the more precise alternative,
+  with the codec's refusal above 65,504 (a failed prompt, never silent). Not measured yet: the largest value at the
+  split, which would say whether FP16 is safe.
 - **The user chose the 2.25 set (2026-10-28)** and will delete 2.00 later. DSpark and vision stay off in the split.
 - **The user is adding the 2.25 set** (docs/STRATARPCD.md, "Adding the 2.25 bpw set"). On A the shared files were
   downloaded with `hf download` beside the 2.00 shards, and setup only looks for them in
