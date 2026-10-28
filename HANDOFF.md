@@ -12,7 +12,8 @@ this update. Old claims that stage mode has not run, or that vision/manual sessi
 are superseded by this section.
 
 - **Protocol 2: update both PCs together.** `--layer-stage-vision` enables A's existing GPU tower and
-  C's image-routing bias. C receives only ordered image spans/hashes, once before feeding each request. No picture encoder runs on C. Text-only stage defaults remain unchanged when
+  C's image-routing bias. C receives only ordered image spans/hashes, once before feeding each
+  request. No picture encoder runs on C. Text-only stage defaults remain unchanged when
   the new flag is absent. The server keeps image hashes/spans for restored prefix checks.
 - **`--layer-stage-sessions` is opt-in on both PCs.** Worker also needs
   `--layer-stage-session-dir`. The existing Python `/slots/0?action=save|restore` API now reaches
@@ -36,8 +37,13 @@ are superseded by this section.
   launcher/config regressions pass (3/3); the coordinator config passes the actual Python server's
   parsing and final argument shaping. Linux CUDA 13.2 compilation passed for sm_89 and sm_120.
   Protocol and file tests also passed with ASan/UBSan; 43 existing Python session/API tests passed.
-  GitHub Windows build is to be dispatched and monitored after this commit. No GPU vision or
-  cache-restore execution has been measured here; the two PCs must perform the first hardware checks.
+  **Windows build passed:** [run 40718452176](https://github.com/Protonburn35/StrataRPC/actions/runs/40718452176),
+  source commit `24d1b14d86d4eccdfbc809a90c618c43b31279bd`, CUDA 13.2 / MSVC, sm_89 + sm_120.
+  Both Windows test stages, compilation, packaging and upload succeeded. Download the
+  [407 MB package](https://github.com/Protonburn35/StrataRPC/actions/runs/40718452176/artifacts/12831277803),
+  `StrataRPCD-engine-win-x64-cuda13-sm89-sm120`. It includes the exe, CUDA DLLs, both start scripts,
+  both presets and `STRATARPCD-FIRST-RUN.md`. No GPU vision or cache-restore execution has been
+  measured here; the two PCs must perform the first hardware checks.
 - **Hardware checks:** ordinary text; a picture and follow-up; changed pictures and a text-only chat;
   save/switch/restore a short text and image conversation; restart both engines and restore; only
   then save a long conversation. Compare image answers against the same model on one PC and record
