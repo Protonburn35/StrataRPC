@@ -197,10 +197,12 @@ Windows build notes:
 - **BF16 rows (2.25, 1M, logs 08:55):** the 60,283-token prompt in 123.4 s (**488 tok/s**, was 146.7 s / 411 with
   FP32): 2,471 MB of rows in 20.9 s (118 MB/s), 82.3 s waiting for A, 20.1 s C's own. Answers 6.82 tok/s over 2,390
   tokens (FP32 6.55; within the noise). As predicted: BF16 halves the link and leaves the rest.
-- **`-Context 262144` instead of 1M (user report, 2026-10-28):** no meaningful change in answer speed, as expected
-  (1M costs each card 5-7% of its expert slots, worth a few percent at most). The user keeps 1M.
+- **`-Context 262144` instead of 1M (2.25, BF16, logs 09:05):** VRAM experts A 1,683 -> 1,746 (+63), C 897 -> 942
+  (+45); the 60K prompt 122.5 s (492 tok/s, 1M: 123.4 s); answers 6.78 tok/s over 2,650 tokens (1M: 6.82). No change:
+  ~60 more experts on each card is lost in the noise, so the head on A (~+50-70 on C, the same fewer on A) would
+  likely gain about nothing. The user keeps 1M.
 - **Settled setup (2026-10-28):** 2.25, 1M context, BF16 rows (the scripts' default), default prompt chunks, `-Stats`.
-  Answer-speed levers left are all small (the head on A: 2-5% est.; one round trip a token: <1%). Prompt-side: saved
+  Answer-speed levers left are all small (the head on A: likely ~0-2% after the 256K test; one round trip a token: <1%). Prompt-side: saved
   conversation slots in the split (each PC saving its half of the cache) would spare re-reading a long prompt after
   switching conversations; the overlap is worth a few seconds (A runs prompts layer-major).
 - **Saved chats, later (user, 2026-10-28):** instead of automatic slots, port the manual "save chat" the user says
