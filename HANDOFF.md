@@ -16,7 +16,7 @@ user has tested phase 1.
 | B (192.168.50.129) | RTX 4060 Laptop 8 GB, HX 370, 32 GB RAM | phase 2 |
 
 Network: the worker listens on port 39501 (StrataRPC's qfn worker uses 39001). C's inbound firewall rule lists
-remote addresses: `-RemoteAddress 192.168.50.206,192.168.50.129` (A and the laptop). When planning phase 2, check which PC connects to
+remote addresses: `-RemoteAddress 192.168.50.206` (A only; the user removed the laptop on 2026-10-28). When planning phase 2, check which PC connects to
 which: every listening PC needs an inbound rule, and a rule with an address list must include each PC that connects to it.
 
 The user keeps the whole model in a `StrataRPCD` folder on every PC: the GGUF shards, the Engram table, the DSpark GGUF
