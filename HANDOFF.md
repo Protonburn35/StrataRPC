@@ -197,6 +197,15 @@ Windows build notes:
 - **BF16 rows (2.25, 1M, logs 08:55):** the 60,283-token prompt in 123.4 s (**488 tok/s**, was 146.7 s / 411 with
   FP32): 2,471 MB of rows in 20.9 s (118 MB/s), 82.3 s waiting for A, 20.1 s C's own. Answers 6.82 tok/s over 2,390
   tokens (FP32 6.55; within the noise). As predicted: BF16 halves the link and leaves the rest.
+- **2.00 with BF16 rows (1M, logs 09:30):** the 60,283-token prompt in 109.2 s (**552 tok/s**; FP32 135.4 s / 445):
+  2,471 MB of rows in 20.9 s, 69.5 s waiting for A, 18.8 s C's own; answers **7.94 tok/s** over 2,119 tokens.
+- **The two settled configs, measured (split, 1M context, BF16 rows, 60,283-token prompt):**
+
+  | Set | Prompt | Answers | VRAM experts A / C |
+  |---|---|---|---|
+  | 2.00 (speed) | 109.2 s, 552 tok/s | 7.94 tok/s | 1,942 / 989 |
+  | 2.25 (quality) | 123.4 s, 488 tok/s | 6.82 tok/s | 1,683 / 897 |
+
 - **`-Context 262144` instead of 1M (2.25, BF16, logs 09:05):** VRAM experts A 1,683 -> 1,746 (+63), C 897 -> 942
   (+45); the 60K prompt 122.5 s (492 tok/s, 1M: 123.4 s); answers 6.78 tok/s over 2,650 tokens (1M: 6.82). No change:
   ~60 more experts on each card is lost in the noise, so the head on A (~+50-70 on C, the same fewer on A) would
