@@ -130,6 +130,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\engine-rpcd\start-coordina
 | `-Wire bf16` | `fp32` | Sends the rows in BF16: half the bytes on the link, but the numbers change slightly (lossy). Use the same on both PCs. |
 | `-Stats` | off | Writes each prompt's time, the MB sent and the time spent waiting on C into the log. On A it also logs every 256 tokens. |
 | `-Context N` | setup's (8192) | The context. It must be the same on both PCs. |
+| `-PrefillChunk N` | the engine's (8192 on A, 4096 on C) | The prompt chunk on that PC alone. Smaller leaves more VRAM for experts (faster answers) and reads long prompts somewhat slower there. |
 | `-Split 20` | 20 | The worker's first layer. 20 is the only clean split for V4.1, so leave it. |
 | `-DryRun` | | Prints the command and stops. |
 | `-Listen` (C) | `0.0.0.0:39501` | The worker's address and port. |

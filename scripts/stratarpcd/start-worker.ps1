@@ -10,6 +10,7 @@ param(
     [int]$Split = 20,                    # the worker's first layer: the same on both PCs
     [ValidateSet("fp32", "bf16", "fp16")][string]$Wire = "fp32",   # the rows on the link: the same on both PCs
     [int]$Context = 0,                   # 0: the config's --max-context (it must match the coordinator's)
+    [int]$PrefillChunk = 0,              # the prompt chunk on this PC (0: the engine's own, 4096 on a 16 GB card): smaller leaves more VRAM for experts
     [switch]$Stats,                      # STRATA_LAYER_STAGE_STATS=1: each prompt's time in the log
     [switch]$DryRun                      # print what it would run and stop (nothing starts)
 )
@@ -31,10 +32,11 @@ $a = New-Object System.Collections.Generic.List[string]
 $given = @($cfg.args)
 for ($i = 0; $i -lt $given.Count; $i++) {
     $k = [string]$given[$i]
-    if ($k -like "--layer-stage-*" -or ($Context -gt 0 -and $k -eq "--max-context")) { $i++; continue }
+    if ($k -like "--layer-stage-*" -or ($Context -gt 0 -and $k -eq "--max-context") -or ($PrefillChunk -gt 0 -and $k -eq "--prefill-chunk")) { $i++; continue }
     $a.Add($k)
 }
 if ($Context -gt 0) { $a.Add("--max-context"); $a.Add([string]$Context) }
+if ($PrefillChunk -gt 0) { $a.Add("--prefill-chunk"); $a.Add([string]$PrefillChunk) }
 foreach ($x in @("--layer-stage-server", $Listen, "--layer-stage-split", [string]$Split, "--layer-stage-wire", $Wire)) { $a.Add($x) }
 
 if ($cfg.env) { foreach ($p in $cfg.env.PSObject.Properties) { Set-Item -Path "env:$($p.Name)" -Value ([string]$p.Value) } }
