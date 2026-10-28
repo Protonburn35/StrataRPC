@@ -197,6 +197,12 @@ Windows build notes:
 - **BF16 rows (2.25, 1M, logs 08:55):** the 60,283-token prompt in 123.4 s (**488 tok/s**, was 146.7 s / 411 with
   FP32): 2,471 MB of rows in 20.9 s (118 MB/s), 82.3 s waiting for A, 20.1 s C's own. Answers 6.82 tok/s over 2,390
   tokens (FP32 6.55; within the noise). As predicted: BF16 halves the link and leaves the rest.
+- **`-Context 262144` instead of 1M (user report, 2026-10-28):** no meaningful change in answer speed, as expected
+  (1M costs each card 5-7% of its expert slots, worth a few percent at most). The user keeps 1M.
+- **Settled setup (2026-10-28):** 2.25, 1M context, BF16 rows (the scripts' default), default prompt chunks, `-Stats`.
+  Answer-speed levers left are all small (the head on A: 2-5% est.; one round trip a token: <1%). Prompt-side: saved
+  conversation slots in the split (each PC saving its half of the cache) would spare re-reading a long prompt after
+  switching conversations; the overlap is worth a few seconds (A runs prompts layer-major).
 - **`-PrefillChunk 2048` on C (2.25, 1M, logs 08:35/08:36) against the default 4096:** C's VRAM experts 897 -> 942
   (+45, +0.46 GB; its RAM store 885 -> 915 slots); answers 6.55 -> 6.89 tok/s (+5%, within the run-to-run spread:
   256-step blocks range 120-168 ms in both); the prompt 146.7 -> 156.7 s (C's own part 20.9 -> 31.0 s). Freeing ~0.5
