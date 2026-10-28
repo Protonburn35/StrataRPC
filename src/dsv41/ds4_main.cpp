@@ -94,6 +94,9 @@ void usage() {
                  "           | --encode-image FILE.rgb --size WxH --dump-image OUT\n"
                  "           | --pack-info)\n"
                  "  StrataRPC layer stage (two PCs, the model split by layers; both need STRATA_RPC_TOKEN set to the same secret):\n"
+                 "           --layer-stage-vision            encode on the coordinator GPU; image routing on both stages\n"
+                 "           --layer-stage-sessions          enable manual paired disk save/restore on both stages\n"
+                 "           --layer-stage-session-dir DIR   worker snapshot folder (required for worker sessions)\n"
                  "           --layer-stage-split K           the worker's first layer (V4.1: 20)\n"
                  "           --layer-stage-server HOST:PORT  the worker: layers K.. and the head, serving the coordinator\n"
                  "           --layer-stage-client HOST:PORT  the coordinator (with --serve): layers ..K-1, the worker at HOST:PORT\n"
@@ -124,6 +127,11 @@ struct StageBackend : strata::ds4::stage::Backend {
         return m.sample(s.temperature, s.top_p, s.top_k, s.min_p, s.seed, s.counter);
     }
     bool logits(std::vector<float>& out) override { return m.logits(out); }
+    void images(const std::vector<strata::ds4::stage::ImageSpan>& images) override { m.set_image_spans(images); }
+    bool snapshot(bool save, const strata::ds4::stage::SnapshotRef& ref, uint64_t& bytes, std::string& err) override {
+        try { return m.stage_snapshot(save, ref, bytes, err); }
+        catch (const std::exception& e) { err = e.what(); if (!save) m.reset(); return false; }
+    }
 };
 
 int stage_worker(strata::ds4::Model& m, const strata::ds4::Options& o, const std::string& endpoint) {
@@ -136,6 +144,8 @@ int stage_worker(strata::ds4::Model& m, const strata::ds4::Options& o, const std
     spec.vocab = (uint32_t) m.vocab();
     spec.max_context = (uint64_t) m.max_context();
     spec.wire = (st::LayerStageWireFormat) o.stage_wire;
+    spec.image_token = m.image_token();
+    spec.sessions = o.stage_sessions;
     st::hash_text(m.stage_identity(), spec.identity_a, spec.identity_b);
     StageBackend backend(m);
     st::Server server(o.stage_token, spec, backend);
@@ -701,6 +711,38 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     }
     while (in.next(line)) {
         if (line == "QUIT") break;
+        if (line.rfind("SAVE ", 0) == 0 || line.rfind("RESTORE ", 0) == 0) {
+            const bool saving = line.rfind("SAVE ", 0) == 0;
+            const std::string path = line.substr(saving ? 5 : 8);
+            std::string error;
+            uint64_t bytes = 0;
+            const double started = now_ms();
+            // A bounded blocking allowance covers GPU copies and the worker's local SSD operation.
+            std::printf("SWAIT %s 900\n", saving ? "save" : "restore");
+            std::fflush(stdout);
+            bool ok = false;
+            try {
+                ok = !path.empty() && (saving ? m.save_session(path, bytes, error) : m.load_session(path, bytes, error));
+            } catch (const std::exception& e) {
+                error = e.what();
+                if (!saving) m.reset();
+            }
+            if (ok && !saving) {
+                held.clear();
+                for (const auto& im : m.image_spans()) {
+                    Pic pic; pic.start = im.start; pic.len = (size_t) im.length; pic.hash = im.hash;
+                    held.push_back(std::move(pic));
+                }
+            }
+            if (ok) std::printf("%s %lld %llu %.1f\n", saving ? "SAVED" : "RESTORED", (long long) m.pos(),
+                                (unsigned long long) bytes, now_ms() - started);
+            else {
+                for (char& c : error) if (c == '\r' || c == '\n') c = ' ';
+                std::printf("SERR io 0 %s\n", error.empty() ? "session command failed" : error.c_str());
+            }
+            std::fflush(stdout);
+            continue;
+        }
         const bool geni = line.rfind("GENI ", 0) == 0;
         if (!geni && line.rfind("GEN ", 0) != 0) {
             std::printf("ERR unsupported command '%s' (GEN, GENI, STOP and QUIT)\n", line.substr(0, line.find(' ')).c_str());
@@ -815,6 +857,13 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                              now_ms() - te);
             }
             for (Pic& q : pics) q.rgb = {};   // (only the start, hash and span stay)
+        }
+        if (ok) {
+            std::vector<strata::ds4::stage::ImageSpan> image_spans;
+            for (const auto& q : pics) image_spans.push_back({q.start, (int64_t) q.len, q.hash});
+            if (!strata::ds4::stage::valid_images(image_spans, (uint64_t) m.max_context())) {
+                err = "image spans overlap or exceed the context"; ok = false;
+            } else m.set_image_spans(std::move(image_spans));
         }
         // the prompt in windows (PP <read> <total> <ms> <tok/s> <reuse> every 64 tokens), a checkpoint before its last
         // token and one after it: the next turn re-renders this one, and shares its start up to one of them
@@ -1325,6 +1374,9 @@ int main(int argc, char** argv) {
         else if (a == "--serve") serve_mode = true;
         else if (a == "--pack-info") pack_info_mode = true;
         else if (a == "--layer-split") (void) val("--layer-split");   // the server's (this engine balances its own split)
+        else if (a == "--layer-stage-vision") o.stage_vision = true;
+        else if (a == "--layer-stage-sessions") o.stage_sessions = true;
+        else if (a == "--layer-stage-session-dir") o.stage_session_dir = val("--layer-stage-session-dir");
         else if (a == "--layer-stage-client") o.stage_client = val("--layer-stage-client");
         else if (a == "--layer-stage-server") stage_server = val("--layer-stage-server");
         else if (a == "--layer-stage-split") stage_split = std::atoi(val("--layer-stage-split").c_str());
@@ -1385,6 +1437,10 @@ int main(int argc, char** argv) {
 #endif
         o.stage_begin = stage_server.empty() ? 0 : stage_split;
         o.stage_end = stage_server.empty() ? stage_split : -1;
+    }
+    if (o.stage_sessions && !stage_server.empty() && o.stage_session_dir.empty()) {
+        std::fprintf(stderr, "maya-ds4: worker sessions require --layer-stage-session-dir DIR\n");
+        return 2;
     }
     if (o.profile.empty()) o.profile = o.pack + "/expert-profile.bin";   // "none": no profile
     if (o.profile == "none") o.profile.clear();

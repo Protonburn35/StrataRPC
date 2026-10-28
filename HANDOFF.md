@@ -3,6 +3,46 @@
 Read this first. Claude and Sol (GPT/Codex) both work here. Fetch before you start, keep the other's commits, update this
 file with every push, and never force-push.
 
+## Current continuation: vision and paired manual sessions (2026-10-28, Codex)
+
+The user confirmed A + C works and now uses **IST-DAS 2.25 bpw only, 1M context, BF16 transfers,
+all six experts, no DSpark**. Work alone: the user explicitly complained about sub-agent usage.
+The sections below retain earlier history; this section and `docs/STRATARPCD-FIRST-RUN.md` describe
+this update. Old claims that stage mode has not run, or that vision/manual sessions are unavailable,
+are superseded by this section.
+
+- **Protocol 2: update both PCs together.** `--layer-stage-vision` enables A's existing GPU tower and
+  C's image-routing bias. C receives only ordered image spans/hashes, once before feeding each request. No picture encoder runs on C. Text-only stage defaults remain unchanged when
+  the new flag is absent. The server keeps image hashes/spans for restored prefix checks.
+- **`--layer-stage-sessions` is opt-in on both PCs.** Worker also needs
+  `--layer-stage-session-dir`. The existing Python `/slots/0?action=save|restore` API now reaches
+  `SAVE` / `RESTORE` in the native serve loop. Automatic conversation slots remain disabled.
+- **Paired persistence:** C publishes its immutable `<32-hex-id>.srpc` first, then A atomically
+  publishes its file referring to that ID. Each file contains only its PC's native layer state,
+  checkpoints, shared compatibility metadata, image spans/hashes and a checksum. KV never crosses
+  the network for save/restore. Restore verifies the descriptor/identity/context/wire/vision/role,
+  reconnects to C, restores C then A, and resets both live halves after a partial failure.
+- **Limits:** local native state is staged in RAM, with a 256 MiB margin and an 8 GiB file cap.
+  Writes require an extra 64 MiB of free disk. Files persist until deleted; overwritten host names
+  and failed host writes can leave orphan worker files. Native model state does not export a chat
+  transcript or the client's sampling settings. Keep the client's history and image attachments.
+- **Launchers:** `-Vision`, `-Sessions`, `-SessionDir`; saved feature flags are preserved when the
+  runtime JSON is regenerated. New presets are in `configs/stratarpcd/` and are copied into the build
+  artifact, with `STRATARPCD-FIRST-RUN.md`. They use the user's existing Windows paths, GPU 0, API
+  8081, worker 192.168.50.143:39501. `--dspark none` prevents loading the drafter; `off` alone does not.
+- **Quality guard:** stage mode refuses a conflicting `DS4_TOPK` override or expert-dropping
+  `STRATA_DS4_DISK_SKIP_W`. No forced temperature, expert clipping or new lossy conversion was added.
+- **Validation:** GPU-free protocol, session-envelope and transport tests pass (3/3); PowerShell
+  launcher/config regressions pass (3/3); the coordinator config passes the actual Python server's
+  parsing and final argument shaping. Linux CUDA 13.2 compilation passed for sm_89 and sm_120.
+  Protocol and file tests also passed with ASan/UBSan; 43 existing Python session/API tests passed.
+  GitHub Windows build is to be dispatched and monitored after this commit. No GPU vision or
+  cache-restore execution has been measured here; the two PCs must perform the first hardware checks.
+- **Hardware checks:** ordinary text; a picture and follow-up; changed pictures and a text-only chat;
+  save/switch/restore a short text and image conversation; restart both engines and restore; only
+  then save a long conversation. Compare image answers against the same model on one PC and record
+  reused prompt tokens plus logs. A full 1M-token saved state is not validated by a 60K-token test.
+
 ## Start here (2026-10-28): the user's setup and Sol's next two tasks
 
 **The setup the user runs** (both PCs on the user's own local build of this branch, `scripts/stratarpcd/build-local.ps1`

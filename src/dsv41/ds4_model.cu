@@ -16,6 +16,7 @@
 #include "ds4_pick_rule.hpp"
 #include "ds4_experts_rule.hpp"
 #include "ds4_engram_io.hpp"
+#include "ds4_session.hpp"
 #include "ds4_stage.hpp"   // StrataRPC: the layer-stage link (a coordinator's half of the layers, a worker's other half)
 
 #include "ds4_gguf.cuh"
@@ -1986,6 +1987,10 @@ struct Model::Impl {
         const auto list = [](const std::vector<int>& v) { return stage::join(v); };
         // the experts a word takes, decided here so both stages take the same: as asked, or the model's (full quality)
         if (o.experts < 1) o.experts = g.k_exp;
+        if (experts_test_override(std::min(o.experts, g.k_exp), g.k_exp) != std::min(o.experts, g.k_exp) || disk_skip_w > 0) {
+            err = "layer stages require matching full expert settings: unset DS4_TOPK and STRATA_DS4_DISK_SKIP_W";
+            return false;
+        }
         {
             std::ostringstream id;
             id << "ds4 stage v1 vocab " << g.vocab << " dim " << g.dim << " layers " << g.nl << " hc " << g.hc
@@ -2020,7 +2025,8 @@ struct Model::Impl {
         g.n_mtp = 0;
         g.d_targets.clear();
         o.dspark = o.dspark_auto = false;
-        o.vision = false;
+        if (!o.stage_vision) o.vision = false;
+        if (stage_in && o.vision) img_tok = (int) pk.num("image_token_id", -1);
         g.nl = e - b;
         // the tensor table: this stage's layers, the embedding table on the coordinator, the head on the worker
         for (auto it = pk.t.begin(); it != pk.t.end();) {
@@ -2029,7 +2035,8 @@ struct Model::Impl {
             if (n.rfind("layers.", 0) == 0) {
                 const int li = std::atoi(n.c_str() + 7);
                 keep = li >= b && li < e;
-            } else if (n.rfind("mtp.", 0) == 0 || n.rfind("vision.", 0) == 0 || n.rfind("aligner.", 0) == 0)
+            } else if (n.rfind("mtp.", 0) == 0 ||
+                       ((stage_in || !o.vision) && (n.rfind("vision.", 0) == 0 || n.rfind("aligner.", 0) == 0)))
                 keep = false;
             else if (stage_out && (n.rfind("head.", 0) == 0 || n == "norm.weight"))
                 keep = false;
@@ -2201,7 +2208,7 @@ struct Model::Impl {
                          o.prefill_chunk == 0 ? "leave --prefill-chunk out for chunks"
                                               : "leave --tp 1 out, or pass --threads on, for chunks");
         // the vision tower on the first GPU, before the split: the layers get what it leaves
-        if (o.vision && !load_vision(err)) {   // (a tower that cannot load leaves the model reading text: said loudly,
+        if (o.vision && !stage_in && !load_vision(err)) {   // (a tower that cannot load leaves the model reading text: said loudly,
             if (o.vision_only) return false;   // and the server is told pictures are off - info_lines)
             std::fprintf(stderr, "ds4: WARNING: the vision tower did not load (%s): pictures are OFF, the model reads "
                                  "text only\n", err.c_str());
@@ -5258,6 +5265,9 @@ struct Model::Impl {
     }
 
     void reset() {
+        known_images.clear();
+        imgs.clear();
+        image_dirty = true;
         pos = 0;
         toks.clear();
         ctoks.clear();
@@ -5394,8 +5404,8 @@ struct Model::Impl {
         return n + 8;
     }
 
-    uint64_t slot_save(std::vector<uint8_t>& out, std::string& err) {
-        if (slot_held) {
+    uint64_t slot_save(std::vector<uint8_t>& out, std::string& err, bool manual = false) {
+        if (slot_held && !manual) {
             err = "it is already set aside";
             return 0;
         }
@@ -5407,12 +5417,17 @@ struct Model::Impl {
             err = "the state's tokens do not match its position";
             return 0;
         }
-        if (!imgs.empty()) {
+        if ((!imgs.empty() || !known_images.empty()) && !manual) {
             err = "it holds pictures";
             return 0;
         }
         const std::string id = slot_identity();
-        out.assign(slot_bytes(), 0);
+        const size_t needed = slot_bytes();
+        const uint64_t available = ram_avail();
+        if (manual && available != ~uint64_t{0} && (available < (256ull << 20) || needed > available - (256ull << 20))) {
+            err = "not enough free RAM to stage the session file"; return 0;
+        }
+        out.assign(needed, 0);
         uint8_t* p = out.data();
         size_t off = 0;
         const auto put = [&](const void* s, size_t b) {
@@ -5495,7 +5510,7 @@ struct Model::Impl {
             return 0;
         }
         put(&kSlotMagic, 8);
-        slot_held = true;
+        if (!manual) slot_held = true;
         return (uint64_t) off;
     }
 
@@ -5693,8 +5708,7 @@ struct Model::Impl {
         pos = n_pos;
         toks.swap(toks_in);
         ctoks.resize((size_t) pos);
-        for (size_t i = 0; i < (size_t) pos; ++i)
-            ctoks[i] = toks[i] < pk.eg_vocab ? pk.eg_map[(size_t) toks[i]] : 0;
+        for (size_t i = 0; i < (size_t) pos; ++i) ctoks[i] = ctok((int64_t) i, toks[i]);
         for (int k = 0; k < kChecks; ++k) ck[k] = std::move(got[k]);   // (the slot's own; the old ones held the state
                                                                // this one replaced)
         slot_held = false;
@@ -5720,6 +5734,9 @@ struct Model::Impl {
            << " tensors.txt:" << size_of(pk.dir + "/tensors.txt");
         for (size_t i = 0; i < pk.files.size(); ++i)
             id << " " << pk.files[i] << ":" << os::file_size(pk.fds[i]);
+        if (stage_in || stage_out)
+            id << " stage=" << lb << ":" << g.nl << " wire=" << o.stage_wire << " context=" << o.max_context
+               << " identity=" << spec.identity_a << ":" << spec.identity_b << " vision=" << img_tok;
         return id.str();
     }
 
@@ -5739,6 +5756,15 @@ struct Model::Impl {
     std::string vision_err;              // why the tower did not load (pictures off), or empty
     std::vector<uint16_t> img_mark[3];   // image_start, image_newline, image_end: BF16 [dim]
     std::vector<Image> imgs;             // the pictures of the prompt being fed, by start
+    std::vector<stage::ImageSpan> known_images;  // full conversation spans, retained after encoding buffers are dropped
+    bool image_dirty = true;
+    bool image_at(int64_t p) const {
+        auto it = std::upper_bound(known_images.begin(), known_images.end(), p,
+                                  [](int64_t v, const stage::ImageSpan& im) { return v < im.start; });
+        if (it == known_images.begin()) return false;
+        --it;
+        return p - it->start < it->length;
+    }
     // a BF16 (or, rounded to nearest even, F32) tensor of n values into dst
     bool read_bf16(const Tensor& t, size_t n, void* dst) {
         if (t.dtype == "BF16") return t.bytes == n * 2 && pk.read(t, dst);
@@ -5839,15 +5865,15 @@ struct Model::Impl {
         const uint16_t* r = tk == img_tok ? image_row(p) : nullptr;
         return r != nullptr ? r : embed_pinned + (size_t) tk * g.dim;
     }
-    bool in_image(int64_t p) const { return img_tok >= 0 && toks[(size_t) p] == img_tok && image_row(p) != nullptr; }
+    bool in_image(int64_t p) const { return img_tok >= 0 && toks[(size_t) p] == img_tok && image_at(p); }
     // the Engram's compressed id of token tk at p (-1: a picture's, which no n-gram spans)
     int32_t ctok(int64_t p, int tk) const {
-        if (tk == img_tok && image_row(p) != nullptr) return -1;
+        if (tk == img_tok && image_at(p)) return -1;
         return tk < pk.eg_vocab ? pk.eg_map[(size_t) tk] : 0;
     }
     // a chunk's image rows (route()'s bits); false: none
     bool vl_bits(int64_t p0, int T, VlBits& b) const {
-        if (imgs.empty()) return false;
+        if (known_images.empty()) return false;
         std::memset(&b, 0, sizeof b);
         bool any = false;
         for (int t = 0; t < T && t < kVlRows; ++t)
@@ -8899,7 +8925,7 @@ struct Model::Impl {
         wp.par = par;
         wp.async = par || (!sync_decode && T <= async_max_t);
         wp.vl = 0;
-        for (int t = 0; t < T && !imgs.empty(); ++t)
+        for (int t = 0; t < T && !known_images.empty(); ++t)
             if (in_image(p0 + t)) wp.vl |= 1u << t;
         for (int il = 0; il < g.nl; ++il) {
             const Layer& l = L[(size_t) il];
@@ -9837,6 +9863,10 @@ struct Model::Impl {
     bool stage_feed(const int* tokens, int n, int logits_rows, int snap, std::string& err) {
         if (n < 1) return true;
         if (!stage_up(err)) return false;
+        if (image_dirty && spec.image_token >= 0) {
+            if (!link->images(pos, known_images, err)) return false;
+            image_dirty = false;
+        }
         const int64_t p0 = pos;
         const double t0 = now_ms(), w0 = link->wait_ms();
         const uint64_t b0 = link->bytes_sent();
@@ -9968,7 +9998,7 @@ Model::~Model() = default;
 bool Model::load(const Options& o, std::string& err) {
     Impl& p = *p_;
     if (!p.load(o, err)) return false;
-    if (!p.stage_in && !p.stage_out) return true;
+    if (!p.stage_in && !p.stage_out && !p.o.stage_sessions) return true;
     // StrataRPC: what the two stages check at the handshake
     p.spec.n_layers = (uint32_t) p.nl_all;
     p.spec.split = (uint32_t) (p.stage_out ? p.g.nl : p.lb);
@@ -9977,7 +10007,9 @@ bool Model::load(const Options& o, std::string& err) {
     p.spec.vocab = (uint32_t) p.g.vocab;
     p.spec.max_context = (uint64_t) p.o.max_context;
     p.spec.wire = (stage::LayerStageWireFormat) p.o.stage_wire;
-    stage::hash_text(p.ident, p.spec.identity_a, p.spec.identity_b);
+    p.spec.image_token = p.img_tok;
+    p.spec.sessions = p.o.stage_sessions;
+    stage::hash_text(p.ident.empty() ? p.slot_identity() : p.ident, p.spec.identity_a, p.spec.identity_b);
     if (!p.stage_out) return true;
     // the coordinator: the worker, which may still be loading - tried every 5 s for STRATA_LAYER_STAGE_WAIT seconds
     // (1800); a refusal (another model, split, context or wire format, a wrong secret) stops at once
@@ -10034,6 +10066,82 @@ bool Model::logits(std::vector<float>& out) {
     std::string err;
     return p.stage_up(err) && p.link->logits(out, err);
 }
+void Model::set_image_spans(std::vector<stage::ImageSpan> images) {
+    p_->known_images = std::move(images);
+    p_->image_dirty = true;
+}
+const std::vector<stage::ImageSpan>& Model::image_spans() const { return p_->known_images; }
+
+bool Model::stage_snapshot(bool save, const stage::SnapshotRef& ref, uint64_t& bytes, std::string& err) {
+    Impl& p = *p_;
+    if (!p.o.stage_sessions || !p.stage_in || p.o.stage_session_dir.empty() ||
+        !stage::valid_snapshot(ref, (uint64_t) p.o.max_context)) {
+        err = "worker disk sessions are disabled or the descriptor is invalid"; return false;
+    }
+    const std::string path = (std::filesystem::path(p.o.stage_session_dir) / (ref.id + ".srpc")).string();
+    session::File f;
+    if (save) {
+        if (ref.position != p.pos || ref.prefix != stage::prefix_hash(p.toks)) {
+            err = "worker conversation differs from the coordinator"; return false;
+        }
+        f.spec = p.spec; f.ref = ref; f.worker = true; f.images = p.known_images;
+        if (!p.slot_save(f.state, err, true)) return false;
+        if (!session::write(path, f, bytes, err, true)) return false;
+        std::fprintf(stderr, "ds4 sessions: worker saved %s (%llu bytes)\n", path.c_str(), (unsigned long long) bytes);
+        return true;
+    }
+    std::string why;
+    if (!session::read(path, f, bytes, err, ram_avail()) || !stage::same_spec(f.spec, p.spec, why) || !f.worker ||
+        f.ref.id != ref.id || f.ref.position != ref.position || f.ref.prefix != ref.prefix) {
+        if (err.empty()) err = why.empty() ? "worker snapshot does not match its coordinator file" : why;
+        return false;
+    }
+    p.known_images = f.images; p.imgs.clear();
+    if (!p.slot_load(f.state.data(), f.state.size(), ref.position, err) || stage::prefix_hash(p.toks) != ref.prefix) {
+        p.reset(); if (err.empty()) err = "worker snapshot prefix mismatch"; return false;
+    }
+    std::fprintf(stderr, "ds4 sessions: worker restored %s\n", path.c_str());
+    return true;
+}
+bool Model::save_session(const std::string& path, uint64_t& bytes, std::string& err) {
+    Impl& p = *p_;
+    if (!p.o.stage_sessions || p.stage_in || p.pos <= 0) {
+        err = "manual sessions are disabled or there is no conversation"; return false;
+    }
+    session::File f;
+    f.spec = p.spec; f.ref = {session::new_id(), p.pos, stage::prefix_hash(p.toks)}; f.images = p.known_images;
+    if (p.stage_out) {
+        uint64_t worker_bytes = 0;
+        if (!p.stage_up(err) || !p.link->snapshot(true, f.ref, worker_bytes, err)) return false;
+    }
+    if (!p.slot_save(f.state, err, true)) return false;
+    return session::write(path, f, bytes, err);
+}
+bool Model::load_session(const std::string& path, uint64_t& bytes, std::string& err) {
+    Impl& p = *p_;
+    if (!p.o.stage_sessions || p.stage_in) { err = "manual sessions are disabled"; return false; }
+    session::File f;
+    std::string why;
+    if (!session::read(path, f, bytes, err, ram_avail()) || !stage::same_spec(f.spec, p.spec, why) || f.worker) {
+        if (err.empty()) err = why.empty() ? "not a coordinator snapshot" : why;
+        return false;
+    }
+    bool ok = false;
+    if (p.stage_out) {
+        uint64_t worker_bytes = 0;
+        // Restore replaces both live halves. A fresh handshake also handles a worker restarted since the last request.
+        if (!p.stage_connect(err)) { reset(); return false; }
+        ok = p.link->snapshot(false, f.ref, worker_bytes, err);
+    } else ok = true;
+    if (ok) {
+        p.known_images = f.images; p.imgs.clear(); p.image_dirty = true;
+        ok = p.slot_load(f.state.data(), f.state.size(), f.ref.position, err) &&
+             stage::prefix_hash(p.toks) == f.ref.prefix;
+    }
+    if (!ok) { reset(); if (err.empty()) err = "snapshot prefix mismatch; live state reset"; }
+    return ok;
+}
+
 int Model::image_token() const { return p_->img_tok; }
 int Model::dim() const { return p_->g.dim; }
 bool Model::encode_image(const uint8_t* rgb, int width, int height, std::vector<uint16_t>& span, std::string& err) {
@@ -10041,6 +10149,12 @@ bool Model::encode_image(const uint8_t* rgb, int width, int height, std::vector<
 }
 void Model::set_images(std::vector<Image> images) {
     std::sort(images.begin(), images.end(), [](const Image& a, const Image& b) { return a.start < b.start; });
+    if (!images.empty()) {
+        p_->known_images.clear();
+        for (const auto& im : images)
+            p_->known_images.push_back({im.start, (int64_t) (im.rows->size() / (size_t) p_->g.dim), 0});
+        p_->image_dirty = true;
+    }
     p_->imgs = std::move(images);
 }
 int Model::draft_block() const { return p_->g.n_mtp > 0 ? p_->g.d_block : 0; }
@@ -10113,6 +10227,7 @@ bool Model::slot_load(const uint8_t* data, size_t bytes, int64_t n_pos, std::str
         err = "conversation slots are off with a layer-stage split";
         return false;
     }
+    p_->known_images.clear(); p_->imgs.clear(); p_->image_dirty = true;
     return p_->slot_load(data, bytes, n_pos, err);
 }
 void Model::set_stage_rows(StageRows f) { p_->stage_rows = std::move(f); }

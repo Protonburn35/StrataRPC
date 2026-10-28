@@ -25,7 +25,7 @@ constexpr std::chrono::milliseconds kPromptTimeout{120 * 60 * 1000};
 
 enum Type : uint16_t {
     kHello = 1, kReset = 2, kCheckpoint = 3, kRestore = 4, kPin = 5, kWindow = 6, kPrompt = 7, kRows = 8, kSample = 9,
-    kLogits = 10
+    kLogits = 10, kImages = 11, kSave = 12, kLoad = 13
 };
 constexpr uint16_t kReply = 0x8000;
 
@@ -75,13 +75,15 @@ struct Reader {
 void write_spec(Writer& w, const Spec& s) {
     w.u64(s.identity_a); w.u64(s.identity_b); w.u32(s.n_layers); w.u32(s.split); w.u32(s.dim); w.u32(s.hc);
     w.u32(s.vocab); w.u64(s.max_context); w.u32((uint32_t) s.wire);
+    w.i32(s.image_token); w.u32(s.sessions ? 1u : 0u);
 }
 bool read_spec(Reader& r, Spec& s) {
-    uint32_t wire = 0;
+    uint32_t wire = 0, sessions = 0;
     if (!r.u64(s.identity_a) || !r.u64(s.identity_b) || !r.u32(s.n_layers) || !r.u32(s.split) || !r.u32(s.dim) ||
         !r.u32(s.hc) || !r.u32(s.vocab) || !r.u64(s.max_context) || !r.u32(wire) ||
-        wire > (uint32_t) LayerStageWireFormat::fp16)
+        wire > (uint32_t) LayerStageWireFormat::fp16 || !r.i32(s.image_token) || !r.u32(sessions) || sessions > 1)
         return false;
+    s.sessions = sessions != 0;
     s.wire = (LayerStageWireFormat) wire;
     return true;
 }
@@ -208,7 +210,30 @@ bool same_spec(const Spec& a, const Spec& b, std::string& why) {
     else if (a.wire != b.wire)
         why = std::string("--layer-stage-wire differs (coordinator ") + wire_name(a.wire) + ", worker " +
               wire_name(b.wire) + ")";
+    else if (a.image_token != b.image_token) why = "--vision differs, or the image token differs";
+    else if (a.sessions != b.sessions) why = "--layer-stage-sessions must match on both PCs";
     return why.empty();
+}
+
+bool valid_images(const std::vector<ImageSpan>& images, uint64_t context) {
+    if (images.size() > 4096) return false;
+    uint64_t end = 0;
+    for (const auto& im : images) {
+        if (im.start < 0 || im.length <= 0 || (uint64_t) im.start < end ||
+            (uint64_t) im.start > context || (uint64_t) im.length > context - (uint64_t) im.start) return false;
+        end = (uint64_t) im.start + (uint64_t) im.length;
+    }
+    return true;
+}
+bool valid_snapshot(const SnapshotRef& ref, uint64_t context) {
+    return ref.id.size() == 32 && ref.id.find_first_not_of("0123456789abcdef") == std::string::npos &&
+           ref.position > 0 && (uint64_t) ref.position <= context;
+}
+uint64_t prefix_hash(const std::vector<int32_t>& tokens) {
+    uint64_t h = 1469598103934665603ull;
+    for (int32_t t : tokens)
+        for (int b = 0; b < 4; ++b) h = (h ^ (uint8_t) ((uint32_t) t >> (8 * b))) * 1099511628211ull;
+    return h;
 }
 
 bool parse_wire(const std::string& s, LayerStageWireFormat& f) {
@@ -398,6 +423,31 @@ bool Client::restore(int64_t limit, bool& restored, int64_t& pos, std::string& e
 bool Client::pin(std::string& err) {
     std::vector<uint8_t> body;
     return call(kPin, {}, body, err, kCallTimeout);
+}
+
+bool Client::images(int64_t position, const std::vector<ImageSpan>& images, std::string& err) {
+    if (!valid_images(images, spec_.max_context) || (spec_.image_token < 0 && !images.empty())) {
+        err = "invalid image spans or vision disabled";
+        return false;
+    }
+    Writer w;
+    w.i64(position); w.u32((uint32_t) images.size());
+    for (const auto& im : images) { w.i64(im.start); w.i64(im.length); w.u64(im.hash); }
+    std::vector<uint8_t> body;
+    return call(kImages, w.b, body, err, kCallTimeout);
+}
+bool Client::snapshot(bool save, const SnapshotRef& ref, uint64_t& bytes, std::string& err) {
+    if (!spec_.sessions || !valid_snapshot(ref, spec_.max_context)) {
+        err = "invalid or disabled paired disk session";
+        return false;
+    }
+    Writer w;
+    w.raw(ref.id.data(), 32); w.i64(ref.position); w.u64(ref.prefix);
+    std::vector<uint8_t> body;
+    if (!call(save ? kSave : kLoad, w.b, body, err, kCallTimeout)) return false;
+    Reader r{body.data(), body.size(), 0};
+    if (!r.u64(bytes) || r.left() != 0) { err = "malformed snapshot answer"; fail(); return false; }
+    return true;
 }
 
 // a ROWS frame's meta (p0, T, flags) and the rows' bytes into wire_: h in the wire format, then pre as FP32
@@ -719,6 +769,32 @@ bool Server::serve(rpc::Socket s, std::string& err) {
             case kPin: {
                 backend_.pin();
                 if (!respond(true, "")) return false;
+                break;
+            }
+            case kImages: {
+                int64_t position = 0;
+                uint32_t n = 0;
+                if (!r.i64(position) || position != backend_.pos() || !r.u32(n) || n > 4096 || r.left() != (size_t) n * 24)
+                    return refuse("invalid image spans");
+                std::vector<ImageSpan> images(n);
+                for (auto& im : images) { r.i64(im.start); r.i64(im.length); r.u64(im.hash); }
+                if (!valid_images(images, spec_.max_context) || (spec_.image_token < 0 && !images.empty()))
+                    return refuse("invalid image spans or vision disabled");
+                backend_.images(images);
+                if (!respond(true, "")) return false;
+                break;
+            }
+            case kSave:
+            case kLoad: {
+                SnapshotRef ref;
+                ref.id.resize(32);
+                if (!spec_.sessions || !r.raw(&ref.id[0], 32) || !r.i64(ref.position) || !r.u64(ref.prefix) || r.left() != 0 ||
+                    !valid_snapshot(ref, spec_.max_context)) return refuse("invalid or disabled paired disk session");
+                uint64_t bytes = 0;
+                std::string se;
+                if (!backend_.snapshot(type == kSave, ref, bytes, se)) return refuse("disk session: " + se);
+                Writer w; w.u64(bytes);
+                if (!respond(true, "", w.b)) return false;
                 break;
             }
             case kWindow: {   // p0, n, logits_rows, n tokens, then n rows

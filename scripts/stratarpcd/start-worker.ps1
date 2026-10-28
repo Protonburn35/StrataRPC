@@ -11,6 +11,9 @@ param(
     [ValidateSet("fp32", "bf16", "fp16")][string]$Wire = "bf16",   # the rows on the link, the same on both PCs: bf16 (half the bytes), fp32 exact
     [int]$Context = 0,                   # 0: the config's --max-context (it must match the coordinator's)
     [int]$PrefillChunk = 0,              # the prompt chunk on this PC (0: the engine's own, 4096 on a 16 GB card): smaller leaves more VRAM for experts
+    [switch]$Vision,                     # encode images on A's GPU; image routing on both PCs
+    [switch]$Sessions,                   # opt-in manual paired disk sessions, on both PCs
+    [string]$SessionDir = "",            # this PC's own session folder
     [switch]$Stats,                      # STRATA_LAYER_STAGE_STATS=1: each prompt's time in the log
     [switch]$DryRun                      # print what it would run and stop (nothing starts)
 )
@@ -30,13 +33,27 @@ $cfg = Get-Content $Config -Raw | ConvertFrom-Json
 # setup's engine arguments (the pack, the context, ...), then this PC's role
 $a = New-Object System.Collections.Generic.List[string]
 $given = @($cfg.args)
+$useVision = $Vision -or ($given -contains "--layer-stage-vision")
+$useSessions = $Sessions -or ($given -contains "--layer-stage-sessions")
+if (-not $SessionDir) {
+    $si = [array]::IndexOf($given, "--layer-stage-session-dir")
+    if ($si -ge 0 -and $si + 1 -lt $given.Count) { $SessionDir = [string]$given[$si + 1] }
+}
 for ($i = 0; $i -lt $given.Count; $i++) {
     $k = [string]$given[$i]
+    if ($k -in @("--layer-stage-vision", "--layer-stage-sessions")) { continue }
+    if ($useVision -and $k -eq "--vision") { $i++; continue }
     if ($k -like "--layer-stage-*" -or ($Context -gt 0 -and $k -eq "--max-context") -or ($PrefillChunk -gt 0 -and $k -eq "--prefill-chunk")) { $i++; continue }
     $a.Add($k)
 }
 if ($Context -gt 0) { $a.Add("--max-context"); $a.Add([string]$Context) }
 if ($PrefillChunk -gt 0) { $a.Add("--prefill-chunk"); $a.Add([string]$PrefillChunk) }
+if ($useVision) { $a.Add("--vision"); $a.Add("on"); $a.Add("--layer-stage-vision") }
+if ($useSessions) { $a.Add("--layer-stage-sessions") }
+if ($useSessions) {
+    if (-not $SessionDir) { $SessionDir = Join-Path $Root "sessions-worker" }
+    $a.Add("--layer-stage-session-dir"); $a.Add($SessionDir)
+}
 foreach ($x in @("--layer-stage-server", $Listen, "--layer-stage-split", [string]$Split, "--layer-stage-wire", $Wire)) { $a.Add($x) }
 
 if ($cfg.env) { foreach ($p in $cfg.env.PSObject.Properties) { Set-Item -Path "env:$($p.Name)" -Value ([string]$p.Value) } }

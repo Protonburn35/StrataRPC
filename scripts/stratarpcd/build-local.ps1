@@ -173,6 +173,12 @@ foreach ($n in @("cublas64_13.dll", "cublasLt64_13.dll")) {
     Copy-Item $src.FullName $out
 }
 Copy-Item (Join-Path $here "start-*.ps1") $out
+$configs = Join-Path $Root "configs\stratarpcd"
+if (Test-Path $configs) {
+    Copy-Item (Join-Path $configs "*.json") $out
+}
+$instructions = Join-Path $Root "docs\STRATARPCD-FIRST-RUN.md"
+if (Test-Path $instructions) { Copy-Item $instructions $out }
 Set-Content (Join-Path $out "BUILD.txt") "$id, CUDA $(Split-Path -Leaf $Cuda), MSVC $($msvc.Name), $Arch"
 Write-Host ""
 Write-Host "Built: $out"

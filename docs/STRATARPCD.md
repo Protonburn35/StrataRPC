@@ -1,5 +1,9 @@
 # StrataRPCD: DeepSeek-V4.1-Flash on two PCs
 
+**Vision and manual saved chats:** use [the current two-PC instructions](STRATARPCD-FIRST-RUN.md)
+and the supplied 2.25 bpw / 1M / BF16 configs. Both require protocol 2 on A and C and are explicitly
+opted into by those presets. The installation history below includes the earlier text-only builds.
+
 StrataRPCD runs DeepSeek-V4.1-Flash (IST-DAS 2.00 bpw) split by layers across two PCs, the way StrataRPC runs
 Qwen3.8-Flash-Next.
 
@@ -240,6 +244,6 @@ Send back:
 
 ## Not in this version
 
-- DSpark (it would be off on these PCs anyway), pictures, and saved conversation slots.
+- DSpark and automatic saved conversation slots. GPU vision and manual paired disk sessions are now available by opt-in; see STRATARPCD-FIRST-RUN.md.
 - The laptop as a third PC (next phase).
 - Overlapping the network with the GPUs during a prompt.

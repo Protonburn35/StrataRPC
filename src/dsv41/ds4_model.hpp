@@ -13,6 +13,7 @@
 // compressed KV and index keys included, which a checkpoint leaves in place - through a file or a host buffer.
 #pragma once
 
+#include "ds4_stage.hpp"
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -64,11 +65,15 @@ struct Options {
     // StrataRPC layer stage (ds4_stage.hpp): this process runs the model's layers [stage_begin, stage_end) (-1: to the
     // last).  The coordinator (stage_begin 0, stage_end the split) holds the embedding table and the Engram tables and
     // hands its last layer's rows to the worker at stage_client; the worker (stage_begin the split) holds the rest and
-    // the head, and gets its rows through set_stage_rows().  DSpark, vision and conversation slots are off in a stage;
+    // the head, and gets its rows through set_stage_rows(). DSpark and automatic conversation slots are off in a stage;
+    // GPU vision and manual paired disk sessions are separate opt-ins;
     // experts per word default to the model's (full quality) so both stages agree.  0 / -1: the whole model, as before.
     int stage_begin = 0, stage_end = -1;
     std::string stage_client;         // the coordinator: the worker's host:port
     std::string stage_token;          // the shared secret (STRATA_RPC_TOKEN)
+    bool stage_vision = false;       // coordinator GPU vision and image routing, opt-in on both stages
+    bool stage_sessions = false;     // manual paired disk sessions, off by default
+    std::string stage_session_dir;   // worker-owned snapshot folder
     int stage_wire = 0;               // h on the link: 0 FP32 (exact), 1 BF16, 2 FP16 (both lossy)
 };
 
@@ -194,6 +199,11 @@ public:
     /// The pictures of the prompt about to be fed ({}: none): positions inside a span read its rows (and route with
     /// the image bias, and take no part in the Engram n-grams); the rest the embedding table's.
     void set_images(std::vector<Image> images);
+    void set_image_spans(std::vector<stage::ImageSpan> images);
+    const std::vector<stage::ImageSpan>& image_spans() const;
+    bool save_session(const std::string& path, uint64_t& bytes, std::string& err);
+    bool load_session(const std::string& path, uint64_t& bytes, std::string& err);
+    bool stage_snapshot(bool save, const stage::SnapshotRef& ref, uint64_t& bytes, std::string& err);
 
     /// StrataRPC worker: where the next feeds' input rows come from - h [T][hc * dim] then pre [T][8] for positions
     /// p0 .. p0 + T - 1, in order (the coordinator's last layer's hand-off).  false with err: they did not come.

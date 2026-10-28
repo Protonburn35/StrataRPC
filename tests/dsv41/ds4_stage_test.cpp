@@ -10,6 +10,7 @@
 #include <cstring>
 #include <string>
 #include <thread>
+#include <map>
 #include <vector>
 
 using namespace strata::ds4::stage;
@@ -53,11 +54,29 @@ struct FakeModel : Backend {
     int last_logits_rows = 0;
     double sum = 0;            // what the rows add up to: the "logits" the fake samples from
 
+    std::vector<ImageSpan> image_spans;
+    struct Saved { int64_t pos; double sum; std::vector<int32_t> tokens; std::vector<ImageSpan> images; };
+    std::map<std::string, Saved> snapshots;
+    void images(const std::vector<ImageSpan>& v) override { image_spans = v; }
+    bool snapshot(bool save, const SnapshotRef& ref, uint64_t& bytes, std::string& err) override {
+        if (save) {
+            if (ref.position != p || ref.prefix != prefix_hash(toks)) { err = "prefix mismatch"; return false; }
+            snapshots[ref.id] = {p, sum, toks, image_spans};
+        } else {
+            const auto it = snapshots.find(ref.id);
+            if (it == snapshots.end() || ref.position != it->second.pos || ref.prefix != prefix_hash(it->second.tokens)) {
+                err = "missing or mismatched snapshot"; return false;
+            }
+            p = it->second.pos; sum = it->second.sum; toks = it->second.tokens; image_spans = it->second.images;
+        }
+        bytes = toks.size() * 4; return true;
+    }
     int64_t pos() const override { return p; }
     void reset() override {
         ++resets;
         p = 0;
         toks.clear();
+        image_spans.clear();
         for (auto& c : ck) c = -1;
         sum = 0;
     }
@@ -344,6 +363,45 @@ void test_wire_codec() {
     CHECK(parse_wire("bf16", f) && f == LayerStageWireFormat::bf16 && !parse_wire("int8", f));
 }
 
+void test_vision_sessions(int port) {
+    Spec spec = make_spec(LayerStageWireFormat::bf16);
+    spec.image_token = 17; spec.sessions = true;
+    Worker w(spec, port);
+    w.model.tolerance = 0.004f;
+    Client c;
+    std::string err;
+    CHECK(c.connect(w.endpoint, "secret", spec, err));
+    CHECK(c.images(0, {{1, 2, 77}}, err));
+    auto t = tokens(5, 9);
+    std::vector<float> h, pre;
+    make_rows(0, 5, h, pre);
+    int64_t after = 0;
+    CHECK(c.window(0, t.data(), 5, 1, h.data(), pre.data(), after, err));
+    CHECK(w.model.image_spans.size() == 1 && w.model.image_spans[0].hash == 77);
+    Sampling sampling; sampling.temperature = 1.2f; sampling.top_p = 0.9f; sampling.seed = 123; sampling.counter = 9;
+    int before = -1, restored = -2;
+    CHECK(c.sample(sampling, before, err));
+    SnapshotRef ref{"0123456789abcdef0123456789abcdef", 5, prefix_hash(t)};
+    uint64_t bytes = 0;
+    CHECK(c.snapshot(true, ref, bytes, err) && bytes == 20);
+    // A fresh connection resets live state, while snapshots survive it.
+    c.close();
+    CHECK(c.connect(w.endpoint, "secret", spec, err));
+    CHECK(c.snapshot(false, ref, bytes, err));
+    CHECK(c.sample(sampling, restored, err) && restored == before);
+    CHECK(w.model.image_spans.size() == 1 && w.model.image_spans[0].start == 1);
+    ref.prefix ^= 1;
+    CHECK(!c.snapshot(false, ref, bytes, err) && !c.connected());
+    ref.id = "../not-a-snapshot";
+    CHECK(!valid_snapshot(ref, spec.max_context));
+    CHECK(!valid_images({{3, 4, 1}, {4, 1, 2}}, spec.max_context));
+    CHECK(!valid_images({{(int64_t) spec.max_context, 1, 1}}, spec.max_context));
+    Spec wrong = spec; wrong.image_token = -1;
+    CHECK(!same_spec(spec, wrong, err));
+    wrong = spec; wrong.sessions = false;
+    CHECK(!same_spec(spec, wrong, err));
+}
+
 // the split rules on DeepSeek-V4.1-Flash's own layout (pack_gguf's geometry: tests/terminal/test_pack_gguf_engram.py)
 void test_split_rules() {
     Layout v41;
@@ -372,6 +430,7 @@ void test_split_rules() {
 }  // namespace
 
 int main() {
+    test_vision_sessions(port_base() + 15);
     test_split_rules();
     const int base = port_base();
     test_wire_codec();

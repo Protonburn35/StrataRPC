@@ -28,7 +28,7 @@ namespace strata::ds4::stage {
 
 using core::LayerStageWireFormat;
 
-constexpr uint16_t kProtocol = 1;
+constexpr uint16_t kProtocol = 2;   // image spans and paired disk snapshots; update both PCs together
 constexpr int kPreFloats = 8;        // the hand-off's `pre` floats a row
 constexpr int kPieceRows = 256;      // rows a ROWS frame carries at most (20 MiB of FP32 rows at V4.1's 4 x 5120)
 constexpr int kMaxTokens = 1 << 22;  // tokens a PROMPT names at most
@@ -40,10 +40,25 @@ struct Spec {
     uint32_t split = 0;                        // the worker's first layer
     uint32_t dim = 0, hc = 0, vocab = 0;
     uint64_t max_context = 0;
+    int32_t image_token = -1;                // worker uses image routing, but never loads a vision tower
+    bool sessions = false;                   // manual disk sessions, explicitly enabled on both PCs
     LayerStageWireFormat wire = LayerStageWireFormat::fp32;
     size_t h_floats() const { return (size_t) hc * dim; }   // h's floats a row
 };
 bool same_spec(const Spec& a, const Spec& b, std::string& why);
+
+struct ImageSpan {
+    int64_t start = 0, length = 0;
+    uint64_t hash = 0;                        // the coordinator's image hash, for restored prefix reuse
+};
+bool valid_images(const std::vector<ImageSpan>& images, uint64_t context);
+struct SnapshotRef {
+    std::string id;                           // generated 32-character hex ID, never a path from the peer
+    int64_t position = 0;
+    uint64_t prefix = 0;
+};
+bool valid_snapshot(const SnapshotRef& ref, uint64_t context);
+uint64_t prefix_hash(const std::vector<int32_t>& tokens);
 bool parse_wire(const std::string& s, LayerStageWireFormat& f);
 const char* wire_name(LayerStageWireFormat f);
 /// A stable 128-bit hash of a text (the model identity the coordinator and the worker each build from their pack).
@@ -90,6 +105,11 @@ public:
                       std::string& err) = 0;
     virtual int sample(const Sampling& s) = 0;
     virtual bool logits(std::vector<float>& out) = 0;
+    virtual void images(const std::vector<ImageSpan>&) {}
+    virtual bool snapshot(bool, const SnapshotRef&, uint64_t&, std::string& err) {
+        err = "disk sessions are disabled";
+        return false;
+    }
 };
 
 /// The coordinator's end: one connection to the worker, kept for the life of the engine (connected again after a
@@ -110,6 +130,8 @@ public:
     bool checkpoint(int slot, int64_t pos, std::string& err);
     bool restore(int64_t limit, bool& restored, int64_t& pos, std::string& err);
     bool pin(std::string& err);
+    bool images(int64_t position, const std::vector<ImageSpan>& images, std::string& err);
+    bool snapshot(bool save, const SnapshotRef& ref, uint64_t& bytes, std::string& err);
     /// a window whose rows are all known (a step, a short feed): the worker feeds them and answers when done
     bool window(int64_t p0, const int32_t* tokens, int n, int logits_rows, const float* h, const float* pre,
                 int64_t& pos_after, std::string& err);

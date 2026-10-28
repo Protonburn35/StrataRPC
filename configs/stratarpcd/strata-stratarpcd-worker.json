@@ -1,0 +1,46 @@
+{
+  "exe": "C:\\StrataRPCD\\engine-rpcd\\strata-dsv41.exe",
+  "args": [
+    "--pack",
+    "C:\\Strata-data\\packs\\deepseek-v4.1-flash-ist-das-2.25bpw",
+    "--max-context",
+    "1048576",
+    "--eos",
+    "1",
+    "--gpus",
+    "0",
+    "--experts",
+    "6",
+    "--vision",
+    "on",
+    "--dspark",
+    "none",
+    "--layer-stage-vision",
+    "--layer-stage-sessions",
+    "--layer-stage-session-dir",
+    "C:\\StrataRPCD\\sessions-worker",
+    "--layer-stage-server",
+    "192.168.50.143:39501",
+    "--layer-stage-split",
+    "20",
+    "--layer-stage-wire",
+    "bf16"
+  ],
+  "cwd": "C:\\StrataRPCD",
+  "tokenizer": "C:\\Strata-data\\packs\\deepseek-v4.1-flash-ist-das-2.25bpw\\tokenizer",
+  "model_name": "deepseek-v4.1-flash",
+  "arch": "deepseek41",
+  "log": "C:\\StrataRPCD\\stratarpcd-worker.log",
+  "lib_dirs": [
+    "C:\\StrataRPCD\\engine-rpcd"
+  ],
+  "engine_ready_s": 3600,
+  "gpu": 0,
+  "gpus_asked": true,
+  "env": {
+    "STRATA_LAYER_STAGE_STATS": "1",
+    "STRATA_DS4_SLOT_KEEP": "0"
+  },
+  "drafting": "off",
+  "mtp": false
+}
