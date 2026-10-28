@@ -178,6 +178,9 @@ Windows build notes:
     (2.00) / 1,768 (2.25), C 989-1,058 / 958.
   - The 70K prompt's time on C was mostly C's own work: without the skip it runs its 20 layers on every token. The
     transfer (5.7 GB) is about 50 s on gigabit. The user's link speed is not known yet.
+- **With the long-prompt fix and the RAM store fix (the user's local build of f7bba148, 1M context, FP32 rows):** the
+  same 69,701-token prompt read at about 450 tok/s (user report; was 236 with the skip off). Logs not in yet: the worker's
+  new `-Stats` line will split the time into the link, waiting for A, and C's own work.
 - **RAM store fix (`store_gb_now`):** after the weights are on the GPU, the engine sizes the store again, and when the
   free RAM fell by 4 GB or more it took the PC for a shared-memory one (Strix Halo) and set aside 0.11 MB of RAM per
   token of context beyond 16K. A's own host buffers (8192-token prompt chunks) took 6.4 GB, so at 1M it set aside about
