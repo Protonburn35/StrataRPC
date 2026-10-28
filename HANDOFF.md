@@ -225,8 +225,10 @@ Windows build notes:
   adding to the split. **The 4090 alone answers nearly as fast as the split** (2.00, 8K: 9.02 tok/s with 3,098 GPU
   experts): the split's answer gain is ~12%, so its value is mainly prompts and room for 2.25 at 1M. Next comparison
   asked of the user: the 4090 alone on 2.25, 1M, the 60K prompt (`single-4090-2.25.json`, slots off).
-- **Settled setup (2026-10-28, revised):** both sets stay - **2.25 for quality, 2.00 for speed** (the user no longer
-  plans to delete 2.00) - each at 1M context, BF16 rows (the scripts' default), default prompt chunks, `-Stats`.
+- **Settled setup (2026-10-28, final):** **2.25 only**, 1M context, BF16 rows (the scripts' default), default prompt
+  chunks, `-Stats`. The user deletes 2.00 and uses Qwen3.8-Flash-Next (StrataRPC `main`, `C:\Strata`) as the fast
+  model. The user's goal for DeepSeek: a Nintendo Switch static-recompilation PC port (exact AArch64 semantics, long
+  disassembly contexts), hence 2.25. The layer-major test (`DS4_LAYER_CACHE_MB`) is to be run on 2.25.
   Answer-speed levers left are all small (the head on A: likely ~0-2% after the 256K test; one round trip a token: <1%). Prompt-side: saved
   conversation slots in the split (each PC saving its half of the cache) would spare re-reading a long prompt after
   switching conversations; the overlap is worth a few seconds. **Biggest prompt lever found: A runs chunk-major
