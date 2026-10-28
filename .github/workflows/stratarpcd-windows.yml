@@ -125,6 +125,10 @@ jobs:
           # Windows PowerShell 5.1, the conda toolkit (the PCs use NVIDIA's installer), the Python with CMake and Ninja on PATH
           # (Continue: under Stop, 5.1 turns the build's first stderr line into an error when the output goes to a file)
           $ErrorActionPreference = "Continue"
+          # micromamba's init-shell set cmd's AutoRun to the conda activation, which selects VS 2019's toolset (MSVC 14.29): the
+          # build's own cmd.exe children would run it before each compile and nvcc would drop C++20 there (build 10). The PCs
+          # have no such AutoRun; build-local.ps1 warns when one is set.
+          Remove-ItemProperty -Path "HKCU:\Software\Microsoft\Command Processor" -Name AutoRun -ErrorAction SilentlyContinue
           $cuda = Join-Path $env:MAMBA_ROOT_PREFIX "envs\cuda-build\Library"
           $id = (git rev-parse --short=9 HEAD)
           powershell -NoProfile -ExecutionPolicy Bypass -File scripts\stratarpcd\build-local.ps1 -Root $PWD.Path -Cuda $cuda -Jobs 3 -BuildId $id > build.log 2>&1

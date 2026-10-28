@@ -193,7 +193,10 @@ Windows build notes:
   `build-rpcd\engine-rpcd\*` into `C:\StrataRPCD\engine-rpcd`. The workflow's build step runs the same script (with
   the conda toolkit), so a green run tests it. It re-marks changed sources by content hash, because a re-extracted ZIP
   keeps old file times. **The user's first local build took 7.5 minutes** (2026-10-28, from commit f7bba148, both
-  archs), and it worked.
+  archs), and it worked. Build 10 (the first workflow run through the script) failed after 24 minutes: micromamba's
+  `init-shell: cmd.exe` sets cmd's AutoRun to the conda activation, which selects VS 2019's toolset, and the build's own
+  cmd.exe children ran it before each compile. The workflow now removes that AutoRun before the build; the script warns
+  when a PC has one.
 - **The user is adding the 2.25 set** (docs/STRATARPCD.md, "Adding the 2.25 bpw set"). On A the shared files were
   downloaded with `hf download` beside the 2.00 shards, and setup only looks for them in
   `models/deepseek-v4.1-flash-shared` (`dsv41_find_shared`): hard links put them there. With two configs the start

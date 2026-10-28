@@ -131,7 +131,13 @@ foreach ($f in $files) {
 }
 if ($old.Count -gt 0) { Write-Host "$touched source files changed since the last build" }
 
-# configure and build in a cmd with VS 2022's environment (/d: no AutoRun, so nothing else sets up another toolset first)
+# configure and build in a cmd with VS 2022's environment (/d: no AutoRun, so nothing else sets up another toolset first).  The
+# build's own cmd.exe children run cmd's AutoRun all the same: `conda init cmd.exe` puts its activation there, and with a
+# conda CUDA that activation selects VS 2019's toolset before each compile (nvcc then drops C++20).
+foreach ($k in @("HKCU:\Software\Microsoft\Command Processor", "HKLM:\Software\Microsoft\Command Processor")) {
+    $ar = (Get-ItemProperty -Path $k -Name AutoRun -ErrorAction SilentlyContinue).AutoRun
+    if ($ar) { Write-Warning "cmd's AutoRun ($k) runs before every compile: $ar - if the build fails with C++20 errors, clear it for the build" }
+}
 $id = if ($BuildId) { $BuildId } else { "local-" + (Get-Date -Format "yyyyMMdd-HHmm") }
 $cmdFile = Join-Path $bd "build.cmd"
 $cmdLines = @(
