@@ -189,7 +189,8 @@ Windows build notes:
   docs/STRATARPCD.md "Building the engine yourself"). The user keeps the source in `C:\StrataRPCD-project` and copies
   `build-rpcd\engine-rpcd\*` into `C:\StrataRPCD\engine-rpcd`. The workflow's build step runs the same script (with
   the conda toolkit), so a green run tests it. It re-marks changed sources by content hash, because a re-extracted ZIP
-  keeps old file times.
+  keeps old file times. **The user's first local build took 7.5 minutes** (2026-10-28, from commit f7bba148, both
+  archs), and it worked.
 - **The user is adding the 2.25 set** (docs/STRATARPCD.md, "Adding the 2.25 bpw set"). On A the shared files were
   downloaded with `hf download` beside the 2.00 shards, and setup only looks for them in
   `models/deepseek-v4.1-flash-shared` (`dsv41_find_shared`): hard links put them there. With two configs the start
