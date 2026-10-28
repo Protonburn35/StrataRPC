@@ -3,6 +3,72 @@
 Read this first. Claude and Sol (GPT/Codex) both work here. Fetch before you start, keep the other's commits, update this
 file with every push, and never force-push.
 
+## Start here (2026-10-28): the user's setup and Sol's next two tasks
+
+**The setup the user runs** (both PCs on the user's own local build of this branch, `scripts/stratarpcd/build-local.ps1`
+from `C:\StrataRPCD-project`, copied into `C:\StrataRPCD\engine-rpcd`):
+
+- **IST-DAS 2.25 bpw only** (2.00 deleted; Qwen3.8-Flash-Next on StrataRPC `main` is the user's fast model), **1M
+  context**, **BF16 rows** (the start scripts' default), default prompt chunks, `-Stats`. C's firewall rule admits A
+  (192.168.50.206) only.
+- **C (worker, 192.168.50.143, over SSH in PowerShell)**, then **A (coordinator)**, the same `STRATA_RPC_TOKEN` in both:
+
+  ```powershell
+  # C
+  powershell -NoProfile -ExecutionPolicy Bypass -File .\engine-rpcd\start-worker.ps1 -Config C:\StrataRPCD\strata-deepseek-v4.1-flash-ist-das-2.25bpw.json -Context 1048576 -Listen 192.168.50.143:39501 -Stats
+  # A
+  powershell -NoProfile -ExecutionPolicy Bypass -File .\engine-rpcd\start-coordinator.ps1 -Config C:\StrataRPCD\strata-deepseek-v4.1-flash-ist-das-2.25bpw.json -Context 1048576 -Worker 192.168.50.143:39501 -Port 8081 -Stats
+  ```
+
+- **Measured** (60,283-token prompt): 123.4 s (488 tok/s) to read it, **6.8 tok/s** answering. Answer speed is what
+  the user cares about; it is at this hardware's ceiling without losing quality (see Status). The user's DeepSeek goal:
+  a Nintendo Switch static-recompilation PC port.
+- **The user's rules still hold:** nothing that lowers quality, every experiment opt-in, both PCs updated together.
+
+### Task 1: vision in the split
+
+- **Now:** `stage_cut` (ds4_model.cu) drops `vision.*` / `aligner.*` on both stages and sets `o.vision = false`, though
+  setup built the tower into the pack (`mmproj-BF16.gguf`) and the config passes `--vision on`.
+- **Where it runs:** on A, which holds the embedding table. Pictures come in through the serve loop's `GENI` command
+  (ds4_main.cpp: the `DSI1` pictures file); the tower's rows replace the token embeddings at the image positions
+  (`img_tok`, `image_row(p)`, `in_image(p)` in ds4_model.cu). Keep `vision.*` out of the identity hash, as now.
+- **The catch:** the MoE layers route image positions with their own gate bias (`ffn.gate.bias_vl`; see the `img_tok`
+  use near the layer setup, ~line 3995). So the worker's layers 20-39 must know which rows are image rows, though it
+  never sees the pictures. Send a per-row image flag (or the image spans) with WINDOW and PROMPT rows, and have the
+  worker's `in_image()` answer from it. That is a protocol change: bump `kProtocol` (ds4_stage.cpp), add it to the
+  GPU-free test, and update both PCs together.
+- **Cost:** the tower is ~319 MiB on A (about 33 fewer experts there).
+- **Reference:** StrataRPC `main` did vision for the Qwen layer stage in Exp28 (docs/LAYER_STAGE_RPC.md there).
+- **Test:** the same picture prompt on one PC (setup's single-PC config) and through the split; the answers should
+  agree.
+
+### Task 2: port StrataRPC's optional paired disk sessions ("save chats")
+
+- **The feature (StrataRPC `main`, commit `9bd85e5b` "Add opt-in paired disk sessions for layer-stage RPC", Exp29,
+  docs/LAYER_STAGE_RPC.md ~lines 24-55):**
+  - **Manual:** `POST /slots/0?action=save|restore` with `{"filename": "chat-1.bin"}` on the host API.
+  - **Each PC saves only its own layers' state to its own SSD.** The worker writes `<snapshot-id>.srpc` first; then
+    the host publishes its file, which holds the snapshot id. Only the small descriptor crosses Ethernet.
+  - **Opt-in:** `--layer-stage-sessions` on both, `--layer-stage-session-dir` on the worker, `slot_save_path` in the
+    host's JSON.
+- **What this branch already has:** serve/server.py implements `/slots/0?action=save|restore` by writing
+  `SAVE <path>` / `RESTORE <path>` to the engine's stdin and waiting for `SAVED` / `RESTORED` / `SERR ...` (around
+  server.py lines 2434-2460 and 4194-4250; `slot_save_path`).
+- **What is missing:**
+  - **strata-dsv41's serve loop (ds4_main.cpp) has no `SAVE` / `RESTORE`.** It only keeps conversations
+    automatically (STRATA_DS4_SLOT_KEEP, `ds4-slots`, built on `Model::slot_save` / `slot_load`).
+  - **In a stage, `Model::slot_save` / `slot_load` refuse,** and the worker forces `STRATA_DS4_SLOT_KEEP=0`.
+- **Plan:**
+  1. **`SAVE` / `RESTORE` in ds4_main.cpp's serve loop** on top of `slot_save` / `slot_load`. This works on one PC
+     too.
+  2. **In a stage:** new DSTG ops (e.g. SNAP_SAVE id / SNAP_LOAD id). The worker saves or loads its half (its layers'
+     window rings, compressed KV, index keys, the compressors' partial groups, the position) in its session dir. It
+     goes first; then the coordinator writes its file with the snapshot id, the spec / identity hash, the split, the
+     context and the position. On restore, both sides check all of them.
+  3. **Lift the stage refusal** in `slot_save` / `slot_load` for a stage's own layers (A: no head; C: no embedding).
+  4. **Keep it opt-in, off by default,** as in Exp29.
+  5. **Tests:** the new ops in ds4_stage_test, and a save / restore round trip.
+
 ## Goal
 
 Run DeepSeek-V4.1-Flash (IST-DAS 2.00 bpw) across PCs with layer-stage RPC, the way StrataRPC `main` runs
