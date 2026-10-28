@@ -192,6 +192,16 @@ Windows build notes:
     expert of layer cache within `ram_avail() - kRamMargin` (8 GB); A has ~12 GB free after its 7.6 GB store.
     C's line: 5,959 experts streamed (44.9 GB from the files, 7.5 GB from RAM: one pass, the skip leaves it only the
     tail), the compute waited 11.5 s for reads.
+  - **Forced layer-major works (2.00, BF16, 1M, `DS4_LAYER_CACHE_MB=2048` on A, logs 09:49):** A's stream line: 45,074
+    experts streamed, 6,235 from the files (**52.7 GB**, was 320), 6,216 from RAM, **32,623 again from the layer cache
+    (layer-major, 8 chunks, 2.1 GB of RAM)**; the compute waited 9.2 s for reads (was 44.0); A's share 77.0 s (was
+    93.3). The prompt **93.3 s, 646 tok/s** (was 109.3 s, 552); answers 8.04 tok/s. The state's trips to the host and
+    back at every layer cost about 19 s of the 35 s saved (perhaps pageable: a 5.5 GB pinned allocation may fail).
+    The forced setting does not bound the state (84 KB a token): unsafe past ~70K tokens on this 32 GB PC.
+  - **Next proposed (asked the user): segment long prompts so layer-major always fits the free RAM** (each segment's
+    state within `ram_avail() - kRamMargin`, run layer-major, segments in order; one expert pass per segment instead
+    of per chunk; on the worker each segment would get its own skip tail). Open question to the user: did A page
+    during the forced run (if not, the 8 GB `kRamMargin` is too conservative there)?
   - **So the overlap is still small** (rows come per chunk, but A's time is reads), and **the real prompt lever is
     layer-major on A**: one pass over its ~47 GB instead of eight would cut A's reads from 320 GB to ~40-50 GB.
     Cheap test, no code: `DS4_LAYER_CACHE_MB=2048` on A forces `lm_begin` past the RAM check (it then allocates the
