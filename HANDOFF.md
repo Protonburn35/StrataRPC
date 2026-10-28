@@ -198,7 +198,8 @@ Windows build notes:
     93.3). The prompt **93.3 s, 646 tok/s** (was 109.3 s, 552); answers 8.04 tok/s. The state's trips to the host and
     back at every layer cost about 19 s of the 35 s saved (perhaps pageable: a 5.5 GB pinned allocation may fail).
     The forced setting does not bound the state (84 KB a token): unsafe past ~70K tokens on this 32 GB PC.
-  - **Next proposed (asked the user): segment long prompts so layer-major always fits the free RAM** (each segment's
+  - **Deprioritized (user, 2026-10-28: prompt speed is fine, answer speed is what bothers them). Was proposed:
+    segment long prompts so layer-major always fits the free RAM** (each segment's
     state within `ram_avail() - kRamMargin`, run layer-major, segments in order; one expert pass per segment instead
     of per chunk; on the worker each segment would get its own skip tail). Open question to the user: did A page
     during the forced run (if not, the 8 GB `kRamMargin` is too conservative there)?
@@ -235,6 +236,11 @@ Windows build notes:
   adding to the split. **The 4090 alone answers nearly as fast as the split** (2.00, 8K: 9.02 tok/s with 3,098 GPU
   experts): the split's answer gain is ~12%, so its value is mainly prompts and room for 2.25 at 1M. Next comparison
   asked of the user: the 4090 alone on 2.25, 1M, the 60K prompt (`single-4090-2.25.json`, slots off).
+- **Answer speed is the user's concern.** Measured levers gave nothing (+45-63 VRAM experts a card: no change; DSpark
+  halves the speed). Last cheap, lossless test offered: a bigger RAM store via `DS4_STORE_GB` (the auto size is free
+  RAM - 12 GB: A 7.5 GB, C 10 GB; C only runs the worker over SSH): `DS4_STORE_GB=15` on C, `10` on A. Uncertain:
+  Windows' standby list already caches the in-place (mmap) expert pages in that RAM. Beyond that only hardware helps
+  (more RAM, a bigger card in C's place); Qwen3.8-Flash-Next is the user's fast model.
 - **Settled setup (2026-10-28, final):** **2.25 only**, 1M context, BF16 rows (the scripts' default), default prompt
   chunks, `-Stats`. The user deletes 2.00 and uses Qwen3.8-Flash-Next (StrataRPC `main`, `C:\Strata`) as the fast
   model. The user's goal for DeepSeek: a Nintendo Switch static-recompilation PC port (exact AArch64 semantics, long
