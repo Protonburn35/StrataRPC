@@ -185,6 +185,11 @@ Windows build notes:
   3.4 GB, just under the limit.
 - **Worker `-Stats` line:** each prompt now also says the MB of rows, the time receiving them (first byte to last, so
   MB/s is the link), the time waiting for the coordinator (before a frame's first byte) and the worker's own time.
+- **Local builds:** `scripts/stratarpcd/build-local.ps1` builds the engine on a PC (VS 2022 Build Tools + CUDA 13.2.1,
+  docs/STRATARPCD.md "Building the engine yourself"). The user keeps the source in `C:\StrataRPCD-project` and copies
+  `build-rpcd\engine-rpcd\*` into `C:\StrataRPCD\engine-rpcd`. The workflow's build step runs the same script (with
+  the conda toolkit), so a green run tests it. It re-marks changed sources by content hash, because a re-extracted ZIP
+  keeps old file times.
 - **The user is adding the 2.25 set** (docs/STRATARPCD.md, "Adding the 2.25 bpw set"). On A the shared files were
   downloaded with `hf download` beside the 2.00 shards, and setup only looks for them in
   `models/deepseek-v4.1-flash-shared` (`dsv41_find_shared`): hard links put them there. With two configs the start

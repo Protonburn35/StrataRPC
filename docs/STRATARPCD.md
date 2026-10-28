@@ -159,6 +159,47 @@ The 2.25 set (155 GB of model) has better quality than 2.00: about 7.3% above th
 3. **Starting it:** with two configs, pass `-Config C:\StrataRPCD\strata-deepseek-v4.1-flash-ist-das-2.25bpw.json` (or
    `...-2.00bpw.json`) to both start scripts. Both PCs must run the same set.
 
+## Building the engine yourself (optional)
+
+Instead of waiting for GitHub's build (about 40 minutes) after each change, one PC can build the engine (roughly 10-15
+minutes the first time, a few minutes after a change) and you copy it to both. The source lives in a folder of its own,
+`C:\StrataRPCD-project`; `C:\StrataRPCD` stays as it is.
+
+**Once, in an administrator PowerShell** (about 9 GB; the display driver is not touched):
+
+```powershell
+# Visual Studio 2022 Build Tools with the C++ compiler (VS 2026 does not work with CUDA 13.2)
+Invoke-WebRequest https://aka.ms/vs/17/release/vs_BuildTools.exe -OutFile $env:TEMP\vs_BuildTools.exe
+Start-Process $env:TEMP\vs_BuildTools.exe -ArgumentList "--quiet","--wait","--norestart","--nocache","--add","Microsoft.VisualStudio.Workload.VCTools","--includeRecommended" -Wait
+# CUDA Toolkit 13.2.1: only the compiler, the runtime and cuBLAS
+Invoke-WebRequest https://developer.download.nvidia.com/compute/cuda/13.2.1/network_installers/cuda_13.2.1_windows_network.exe -OutFile $env:TEMP\cuda_13.2.1.exe
+Start-Process $env:TEMP\cuda_13.2.1.exe -ArgumentList "-s","nvcc_13.2","crt_13.2","nvvm_13.2","nvptxcompiler_13.2","nvfatbin_13.2","cudart_13.2","cublas_13.2","cublas_dev_13.2","thrust_13.2" -Wait
+```
+
+**Each time** (a normal PowerShell; stop the model on this PC while it builds, the compiler needs the RAM):
+
+```powershell
+# the source, over the old one
+Invoke-WebRequest https://github.com/Protonburn35/StrataRPC/archive/refs/heads/stratarpcd.zip -OutFile $env:TEMP\stratarpcd.zip
+Remove-Item -Recurse -Force $env:TEMP\stratarpcd -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force $env:TEMP\stratarpcd, C:\StrataRPCD-project | Out-Null
+tar -xf $env:TEMP\stratarpcd.zip -C $env:TEMP\stratarpcd
+Copy-Item $env:TEMP\stratarpcd\StrataRPC-stratarpcd\* C:\StrataRPCD-project -Recurse -Force
+# the build (Python, CMake and Ninja come from C:\StrataRPCD's .venv)
+cd C:\StrataRPCD-project
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\stratarpcd\build-local.ps1 -Python C:\StrataRPCD\.venv\Scripts\python.exe
+```
+
+- **The result:** `C:\StrataRPCD-project\build-rpcd\engine-rpcd` holds the exe, the two cuBLAS DLLs and the start
+  scripts. Copy everything in it into `C:\StrataRPCD\engine-rpcd` on each PC, with the model stopped there.
+  `-Install C:\StrataRPCD\engine-rpcd` does that for this PC (it keeps the old exe as `strata-dsv41.prev.exe`).
+- **What it checks:** that VS 2022's own C++ toolset and CUDA 13.x with the parts above are there, and it says what is
+  missing. It builds for both cards (sm_89 + sm_120), so one exe runs on both PCs. `-Clean` builds from scratch.
+- **A new ZIP over an old one:** the extracted files keep their commit times, which can be older than the last build.
+  The script compares the files' contents with the last build's and marks the changed ones, so they are compiled again.
+- **`--version`** of such an exe says `local-<date>-<time>` instead of a commit.
+- **GitHub's build runs the same script,** so a green build there means the script works.
+
 ## What to test, in order
 
 1. **Each PC alone:** setup's 16-word test passed on both.
