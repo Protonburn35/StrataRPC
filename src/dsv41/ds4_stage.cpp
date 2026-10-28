@@ -133,12 +133,15 @@ bool recv_frame(rpc::Socket s, const rpc::IoDeadline& dl, uint16_t& type, uint64
 }
 
 // a whole frame that may be long in coming (a request on an idle connection, the next rows of a prompt): its first byte
-// waited for as long as it takes, then `timeout` for the rest
+// waited for as long as it takes (idle_ms: how long), then `timeout` for the rest
 bool recv_frame_idle(rpc::Socket s, std::chrono::milliseconds timeout, uint16_t& type, uint64_t& op,
-                     std::vector<uint8_t>& payload, std::string& err) {
+                     std::vector<uint8_t>& payload, std::string& err, double* idle_ms = nullptr) {
     uint8_t h[kHeaderBytes];
     uint64_t n = 0;
+    const auto t0 = std::chrono::steady_clock::now();
     if (!rpc::recv_all(s, h, 1, rpc::wait_forever(), err)) return false;
+    if (idle_ms != nullptr)
+        *idle_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     const rpc::IoDeadline dl = rpc::deadline_after(timeout);
     if (!rpc::recv_all(s, h + 1, kHeaderBytes - 1, dl, err) || !parse_header(h, type, op, n, err)) return false;
     payload.resize((size_t) n);
@@ -778,6 +781,10 @@ bool Server::serve(rpc::Socket s, std::string& err) {
                 int64_t f_p0 = p0;          // the position of the queue's first row
                 bool halted = false, broken = false;
                 std::vector<uint8_t> fp;
+                // (-Stats: the rows' frames from their first byte to their last, and the time before that first byte - the
+                // coordinator still computing them - so the log tells the link apart from the two PCs' own work)
+                double rx_ms = 0, rx_idle_ms = 0;
+                uint64_t rx_bytes = 0;
                 const RowFn rows = [&](int64_t q0, int T, float* hd, float* pd, std::string& e) {
                     if (halted || broken) {
                         e = halted ? "the coordinator stopped the prompt" : "the link to the coordinator failed";
@@ -792,11 +799,16 @@ bool Server::serve(rpc::Socket s, std::string& err) {
                         uint16_t t2 = 0;
                         uint64_t op2 = 0;
                         std::string ie;
-                        if (!recv_frame_idle(s, kPromptTimeout, t2, op2, fp, ie) || t2 != kRows) {
+                        const auto r0 = std::chrono::steady_clock::now();
+                        double idle = 0;
+                        if (!recv_frame_idle(s, kPromptTimeout, t2, op2, fp, ie, &idle) || t2 != kRows) {
                             broken = true;
                             e = ie.empty() ? "expected the prompt's rows" : "the prompt's rows: " + ie;
                             return false;
                         }
+                        rx_idle_ms += idle;
+                        rx_ms += ms_since(r0) - idle;
+                        rx_bytes += kHeaderBytes + fp.size();
                         Reader q{fp.data(), fp.size(), 0};
                         int64_t rp0 = 0;
                         uint32_t rT = 0, flags = 0;
@@ -867,9 +879,15 @@ bool Server::serve(rpc::Socket s, std::string& err) {
                 }
                 if (!ok) return refuse("a prompt failed: " + fe);
                 if (f_p0 != p0 + (int64_t) nt) return refuse("the worker's feed did not take every row");
-                if (stats)
-                    std::fprintf(stderr, "ds4 stage: prompt of %u tokens at %lld in %.0f ms\n", nt, (long long) p0,
-                                 ms_since(t0));
+                if (stats) {
+                    const double all = ms_since(t0);
+                    std::fprintf(stderr,
+                                 "ds4 stage: prompt of %u tokens at %lld in %.0f ms: %.0f MB of rows in %.0f ms (%.0f MB/s), "
+                                 "%.0f ms waiting for the coordinator, %.0f ms the worker's own\n",
+                                 nt, (long long) p0, all, (double) rx_bytes / 1e6, rx_ms,
+                                 rx_ms > 0 ? (double) rx_bytes / 1e3 / rx_ms : 0.0, rx_idle_ms,
+                                 std::max(0.0, all - rx_ms - rx_idle_ms));
+                }
                 Writer w;
                 w.i64(backend_.pos());
                 if (!respond(true, "", w.b)) return false;

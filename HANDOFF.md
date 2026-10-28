@@ -166,6 +166,25 @@ Windows build notes:
   layer 20 of 40) and the coordinator (no skip) never take the new branch. A Python model of the prediction against the
   call order (chunk-major and layer-major) reproduced the failure and passes with the fix. Until the user has the new
   build, `STRATA_DS4_PROMPT_SKIP=0` on the worker avoids it (no skip: the same answers, slower long prompts).
+- **First measurements (2026-10-28, FP32 rows, `-Stats`, from the user's logs):**
+
+  | Run | Prompt | Answer | Per answer token (waiting on C) |
+  |---|---|---|---|
+  | 2.00, 8K context | 347 tokens at 23.9 tok/s | 9.02 tok/s over 2,955 tokens | 93-140 ms (60-86) |
+  | 2.25, 8K context | 347 tokens at 19.9 tok/s | 6.46 tok/s over 921 tokens | 150-167 ms (~100) |
+  | 2.00, 1M context, worker with `STRATA_DS4_PROMPT_SKIP=0` | 69,701 tokens at 216-236 tok/s (295-323 s; 5,712 MB to C; 228-245 s waiting on C) | 5.6-5.7 tok/s at ~70K | 174-182 ms (90-95) |
+
+  - RAM store: A 5.4 GB at 8K but **0 GB at 1M** (see the next item); C 9.7-10.1 GB. Experts in VRAM: A 2,040
+    (2.00) / 1,768 (2.25), C 989-1,058 / 958.
+  - The 70K prompt's time on C was mostly C's own work: without the skip it runs its 20 layers on every token. The
+    transfer (5.7 GB) is about 50 s on gigabit. The user's link speed is not known yet.
+- **RAM store fix (`store_gb_now`):** after the weights are on the GPU, the engine sizes the store again, and when the
+  free RAM fell by 4 GB or more it took the PC for a shared-memory one (Strix Halo) and set aside 0.11 MB of RAM per
+  token of context beyond 16K. A's own host buffers (8192-token prompt chunks) took 6.4 GB, so at 1M it set aside about
+  113 GB and the store went to 0. The rule now also needs an integrated GPU (`cudaDeviceProp::integrated`). C's drop was
+  3.4 GB, just under the limit.
+- **Worker `-Stats` line:** each prompt now also says the MB of rows, the time receiving them (first byte to last, so
+  MB/s is the link), the time waiting for the coordinator (before a frame's first byte) and the worker's own time.
 - **The user is adding the 2.25 set** (docs/STRATARPCD.md, "Adding the 2.25 bpw set"). On A the shared files were
   downloaded with `hf download` beside the 2.00 shards, and setup only looks for them in
   `models/deepseek-v4.1-flash-shared` (`dsv41_find_shared`): hard links put them there. With two configs the start
