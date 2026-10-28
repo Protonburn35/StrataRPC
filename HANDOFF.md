@@ -187,6 +187,12 @@ Windows build notes:
   - **Next, lossless:** overlap the link with A's work (a sender thread on A with a host buffer, so A computes chunk
     k+1 while chunk k's rows go out and C works on them). Expected: about max(A ~75-80 s, link + C ~64 s) = ~80-85 s,
     ~700+ tok/s. BF16 rows would save ~21 s without overlap (~530 tok/s) and little with it.
+- **2.25 at 1M context, same 60,283-token prompt (logs 08:20):** 146.7 s (411 tok/s): link 41.9 s (118 MB/s), waiting
+  for A 83.9 s, C's own 20.9 s; then 6.55 tok/s over 1,723 tokens (130-168 ms a token, 74-93 of it waiting on C).
+  Experts in VRAM: A 1,683, C 897.
+- **What the 1M context costs in VRAM (8K vs 1M, same set):** the log's `caches` (compressed KV, index keys, window
+  rings) are 0.58 GB on A and 0.39 GB on C; with the buffers sized by the context the experts lose 0.81 GB on A
+  (2,040 -> 1,942 for 2.00) and 0.61 GB on C (1,058 -> 989): 5-7% of each card's expert slots.
 - **RAM store fix (`store_gb_now`):** after the weights are on the GPU, the engine sizes the store again, and when the
   free RAM fell by 4 GB or more it took the PC for a shared-memory one (Strix Halo) and set aside 0.11 MB of RAM per
   token of context beyond 16K. A's own host buffers (8192-token prompt chunks) took 6.4 GB, so at 1M it set aside about
