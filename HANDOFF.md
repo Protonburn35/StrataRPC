@@ -156,6 +156,12 @@ Windows build notes:
   Setup moved the files from `C:\StrataRPCD\models` to `C:\Strata-data\models\deepseek-v4.1-flash-IST-DAS-2.00bpw`
   (its shared data folder; the user is fine with that) and the pack is in `C:\Strata-data\packs\`. The config is
   `C:\StrataRPCD\strata-deepseek-v4.1-flash-ist-das-2.00bpw.json` (API port 8080). PC C's setup is next (sm_120).
+- **The A + C split works (2026-10-28, user report: "working way better than expected")** with the 2.00 set, FP32
+  rows, `-Stats` on both. The numbers are not in yet: ask the user for A's log and C's worker log.
+- **The user is adding the 2.25 set** (docs/STRATARPCD.md, "Adding the 2.25 bpw set"). On A the shared files were
+  downloaded with `hf download` beside the 2.00 shards, and setup only looks for them in
+  `models/deepseek-v4.1-flash-shared` (`dsv41_find_shared`): hard links put them there. With two configs the start
+  scripts need `-Config`.
 - **Next step: the user runs it on A and C** (docs/STRATARPCD.md, "What to test, in order"). Nothing in stage mode has
   run on a GPU yet, so the first logs are the first real test of `ds4_model.cu`'s stage hooks.
 - **If the dialect problem comes back:** the next thing to try is NVIDIA's installer CUDA 13.0 (as mainline's

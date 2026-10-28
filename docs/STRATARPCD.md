@@ -135,6 +135,30 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\engine-rpcd\start-coordina
 | `-Listen` (C) | `0.0.0.0:39501` | The worker's address and port. |
 | `-Port` (A) | setup's | The API port. |
 
+## Adding the 2.25 bpw set
+
+The 2.25 set (155 GB of model) has better quality than 2.00: about 7.3% above the original model's perplexity instead of
+15.5% (code and agent work 2-3% instead of 5-9%). It shares the Engram, the drafter and the vision file with 2.00.
+
+1. **Only where `hf download` put the shared files beside the 2.00 shards** (PC A): setup looks for them in
+   `C:\Strata-data\models\deepseek-v4.1-flash-shared` and would download them again. Hard links put them there without a
+   copy (no extra disk space; 2.00 keeps working):
+
+   ```powershell
+   $from = "C:\Strata-data\models\deepseek-v4.1-flash-IST-DAS-2.00bpw"
+   $to = "C:\Strata-data\models\deepseek-v4.1-flash-shared"
+   New-Item -ItemType Directory -Force $to | Out-Null
+   foreach ($n in "DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf", "DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00001-of-00009.gguf", "dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf", "mmproj-BF16.gguf") {
+       if (-not (Test-Path (Join-Path $to $n))) { New-Item -ItemType HardLink -Path (Join-Path $to $n) -Target (Join-Path $from $n) | Out-Null }
+   }
+   ```
+
+   A PC whose setup downloaded the files itself already has them there.
+2. **On both PCs:** run setup with `--model IST-DAS-2.25bpw` (the same three lines as for 2.00, with `--yes`). It
+   downloads only the 2.25 shards and writes a second config.
+3. **Starting it:** with two configs, pass `-Config C:\StrataRPCD\strata-deepseek-v4.1-flash-ist-das-2.25bpw.json` (or
+   `...-2.00bpw.json`) to both start scripts. Both PCs must run the same set.
+
 ## What to test, in order
 
 1. **Each PC alone:** setup's 16-word test passed on both.
