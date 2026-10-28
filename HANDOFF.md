@@ -190,6 +190,11 @@ Windows build notes:
 - **2.25 at 1M context, same 60,283-token prompt (logs 08:20):** 146.7 s (411 tok/s): link 41.9 s (118 MB/s), waiting
   for A 83.9 s, C's own 20.9 s; then 6.55 tok/s over 1,723 tokens (130-168 ms a token, 74-93 of it waiting on C).
   Experts in VRAM: A 1,683, C 897.
+- **`-PrefillChunk 2048` on C (2.25, 1M, logs 08:35/08:36) against the default 4096:** C's VRAM experts 897 -> 942
+  (+45, +0.46 GB; its RAM store 885 -> 915 slots); answers 6.55 -> 6.89 tok/s (+5%, within the run-to-run spread:
+  256-step blocks range 120-168 ms in both); the prompt 146.7 -> 156.7 s (C's own part 20.9 -> 31.0 s). Freeing ~0.5
+  GB on C is worth a few percent of answer speed at most, so moving the head to A (~0.5-0.7 GB) would gain about as
+  little. The default stays 4096.
 - **What the 1M context costs in VRAM (8K vs 1M, same set):** the log's `caches` (compressed KV, index keys, window
   rings) are 0.58 GB on A and 0.39 GB on C; with the buffers sized by the context the experts lose 0.81 GB on A
   (2,040 -> 1,942 for 2.00) and 0.61 GB on C (1,058 -> 989): 5-7% of each card's expert slots.
