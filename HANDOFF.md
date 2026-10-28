@@ -201,6 +201,12 @@ Windows build notes:
   (+45); the 60K prompt 122.5 s (492 tok/s, 1M: 123.4 s); answers 6.78 tok/s over 2,650 tokens (1M: 6.82). No change:
   ~60 more experts on each card is lost in the noise, so the head on A (~+50-70 on C, the same fewer on A) would
   likely gain about nothing. The user keeps 1M.
+- **DSpark and the 4090 alone (2.00, 8K, one PC, logs 09:20):** with `--dspark auto` the engine did not load DSpark
+  ("the routed experts (132 GB) are far more than the GPU holds (23 GB)"); answers **8.06 tok/s** over 1,533 tokens,
+  1,502 of 15,360 experts in VRAM, CPU lane 35%. `--dspark on`: about half that speed (user report). DSpark is not worth
+  adding to the split. **The 4090 alone answers nearly as fast as the split** (2.00, 8K: 9.02 tok/s with 3,098 GPU
+  experts): the split's answer gain is ~12%, so its value is mainly prompts and room for 2.25 at 1M. Next comparison
+  asked of the user: the 4090 alone on 2.25, 1M, the 60K prompt (`single-4090-2.25.json`, slots off).
 - **Settled setup (2026-10-28):** 2.25, 1M context, BF16 rows (the scripts' default), default prompt chunks, `-Stats`.
   Answer-speed levers left are all small (the head on A: likely ~0-2% after the 256K test; one round trip a token: <1%). Prompt-side: saved
   conversation slots in the split (each PC saving its half of the cache) would spare re-reading a long prompt after
