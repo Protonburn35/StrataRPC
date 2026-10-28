@@ -38,6 +38,10 @@ from `C:\StrataRPCD-project`, copied into `C:\StrataRPCD\engine-rpcd`):
   worker's `in_image()` answer from it. That is a protocol change: bump `kProtocol` (ds4_stage.cpp), add it to the
   GPU-free test, and update both PCs together.
 - **Cost:** the tower is ~319 MiB on A (about 33 fewer experts there).
+- **GPU, not CPU (the user asked, 2026-10-28):** keep the tower on A's RTX 4090. `ds4_vision.cu` is CUDA kernels
+  only, with no CPU path, so CPU would mean writing one, and it would be far slower per picture. Setup's
+  `--vision gpu|cpu` choice is for the Flash-Next readers; for DeepSeek it only means "on". The 33 fewer experts
+  should not matter: 45-63 more VRAM experts on C made no measurable change to answering speed.
 - **Reference:** StrataRPC `main` did vision for the Qwen layer stage in Exp28 (docs/LAYER_STAGE_RPC.md there).
 - **Test:** the same picture prompt on one PC (setup's single-PC config) and through the split; the answers should
   agree.
