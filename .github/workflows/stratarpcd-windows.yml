@@ -69,7 +69,7 @@ jobs:
           $env:STRATA_RPC_TOKEN = "test"
           $w = powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $t "engine-rpcd/start-worker.ps1") -DryRun | Out-String
           Write-Output $w
-          if ($w -notmatch "DRYRUN worker: .*--pack .*--max-context 8192 .*--layer-stage-server 0\.0\.0\.0:39501 --layer-stage-split 20 --layer-stage-wire fp32") { throw "start-worker.ps1 built the wrong command" }
+          if ($w -notmatch "DRYRUN worker: .*--pack .*--max-context 8192 .*--layer-stage-server 0\.0\.0\.0:39501 --layer-stage-split 20 --layer-stage-wire bf16") { throw "start-worker.ps1 built the wrong command" }
           $w2 = powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $t "engine-rpcd/start-worker.ps1") -PrefillChunk 2048 -DryRun | Out-String
           if ($w2 -notmatch "--max-context 8192 .*--prefill-chunk 2048 --layer-stage-server") { throw "start-worker.ps1 -PrefillChunk did not reach the engine's arguments" }
           $c = powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $t "engine-rpcd/start-coordinator.ps1") -Worker 10.0.0.2:39501 -Wire bf16 -Context 4096 -Port 8081 -DryRun | Out-String

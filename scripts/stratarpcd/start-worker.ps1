@@ -2,13 +2,13 @@
 # Run it from the StrataRPCD folder once setup has made the model's pack on this PC (README-STRATARPCD.md):
 #   $env:STRATA_RPC_TOKEN = "the same long secret as on PC A"
 #   powershell -NoProfile -ExecutionPolicy Bypass -File .\engine-rpcd\start-worker.ps1
-# Ctrl+C stops it. Every switch is optional; the defaults are the tested setup (split 20, FP32 rows).
+# Ctrl+C stops it. Every switch is optional; the defaults are split 20 and BF16 rows (-Wire fp32: exact rows).
 param(
     [string]$Root = "",                  # the StrataRPCD folder (default: the folder above this script's)
     [string]$Config = "",                # setup's run config (default: the strata-deepseek-v4.1-flash-*.json in $Root)
     [string]$Listen = "0.0.0.0:39501",   # where the coordinator connects (this PC's port)
     [int]$Split = 20,                    # the worker's first layer: the same on both PCs
-    [ValidateSet("fp32", "bf16", "fp16")][string]$Wire = "fp32",   # the rows on the link: the same on both PCs
+    [ValidateSet("fp32", "bf16", "fp16")][string]$Wire = "bf16",   # the rows on the link, the same on both PCs: bf16 (half the bytes), fp32 exact
     [int]$Context = 0,                   # 0: the config's --max-context (it must match the coordinator's)
     [int]$PrefillChunk = 0,              # the prompt chunk on this PC (0: the engine's own, 4096 on a 16 GB card): smaller leaves more VRAM for experts
     [switch]$Stats,                      # STRATA_LAYER_STAGE_STATS=1: each prompt's time in the log

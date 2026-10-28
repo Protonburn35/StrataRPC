@@ -10,8 +10,8 @@ Qwen3.8-Flash-Next.
 
 - **What crosses the network:** for each token, one row of 4 x 5120 numbers plus 8 more (80 KiB in FP32). The KV
   cache never crosses.
-- **Quality:** with the default FP32 rows the answers are the same as on one PC, apart from the experts'
-  summing order.
+- **Quality:** the rows go over the link in BF16 by default (rounded once at the split, as vLLM does); with
+  `-Wire fp32` the answers are the same as on one PC, apart from the experts' summing order.
 - **Full quality:** both PCs use the model's 6 experts per word (no "Faster" mode).
 
 This is the first version. It has been built and its link has been tested without a GPU. It has **not** run on the two
@@ -127,7 +127,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\engine-rpcd\start-coordina
 
 | Switch | Default | What it does |
 |---|---|---|
-| `-Wire bf16` | `fp32` | Sends the rows in BF16: half the bytes on the link, but the numbers change slightly (lossy). Use the same on both PCs. |
+| `-Wire fp32` | `bf16` | `bf16` (the default since 2026-10-28) sends the rows in half the bytes, rounded to BF16 once at the split; `fp32` sends them exactly. Use the same on both PCs. |
 | `-Stats` | off | Writes each prompt's time, the MB sent and the time spent waiting on C into the log. On A it also logs every 256 tokens. |
 | `-Context N` | setup's (8192) | The context. It must be the same on both PCs. |
 | `-PrefillChunk N` | the engine's (8192 on A, 4096 on C) | The prompt chunk on that PC alone. Smaller leaves more VRAM for experts (faster answers) and reads long prompts somewhat slower there. |
@@ -136,17 +136,17 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\engine-rpcd\start-coordina
 | `-Listen` (C) | `0.0.0.0:39501` | The worker's address and port. |
 | `-Port` (A) | setup's | The API port. |
 
-## The speed config (optional)
+## BF16 rows (the default) and FP32
 
-Add `-Wire bf16` to **both** start scripts. The rows on the link become BF16: half the bytes, so on gigabit Ethernet
-a 60K prompt's 42 s of transfer becomes about 21 s. Answers are as fast as before (a token's row was under 1 ms either
-way). The rows are rounded to BF16 (about 0.1-0.4% per value) once, at the split: slightly lossy, which is why FP32
-stays the default.
+Since 2026-10-28 both start scripts send the rows in BF16: half the bytes, so on gigabit Ethernet a 60K prompt's 42 s
+of transfer becomes about 21 s. Answers are as fast either way (a token's row is under 1 ms). The rows are rounded to
+BF16 (about 0.1-0.4% per value) once, at the split; vLLM sends its pipeline stages' hidden states in BF16 too, and keeps
+them in BF16 at every layer.
 
-- **`-Wire fp16` instead:** the same speed and about 8x the precision of BF16, but it cannot hold a value above
-  65,504. If the model's running value at the split ever goes past that, that prompt stops with
-  `layer-stage FP16 activation ... exceeds the finite range 65504` (an error, never a wrong answer). If it never
-  happens on your work, FP16 is the better speed config.
+- **`-Wire fp32` on both PCs:** the rows exactly as the engine computed them (the same answers as on one PC, apart
+  from the experts' summing order).
+- **`-Wire fp16`:** the same speed and more precision than BF16, but it cannot hold a value above 65,504; a prompt with
+  such a value stops with an error. Not recommended for a model trained in BF16.
 
 ## Adding the 2.25 bpw set
 
@@ -220,7 +220,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\stratarpcd\build-l
 3. **Speed:** a 2,000-4,000-token prompt and a long answer, with `-Stats` on both PCs. Note the prompt's tokens/s and
    the answer's tokens/s from A's server log.
 4. **Stop:** press Stop during a long prompt, then send another message. Both sides should go on without reloading.
-5. **Optional:** the same with `-Wire bf16` on both PCs. Compare the speed and whether the answers change.
+5. **Optional:** the same with `-Wire fp32` on both PCs (exact rows). Compare the speed and whether the answers change.
 
 Send back:
 - A's log (`strata-deepseek-v4.1-flash-ist-das-2.00bpw.log` in `C:\StrataRPCD`)

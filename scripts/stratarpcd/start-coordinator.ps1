@@ -9,7 +9,7 @@ param(
     [string]$Root = "",                  # the StrataRPCD folder (default: the folder above this script's)
     [string]$Config = "",                # setup's run config (default: the strata-deepseek-v4.1-flash-*.json in $Root)
     [int]$Split = 20,                    # the worker's first layer: the same on both PCs
-    [ValidateSet("fp32", "bf16", "fp16")][string]$Wire = "fp32",   # the rows on the link: the same on both PCs
+    [ValidateSet("fp32", "bf16", "fp16")][string]$Wire = "bf16",   # the rows on the link, the same on both PCs: bf16 (half the bytes), fp32 exact
     [int]$Context = 0,                   # 0: the config's --max-context (it must match the worker's)
     [int]$PrefillChunk = 0,              # the prompt chunk on this PC (0: the engine's own, 8192 on a 24 GB card): smaller leaves more VRAM for experts
     [int]$Port = 0,                      # 0: the config's API port
