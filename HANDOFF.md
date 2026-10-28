@@ -184,9 +184,13 @@ Windows build notes:
   - **The worker's split of the prompt's 135.4 s:** 4,940 MB of rows in 41.9 s (**118 MB/s: gigabit Ethernet, full**),
     71.6 s waiting for A (A's 20 layers), 21.9 s C's own work (the skip works: layer 20's KV for most rows, the full
     layers only for the tail). The three add up to the total: nothing overlaps.
-  - **Next, lossless:** overlap the link with A's work (a sender thread on A with a host buffer, so A computes chunk
-    k+1 while chunk k's rows go out and C works on them). Expected: about max(A ~75-80 s, link + C ~64 s) = ~80-85 s,
-    ~700+ tok/s. BF16 rows would save ~21 s without overlap (~530 tok/s) and little with it.
+  - **The overlap is NOT the win it first looked like (corrected 2026-10-28).** A runs a long prompt layer-major
+    (`lm_begin`: all chunks through layer 0, then layer 1, ...; it reads each layer's experts from the files once
+    instead of once per chunk, mainline measured 6x on an 8K prompt). Its rows for C only come out in its last layer's
+    pass, so a sender thread could hide the link behind ~1/20 of A's work plus C's light kv_only work: a few seconds.
+    Chunk-major on A to free the overlap would re-read A's 57 GB of in-place experts per chunk: far slower.
+  - **What does cut the 42 s link:** C on 2.5 GbE (118 MB/s is a 1 Gbps link; A and the switch are 2.5 Gbps; ask the
+    user what C's adapter is: `Get-NetAdapter`), ~17 s, lossless; `-Wire bf16` halves it (slightly lossy); both ~8.5 s.
 - **2.25 at 1M context, same 60,283-token prompt (logs 08:20):** 146.7 s (411 tok/s): link 41.9 s (118 MB/s), waiting
   for A 83.9 s, C's own 20.9 s; then 6.55 tok/s over 1,723 tokens (130-168 ms a token, 74-93 of it waiting on C).
   Experts in VRAM: A 1,683, C 897.
