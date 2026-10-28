@@ -178,9 +178,15 @@ Windows build notes:
     (2.00) / 1,768 (2.25), C 989-1,058 / 958.
   - The 70K prompt's time on C was mostly C's own work: without the skip it runs its 20 layers on every token. The
     transfer (5.7 GB) is about 50 s on gigabit. The user's link speed is not known yet.
-- **With the long-prompt fix and the RAM store fix (the user's local build of f7bba148, 1M context, FP32 rows):** the
-  same 69,701-token prompt read at about 450 tok/s (user report; was 236 with the skip off). Logs not in yet: the worker's
-  new `-Stats` line will split the time into the link, waiting for A, and C's own work.
+- **With the long-prompt fix and the RAM store fix (the user's local build of f7bba148, 1M context, FP32 rows, logs of
+  2026-10-28 08:05):** a 60,283-token prompt in 135.4 s (445 tok/s); then 7.57 tok/s over 1,277 answer tokens at ~60K
+  context (109-145 ms a token, 62-81 ms of it waiting on C; was 5.6-5.7 with A's store at 0). A's RAM store 7.2 GB.
+  - **The worker's split of the prompt's 135.4 s:** 4,940 MB of rows in 41.9 s (**118 MB/s: gigabit Ethernet, full**),
+    71.6 s waiting for A (A's 20 layers), 21.9 s C's own work (the skip works: layer 20's KV for most rows, the full
+    layers only for the tail). The three add up to the total: nothing overlaps.
+  - **Next, lossless:** overlap the link with A's work (a sender thread on A with a host buffer, so A computes chunk
+    k+1 while chunk k's rows go out and C works on them). Expected: about max(A ~75-80 s, link + C ~64 s) = ~80-85 s,
+    ~700+ tok/s. BF16 rows would save ~21 s without overlap (~530 tok/s) and little with it.
 - **RAM store fix (`store_gb_now`):** after the weights are on the GPU, the engine sizes the store again, and when the
   free RAM fell by 4 GB or more it took the PC for a shared-memory one (Strix Halo) and set aside 0.11 MB of RAM per
   token of context beyond 16K. A's own host buffers (8192-token prompt chunks) took 6.4 GB, so at 1M it set aside about
