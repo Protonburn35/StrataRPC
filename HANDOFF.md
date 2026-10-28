@@ -194,6 +194,9 @@ Windows build notes:
 - **2.25 at 1M context, same 60,283-token prompt (logs 08:20):** 146.7 s (411 tok/s): link 41.9 s (118 MB/s), waiting
   for A 83.9 s, C's own 20.9 s; then 6.55 tok/s over 1,723 tokens (130-168 ms a token, 74-93 of it waiting on C).
   Experts in VRAM: A 1,683, C 897.
+- **BF16 rows (2.25, 1M, logs 08:55):** the 60,283-token prompt in 123.4 s (**488 tok/s**, was 146.7 s / 411 with
+  FP32): 2,471 MB of rows in 20.9 s (118 MB/s), 82.3 s waiting for A, 20.1 s C's own. Answers 6.82 tok/s over 2,390
+  tokens (FP32 6.55; within the noise). As predicted: BF16 halves the link and leaves the rest.
 - **`-PrefillChunk 2048` on C (2.25, 1M, logs 08:35/08:36) against the default 4096:** C's VRAM experts 897 -> 942
   (+45, +0.46 GB; its RAM store 885 -> 915 slots); answers 6.55 -> 6.89 tok/s (+5%, within the run-to-run spread:
   256-step blocks range 120-168 ms in both); the prompt 146.7 -> 156.7 s (C's own part 20.9 -> 31.0 s). Freeing ~0.5
