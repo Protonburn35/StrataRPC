@@ -209,6 +209,7 @@ Windows build notes:
   `init-shell: cmd.exe` sets cmd's AutoRun to the conda activation, which selects VS 2019's toolset, and the build's own
   cmd.exe children ran it before each compile. The workflow now removes that AutoRun before the build; the script warns
   when a PC has one.
+- **The user chose the 2.25 set (2026-10-28)** and will delete 2.00 later. DSpark and vision stay off in the split.
 - **The user is adding the 2.25 set** (docs/STRATARPCD.md, "Adding the 2.25 bpw set"). On A the shared files were
   downloaded with `hf download` beside the 2.00 shards, and setup only looks for them in
   `models/deepseek-v4.1-flash-shared` (`dsv41_find_shared`): hard links put them there. With two configs the start
