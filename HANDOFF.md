@@ -203,6 +203,10 @@ Windows build notes:
   Answer-speed levers left are all small (the head on A: 2-5% est.; one round trip a token: <1%). Prompt-side: saved
   conversation slots in the split (each PC saving its half of the cache) would spare re-reading a long prompt after
   switching conversations; the overlap is worth a few seconds (A runs prompts layer-major).
+- **Saved chats, later (user, 2026-10-28):** instead of automatic slots, port the manual "save chat" the user says
+  "Astra" implemented (invoked by hand). Unclear which code: possibly mainline Strata's conversation files
+  (`src/core/conversation_file.cpp`), possibly a separate project; ask before starting. In the split, both PCs would
+  save and load their halves of the cache together.
 - **`-PrefillChunk 2048` on C (2.25, 1M, logs 08:35/08:36) against the default 4096:** C's VRAM experts 897 -> 942
   (+45, +0.46 GB; its RAM store 885 -> 915 slots); answers 6.55 -> 6.89 tok/s (+5%, within the run-to-run spread:
   256-step blocks range 120-168 ms in both); the prompt 146.7 -> 156.7 s (C's own part 20.9 -> 31.0 s). Freeing ~0.5
