@@ -1288,8 +1288,10 @@ bool Glm5Model::prefill_setup(std::string& err) {
         cudaHostAlloc((void**) &S->h_counts, 4096 * sizeof(int), cudaHostAllocMapped) != cudaSuccess ||
         cudaHostAlloc((void**) &S->h_base, 4096 * sizeof(int), cudaHostAllocDefault) != cudaSuccess ||
         cudaHostAlloc((void**) &S->h_bounds, 8192 * sizeof(int), cudaHostAllocDefault) != cudaSuccess ||
-        (l1_ < g.n_layers && cudaHostAlloc((void**) &S->hop_h, (size_t) 2 * T * 4 * E * sizeof(float),
-                                           cudaHostAllocDefault) != cudaSuccess)) {
+        // (the hand-over to the next part on this PC, double-buffered: none after this PC's last layer - a layer
+        //  stage's coordinator sends its rows to the other PC from stage_rows_, and kept ~4.3 GB pinned for nothing)
+        (l1_ < local_layers_end() && cudaHostAlloc((void**) &S->hop_h, (size_t) 2 * T * 4 * E * sizeof(float),
+                                                   cudaHostAllocDefault) != cudaSuccess)) {
         cudaGetLastError();
         std::fprintf(stderr, "glm prefill: CUDA%d pinned staging did not allocate - token by token\n", dev_);
         prefill_destroy();
@@ -4336,6 +4338,9 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
             err = "glm stage: " + se;
             ok = false;
         }
+        // the rows' buffer (a chunk's, ~2 GB at 32K tokens) is not kept between prompts: the sender is idle now
+        stage_rows_.clear();
+        stage_rows_.shrink_to_fit();
     }
     cudaSetDevice(dev_);
     return ok;

@@ -1079,6 +1079,11 @@ public:
     /// to share among those layers alone - the other PC's layers never draw on it.  Without it (no stage) the budget is
     /// shared over the whole model's MoE layers, whose later parts a split on this PC loads after this one.
     void set_stage_layers(int l0, int l1) { stage_l0_ = l0; stage_l1_ = l1; }
+    /// the end of the layers this PC loads: a layer stage's own (set_stage_layers), else the whole model's - a part
+    /// that ends there hands nothing on to another part on this PC
+    int local_layers_end() const {
+        return stage_l0_ >= 0 && stage_l1_ > 0 ? std::min(stage_l1_, g_.n_layers) : g_.n_layers;
+    }
     bool head_loaded() const { return ws_map_.count("output.weight") != 0; }
     /// The coordinator: from now on every position also runs the worker's layers behind `link` (its connection made);
     /// head_here: the head and the sampling are this part's (--layer-stage-head coordinator), else the worker's.

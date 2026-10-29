@@ -4,6 +4,41 @@ Read this first. Claude and Sol (GPT/Codex) both work here. Fetch before you sta
 this file with every push, and never force-push. Doc-only commits carry `[skip ci]`. Never commit
 `STRATA_RPC_TOKEN`, raw logs or other private data.
 
+## Long-prompt crash on the 4090 and its memory follow-up (2026-10-29, Claude)
+
+**Not yet run on the PCs.**
+
+- **What the user saw:** the 4090's engine died while reading a 152,311-token prompt, right after its first
+  28,672-token chunk.
+  - The exit code was 0xC0000005 (access violation); Maya's "out of RAM" hint is generic. The worker's Winsock 10054 is
+    only the coordinator vanishing.
+  - Task Manager showed about **80 GB committed** on the 4090 at the time, versus about 50 GB normally on each PC.
+  - The same prompt had passed on an earlier start of the old engine.
+  - The engine it crashed on was compiled at 15:25 with fingerprint `dcb6ac2c179724da`. That is no pushed version, most
+    likely `c82cf424` plus stray files in the source folders.
+- **Most likely cause (not proven): Windows ran out of commit** during the prompt, and a failed allocation crashed.
+  - The RAM fix lets the tier take everything above the 6 GB headroom; the old halving left about 4 GB of extra slack.
+  - A stage prompt then allocates the chunk rows (`stage_rows_`, chunk × 64 KB, about 2 GB) after the measurement.
+  - On Windows, the 4090's VRAM allocations also count against commit (Maya's own note in the RAM-tier code).
+- **Changes in this push:**
+  - **Reserve:** in a layer stage the RAM tier now keeps one chunk's rows (`prefill_pinned().hop / 2`) out of its
+    budget, on both PCs, unless `STRATA_GLM_RAM_GB` sets the budget explicitly.
+  - **No unused hand-over buffer:** Maya's pinned `hop_h` (2 × chunk × 64 KB, about 4.3 GB) is only for a next part on
+    the same PC. It is no longer allocated on the part that ends this PC's layers (`Glm5Model::local_layers_end()`).
+    That frees about 4.3 GB on the 4090 before the RAM tier is measured.
+  - **Row buffer freed:** the coordinator's `stage_rows_` is released after each prompt instead of being kept.
+- **Expected:**
+  - The 4090's RAM tier gains about 2.3 GB over the crash run at the same free memory.
+  - About 8 GB stays outside the tier, against 6 before.
+  - If long prompts still crash, set `STRATA_GLM_RAM_HEADROOM_GB` (default 6) higher in the coordinator's window, and
+    check Task Manager → Details → "Commit size" to see which process grows.
+- **Validation:** the CUDA engine builds (Linux, sm_89); `glm_stage_test` passes. The Windows workflow re-checks sm_89 +
+  sm_120 on this push.
+- **Reinstall route:** the user will delete `C:\StrataRPCG` on both PCs and recreate it from the commit's ZIP, then run
+  `START-HERE.bat --yes --download-model --no-start`.
+  - That compiles the engine and the picture encoder from scratch.
+  - It reuses the model, pack and verified checksums in `C:\Strata-data\models-glm`.
+
 ## Coordinator RAM budget fixed (2026-10-29, Claude)
 
 Sol's priority below is implemented. **Not yet measured on the PCs.** The user compiles updates locally on both PCs

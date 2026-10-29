@@ -1539,9 +1539,8 @@ bool Glm5Model::fast_setup(std::string& err) {
         // the layers this process serves: the whole model's, or a layer stage's own range (StrataRPCG: the other PC
         // holds the rest and never draws on this PC's RAM - shared over the whole model, the coordinator's layers 0-23
         // took 21 / 42 of its budget and left the other half unused)
-        const bool stage_local = stage_l0_ >= 0;
-        const int local_end = stage_local && stage_l1_ > 0 ? std::min(stage_l1_, g.n_layers) : g.n_layers;
-        const int local_begin = stage_local ? std::max(stage_l0_, 0) : 0;
+        const int local_end = local_layers_end();
+        const int local_begin = std::max(stage_l0_, 0);
         static int64_t unpinned = 0;   // a parallel load: the earlier parts' planned tiers, none pinned yet
         const auto pinned_pf = prefill_pinned();
         const int later = n_parts_ - 1 - part_;   // the parts that start after this one
@@ -1606,6 +1605,11 @@ bool Glm5Model::fast_setup(std::string& err) {
                 if (now > 0)
                     budget = std::min<int64_t>(budget, std::max<int64_t>(0, now - unpinned - head_b / 2 - unseen_pf));
             }
+            // a layer stage holds one prompt chunk's rows in RAM while they go to the other PC (stage_rows_: T x hc x
+            // n_embd FP32, ~2 GB at 32K tokens), allocated after this measurement: kept out of the tier, as a later
+            // part's staging is, so a long prompt does not eat into the headroom (Windows' commit runs out there)
+            if (stage_l0_ >= 0 && !fixed_ram)
+                budget = std::max<int64_t>(0, budget - (int64_t) (pinned_pf.hop / 2));
         }
         F->rc.assign(cls_stride.size(), FastState::RamClass{});
         std::vector<int64_t> cls_n(cls_stride.size(), 0), cls_cap(cls_stride.size(), 0);
