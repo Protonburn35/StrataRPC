@@ -19,7 +19,15 @@ successfully. Model download had not yet been reached. The missing Git warning w
   basic toolkit path used by the PCs. CUDA 13.2, MSVC and sm_89 + sm_120 remain the build targets.
 - **Local validation:** the complete changed CUDA translation unit compiled for sm_89 + sm_120 with both optional
   headers absent; the HIP-name mapping check passes. No model arithmetic, sampling or inference setting changed.
-  Windows CI will recheck the full engine after this push; GPU inference remains untested here.
+  **Windows CI passed:** [run 40930293645](https://github.com/Protonburn35/StrataRPC/actions/runs/40930293645),
+  source `e940f482`. Windows PowerShell 5.1 launchers, MSVC protocol tests, full CUDA build for sm_89 + sm_120
+  and the engine's CLI check all passed without installing the optional profiling packages. The full Python
+  [workflow also passed](https://github.com/Protonburn35/StrataRPC/actions/runs/40930293684).
+  GPU inference remains untested here.
+- **User follow-up:** replacing that one source file let A compile and link `C:\StrataRPCG\build\maya.exe`
+  successfully with its NVIDIA-installed toolkit, then begin downloading the 117.5 GB model. Setup completion,
+  the 5070 Ti build and actual GPU inference are still pending. The user log still reports Git absent, so this
+  build uses the separate SwiGLU prompt kernel instead of the optional fused MMQ patch.
 - **Recovery:** replace only `src/core/glm_fast_path.cu` with this branch's updated file and rerun
   `START-HERE.bat --yes --download-model --no-start`. Existing build objects are reused. No compiler/Python
   reinstallation is needed for this error, and the user's model files need not be removed.
