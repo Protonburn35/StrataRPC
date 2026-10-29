@@ -3,6 +3,48 @@
 Read this first. Claude and Sol (GPT/Codex) both work here. Fetch before you start, keep the other's commits, update this
 file with every push, and never force-push.
 
+## Current continuation: optional A+B+C (2026-10-29, Codex)
+
+The user authorized implementing a three-stage DeepSeek setup while retaining the working A+C preset.
+Work alone. Laptop B is **192.168.50.129, Ryzen AI 9 HX 370, RTX 4060 Laptop 8 GB, 32 GB RAM**.
+The user will run START-HERE on B; explicitly choose IST-DAS 2.25 and no-start, then install this fork's new
+engine on every participating PC. See `docs/STRATARPCD-THREE-PC.md` for the complete configs/commands.
+
+- **Protocol 3**, update all peers together. Original two-PC presets remain available. New presets are
+  `configs/stratarpcd/strata-stratarpcd-abc-{a,b,c}.json`; build-local includes all five JSONs and both guides.
+  A+C still runs 0-19 / 20-39. A+B+C runs A 0-19, B 20-23, C source 20 plus 24-39 and the head.
+- **Why C repeats source 20:** layers after 20 reuse its compressed KV, index keys and candidates. B sends
+  both its original input and its final residual/pre rows. C reconstructs 20 locally, replaces its residual/pre
+  at 24 with B's output, and 24 computes its own indexer picks. This avoids transferring growing KV caches.
+  C loads 17 layers rather than 20, B loads four. This duplicates computation and **does not establish a speedup**.
+- `--layer-stage-middle-end 24` opts in on all peers. Validated later indexer boundaries are 24/28/32/36;
+  do not use arbitrary cuts or drop the shared source. The model's actual layout is checked before loading.
+  B forwards prompts in bounded 2048-token feeds. Three-stage mode disables prompt skipping to consume/rebuild
+  every paired row, so prefill can cost more. Two-PC behavior keeps its existing prompt path.
+- Controls, image spans, checkpoints, sampling and logits traverse A->B->C. A alone encodes pictures on GPU;
+  no laptop encoder or DSpark. Six experts, 1M declared context and BF16 remain the presets. No temperature rule,
+  pruning or new weight conversion. Three-stage downstream sampling failures propagate rather than becoming EOS.
+- Manual save is **C then B then A**, same snapshot ID, each local native state on its own SSD. Restore verifies
+  local files/topology and reconnects downstream. Partial failures reset the chain. A's three-PC folder is
+  `C:\StrataRPCD\sessions-abc`, B/C use `sessions-abc-b` / `sessions-abc-c`. A+C snapshots are incompatible with
+  A+B+C and refused across modes. Existing two-PC DS4PAIR2 envelopes remain readable; new topology uses DS4PAIR3.
+  Existing RAM/disk guards and 8 GiB per-file cap remain. No automatic disk save was added.
+- Launchers preserve topology flags from explicit input configs. B uses start-worker with both server/client;
+  C's split becomes 24 only in its ABC preset. A writes a separate ABC runtime JSON. Stop engines before switching
+  modes. Firewall: B admits A (.206), C additionally admits B (.129); retain C's A allowance for A+C.
+- **Validation so far:** GPU-free two/three-stage protocol, dependency-layout and session-envelope tests pass;
+  FP32 and BF16 synthetic chains cover streamed prompts crossing the forwarding bound, decode, image spans,
+  checkpoints, save/reset/restore and downstream sampling failure. Four PowerShell launcher/config tests and
+  43 existing Python session/API tests pass. Linux CUDA 13.2 compilation passed for sm_89 and sm_120 (no GPU).
+  Protocol and session-envelope tests also pass ASan/UBSan.
+  Windows build and hardware checks are pending at this source commit. HIP/SYCL toolchains are not installed here.
+  No actual model output, GPU snapshot restore, numerical parity, throughput or full-1M-state claim is made.
+
+First hardware check: compare short text and image/follow-up, then manual save, switch, restore, restart all three
+and restore. Keep the same client history/attachments. Benchmark A+C vs A+B+C with identical prompts/sampling.
+Use A/B -Stats decode totals/waits to locate stage cost; do not assume network bandwidth is limiting. The user
+asked about SSD latency: low read MB/s alone does not establish or exclude an I/O bottleneck.
+
 ## Current continuation: vision and paired manual sessions (2026-10-28, Codex)
 
 The user confirmed A + C works and now uses **IST-DAS 2.25 bpw only, 1M context, BF16 transfers,

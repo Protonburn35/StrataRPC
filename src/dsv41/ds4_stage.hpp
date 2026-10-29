@@ -6,6 +6,9 @@
 // FP16 half the bytes and lossy), and pre, 8 floats (always FP32).  The split must be a layer whose later layers read
 // nothing from before it (V4.1: 20 - the compressed KV, index keys and candidates of layers 20-39 are layer 20's own),
 // so nothing else crosses: no KV cache, no logits (the worker samples).
+// Optional three-PC mode: A ends at 20, B ends at an indexer boundary (24 by default), C repeats
+// source 20 then resumes at B's end. B->C carries two row streams: B's output and source 20's input.
+// The repeated source reconstructs shared KV/candidates locally; all controls and sessions traverse A->B->C.
 //
 // The protocol: authenticated, ordered, one request at a time, each answered; a failure closes the connection (the
 // coordinator connects again and both ends start over from position 0).  A prompt streams: PROMPT names its tokens,
@@ -28,22 +31,25 @@ namespace strata::ds4::stage {
 
 using core::LayerStageWireFormat;
 
-constexpr uint16_t kProtocol = 2;   // image spans and paired disk snapshots; update both PCs together
+constexpr uint16_t kProtocol = 3;   // optional three-stage topology; update every participating PC together
 constexpr int kPreFloats = 8;        // the hand-off's `pre` floats a row
 constexpr int kPieceRows = 256;      // rows a ROWS frame carries at most (20 MiB of FP32 rows at V4.1's 4 x 5120)
 constexpr int kMaxTokens = 1 << 22;  // tokens a PROMPT names at most
+constexpr int kMiddleRows = 2048;   // bound B's source rows and C's two-stream queue
 
 /// What both ends must agree on; the worker refuses a connection that differs.
 struct Spec {
     uint64_t identity_a = 0, identity_b = 0;   // the model's identity (its geometry and tensors): the same model on both
     uint32_t n_layers = 0;                     // the whole model's layers
     uint32_t split = 0;                        // the worker's first layer
+    uint32_t middle_end = 0;                   // 0: A+C; otherwise A+B+C, B owns [20,middle_end)
     uint32_t dim = 0, hc = 0, vocab = 0;
     uint64_t max_context = 0;
     int32_t image_token = -1;                // worker uses image routing, but never loads a vision tower
     bool sessions = false;                   // manual disk sessions, explicitly enabled on both PCs
     LayerStageWireFormat wire = LayerStageWireFormat::fp32;
     size_t h_floats() const { return (size_t) hc * dim; }   // h's floats a row
+    bool shadow_rows() const { return middle_end != 0 && split == middle_end; }
 };
 bool same_spec(const Spec& a, const Spec& b, std::string& why);
 
@@ -76,6 +82,10 @@ struct Layout {
 /// crosses - the worker's first layer writes its own KV and index keys, no worker layer reads candidates from before the
 /// split, and every Engram layer is the coordinator's.  V4.1 (sources 2, 8, 14, 20; Engram 1, 14; candidates 20): 20.
 bool check_split(const Layout& m, int split, std::string& why);
+// Three-stage C repeats the shared source layer, then resumes at an indexer boundary. This reconstructs
+// shared KV/candidates locally without moving the growing KV cache over RPC.
+bool three_stage_layers(const Layout& m, int split, int middle_end, int begin, int end,
+                        std::vector<int>& layers, std::string& why);
 /// The layer numbers of v in [b, e), shifted to start at 0 (a stage's own numbering).
 std::vector<int> cut_layers(const std::vector<int>& v, int b, int e);
 /// "2, 8, 14" (for messages and the identity).
@@ -132,6 +142,7 @@ public:
     bool pin(std::string& err);
     bool images(int64_t position, const std::vector<ImageSpan>& images, std::string& err);
     bool snapshot(bool save, const SnapshotRef& ref, uint64_t& bytes, std::string& err);
+    void set_shadow_rows(RowFn rows) { shadow_rows_ = std::move(rows); }
     /// a window whose rows are all known (a step, a short feed): the worker feeds them and answers when done
     bool window(int64_t p0, const int32_t* tokens, int n, int logits_rows, const float* h, const float* pre,
                 int64_t& pos_after, std::string& err);
@@ -164,6 +175,7 @@ private:
     int64_t prompt_end_ = 0, prompt_sent_ = 0;
     bool prompt_open_ = false;
     std::vector<uint8_t> wire_;
+    RowFn shadow_rows_;
     uint64_t sent_ = 0, received_ = 0;
     double wait_ms_ = 0;
 };

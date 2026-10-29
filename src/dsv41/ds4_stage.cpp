@@ -76,12 +76,14 @@ void write_spec(Writer& w, const Spec& s) {
     w.u64(s.identity_a); w.u64(s.identity_b); w.u32(s.n_layers); w.u32(s.split); w.u32(s.dim); w.u32(s.hc);
     w.u32(s.vocab); w.u64(s.max_context); w.u32((uint32_t) s.wire);
     w.i32(s.image_token); w.u32(s.sessions ? 1u : 0u);
+    w.u32(s.middle_end);
 }
 bool read_spec(Reader& r, Spec& s) {
     uint32_t wire = 0, sessions = 0;
     if (!r.u64(s.identity_a) || !r.u64(s.identity_b) || !r.u32(s.n_layers) || !r.u32(s.split) || !r.u32(s.dim) ||
         !r.u32(s.hc) || !r.u32(s.vocab) || !r.u64(s.max_context) || !r.u32(wire) ||
-        wire > (uint32_t) LayerStageWireFormat::fp16 || !r.i32(s.image_token) || !r.u32(sessions) || sessions > 1)
+        wire > (uint32_t) LayerStageWireFormat::fp16 || !r.i32(s.image_token) || !r.u32(sessions) || sessions > 1 ||
+        !r.u32(s.middle_end))
         return false;
     s.sessions = sessions != 0;
     s.wire = (LayerStageWireFormat) wire;
@@ -212,6 +214,7 @@ bool same_spec(const Spec& a, const Spec& b, std::string& why) {
               wire_name(b.wire) + ")";
     else if (a.image_token != b.image_token) why = "--vision differs, or the image token differs";
     else if (a.sessions != b.sessions) why = "--layer-stage-sessions must match on both PCs";
+    else if (a.middle_end != b.middle_end) why = "--layer-stage-middle-end differs (two/three-stage topology mismatch)";
     return why.empty();
 }
 
@@ -302,6 +305,28 @@ bool check_split(const Layout& m, int split, std::string& why) {
     return true;
 }
 
+bool three_stage_layers(const Layout& m, int split, int middle, int begin, int end,
+                        std::vector<int>& layers, std::string& why) {
+    layers.clear();
+    if (!check_split(m, split, why)) return false;
+    const auto has = [](const std::vector<int>& v, int x) { return std::find(v.begin(), v.end(), x) != v.end(); };
+    if (middle <= split + 1 || middle >= m.n_layers || !has(m.ix_src, middle) ||
+        (m.cand_src >= 0 && m.cand_src != split)) {
+        why = "three stages require a middle end at a later indexer layer (V4.1: 24, 28, 32 or 36)";
+        return false;
+    }
+    for (int x : m.kv_src) if (x > split && x < middle) {
+        why = "three-stage middle range contains another shared KV source"; return false;
+    }
+    if (!((begin == 0 && end == split) || (begin == split && end == middle) ||
+          (begin == middle && end == m.n_layers))) {
+        why = "three-stage range does not match A, B or C"; return false;
+    }
+    if (begin == middle) layers.push_back(split);
+    for (int i = begin; i < end; ++i) layers.push_back(i);
+    return true;
+}
+
 // ------------------------------------------------------------------ the coordinator's end
 
 Client::~Client() { close(); }
@@ -310,6 +335,7 @@ void Client::close() {
     if (socket_ != rpc::kInvalidSocket) rpc::close(socket_);
     socket_ = rpc::kInvalidSocket;
     prompt_open_ = false;
+    shadow_rows_ = nullptr;
 }
 
 void Client::fail() { close(); }
@@ -472,6 +498,19 @@ bool Client::rows_frame(int64_t p0, int T, const float* h, const float* pre, uin
     const size_t at = wire_.size();
     wire_.resize(at + (size_t) T * kPreFloats * 4);
     std::memcpy(wire_.data() + at, pre, (size_t) T * kPreFloats * 4);
+    if (spec_.shadow_rows()) {
+        std::vector<float> sh((size_t) T * spec_.h_floats()), sp((size_t) T * kPreFloats);
+        std::vector<uint8_t> encoded;
+        if (!shadow_rows_ || !shadow_rows_(p0, T, sh.data(), sp.data(), err)) {
+            if (err.empty()) err = "missing shared-source input rows for stage C";
+            return false;
+        }
+        if (!core::layer_stage_encode_activations(spec_.wire, sh.data(), sh.size(), encoded, err)) return false;
+        for (float v : sp) if (!std::isfinite(v)) { err = "non-finite shared-source pre value"; return false; }
+        wire_.insert(wire_.end(), encoded.begin(), encoded.end());
+        const auto* bytes = reinterpret_cast<const uint8_t*>(sp.data());
+        wire_.insert(wire_.end(), bytes, bytes + sp.size() * 4);
+    }
     return true;
 }
 
@@ -514,7 +553,7 @@ bool Client::prompt_begin(int64_t p0, const int32_t* tokens, int n, int logits_r
         fail();
         return false;
     }
-    if (n < 1 || n > kMaxTokens) {
+    if (n < 1 || n > kMaxTokens || (spec_.shadow_rows() && n > kMiddleRows)) {
         err = "a layer-stage prompt of " + std::to_string(n) + " tokens";
         return false;
     }
@@ -683,6 +722,8 @@ bool Server::serve(rpc::Socket s, std::string& err) {
     const size_t hf = spec_.h_floats();
     const size_t elem = core::layer_stage_wire_element_bytes(spec_.wire);
     const size_t row_bytes = hf * elem + (size_t) kPreFloats * 4;   // a row on the wire
+    const bool paired = spec_.shadow_rows();
+    const size_t frame_row_bytes = row_bytes * (paired ? 2 : 1);
     bool hello = false;
     std::vector<uint8_t> payload;
     for (;;) {
@@ -802,7 +843,7 @@ bool Server::serve(rpc::Socket s, std::string& err) {
                 uint32_t nt = 0;
                 int32_t lr = 0;
                 if (!r.i64(p0) || !r.u32(nt) || !r.i32(lr) || nt < 1 || nt > (uint32_t) kPieceRows ||
-                    r.left() != (size_t) nt * 4 + (size_t) nt * row_bytes)
+                    r.left() != (size_t) nt * 4 + (size_t) nt * frame_row_bytes)
                     return refuse("a malformed window");
                 std::vector<int32_t> toks(nt);
                 r.raw(toks.data(), (size_t) nt * 4);
@@ -818,20 +859,30 @@ bool Server::serve(rpc::Socket s, std::string& err) {
                 std::memcpy(pre.data(), r.here() + (size_t) nt * hf * elem, pre.size() * 4);
                 for (float v : pre)
                     if (!std::isfinite(v)) return refuse("a window's rows: a non-finite pre value");
-                bool given = false;
+                std::vector<float> sh, sp;
+                if (paired) {
+                    sh.resize(h.size()); sp.resize(pre.size());
+                    const uint8_t* source = r.here() + (size_t) nt * row_bytes;
+                    if (!core::layer_stage_decode_activations(spec_.wire, source, (size_t) nt * hf * elem,
+                                                              sh.data(), sh.size(), de)) return refuse(de);
+                    std::memcpy(sp.data(), source + (size_t) nt * hf * elem, sp.size() * 4);
+                    for (float v : sp) if (!std::isfinite(v)) return refuse("non-finite shared-source pre value");
+                }
+                int given = 0;
                 const RowFn rows = [&](int64_t q0, int T, float* hd, float* pd, std::string& e) {
-                    if (given || q0 != p0 || T != (int) nt) {
+                    if (given >= (paired ? 2 : 1) || q0 != p0 || T != (int) nt) {
                         e = "the worker asked for rows the window does not hold";
                         return false;
                     }
-                    given = true;
-                    std::memcpy(hd, h.data(), h.size() * 4);
-                    std::memcpy(pd, pre.data(), pre.size() * 4);
+                    const bool shadow = paired && given++ == 0;
+                    if (!paired) ++given;
+                    std::memcpy(hd, shadow ? sh.data() : h.data(), h.size() * 4);
+                    std::memcpy(pd, shadow ? sp.data() : pre.data(), pre.size() * 4);
                     return true;
                 };
                 std::string fe;
                 if (!backend_.feed(toks.data(), (int) nt, lr, -1, rows, fe)) return refuse("a window failed: " + fe);
-                if (!given) return refuse("the worker's feed did not take the window's rows");
+                if (given != (paired ? 2 : 1)) return refuse("the worker's feed did not take all window rows");
                 Writer w;
                 w.i64(backend_.pos());
                 if (!respond(true, "", w.b)) return false;
@@ -842,6 +893,7 @@ bool Server::serve(rpc::Socket s, std::string& err) {
                 uint32_t nt = 0;
                 int32_t lr = 0, snap = -1;
                 if (!r.i64(p0) || !r.u32(nt) || !r.i32(lr) || !r.i32(snap) || nt < 1 || nt > (uint32_t) kMaxTokens ||
+                    (paired && nt > (uint32_t) kMiddleRows) ||
                     r.left() != (size_t) nt * 4)
                     return refuse("a malformed prompt");
                 std::vector<int32_t> toks(nt);
@@ -852,7 +904,8 @@ bool Server::serve(rpc::Socket s, std::string& err) {
                                   std::to_string(backend_.pos()));
                 // the rows as the worker's first layer asks for them: frames read as needed (each acknowledged), a
                 // frame's rows past the request kept for the next one
-                std::vector<float> fh, fpre;
+                std::vector<float> fh, fpre, sh, sp;
+                int64_t normal_next = p0, shadow_next = p0;
                 size_t f_at = 0, f_n = 0;   // the queue's rows: [f_at, f_at + f_n) of fh / fpre
                 int64_t f_p0 = p0;          // the position of the queue's first row
                 bool halted = false, broken = false;
@@ -866,12 +919,14 @@ bool Server::serve(rpc::Socket s, std::string& err) {
                         e = halted ? "the coordinator stopped the prompt" : "the link to the coordinator failed";
                         return false;
                     }
-                    if (q0 != f_p0 || T < 0 || q0 + T > p0 + (int64_t) nt) {
+                    const bool shadow = paired && q0 == shadow_next;
+                    const int64_t expected = paired ? (shadow ? shadow_next : normal_next) : f_p0;
+                    if (q0 != expected || T < 0 || q0 + T > p0 + (int64_t) nt) {
                         e = "the worker asked for rows out of order";
                         broken = true;
                         return false;
                     }
-                    while ((int64_t) f_n < T) {
+                    while (f_p0 + (int64_t) f_n < q0 + T) {
                         uint16_t t2 = 0;
                         uint64_t op2 = 0;
                         std::string ie;
@@ -899,7 +954,7 @@ bool Server::serve(rpc::Socket s, std::string& err) {
                             return false;
                         }
                         if (rT < 1 || rT > (uint32_t) kPieceRows || rp0 != f_p0 + (int64_t) f_n ||
-                            rp0 + (int64_t) rT > p0 + (int64_t) nt || q.left() != (size_t) rT * row_bytes) {
+                            rp0 + (int64_t) rT > p0 + (int64_t) nt || q.left() != (size_t) rT * frame_row_bytes) {
                             broken = true;
                             e = "rows out of order or of the wrong size";
                             return false;
@@ -907,6 +962,10 @@ bool Server::serve(rpc::Socket s, std::string& err) {
                         if (f_at > 0) {   // (the queue's taken front dropped before it grows)
                             fh.erase(fh.begin(), fh.begin() + (std::ptrdiff_t) (f_at * hf));
                             fpre.erase(fpre.begin(), fpre.begin() + (std::ptrdiff_t) (f_at * kPreFloats));
+                            if (paired) {
+                                sh.erase(sh.begin(), sh.begin() + (std::ptrdiff_t) (f_at * hf));
+                                sp.erase(sp.begin(), sp.begin() + (std::ptrdiff_t) (f_at * kPreFloats));
+                            }
                             f_at = 0;
                         }
                         fh.resize((f_n + rT) * hf);
@@ -926,6 +985,18 @@ bool Server::serve(rpc::Socket s, std::string& err) {
                                 e = "the prompt's rows: a non-finite pre value";
                                 return false;
                             }
+                        if (paired) {
+                            sh.resize((f_n + rT) * hf); sp.resize((f_n + rT) * kPreFloats);
+                            const uint8_t* source = q.here() + (size_t) rT * row_bytes;
+                            if (!core::layer_stage_decode_activations(spec_.wire, source, (size_t) rT * hf * elem,
+                                                                      sh.data() + f_n * hf, (size_t) rT * hf, de)) {
+                                broken = true; e = de; return false;
+                            }
+                            std::memcpy(sp.data() + f_n * kPreFloats, source + (size_t) rT * hf * elem,
+                                        (size_t) rT * kPreFloats * 4);
+                            for (size_t i = f_n * kPreFloats; i < sp.size(); ++i)
+                                if (!std::isfinite(sp[i])) { broken = true; e = "non-finite shared-source pre"; return false; }
+                        }
                         f_n += rT;
                         const std::vector<uint8_t> a = answer(true, "");
                         if (!send_frame(s, (uint16_t) (kRows | kReply), op2, a.data(), a.size(), nullptr, 0,
@@ -935,11 +1006,18 @@ bool Server::serve(rpc::Socket s, std::string& err) {
                             return false;
                         }
                     }
-                    std::memcpy(hd, fh.data() + f_at * hf, (size_t) T * hf * 4);
-                    std::memcpy(pd, fpre.data() + f_at * kPreFloats, (size_t) T * kPreFloats * 4);
-                    f_at += (size_t) T;
-                    f_n -= (size_t) T;
-                    f_p0 += T;
+                    const size_t at = f_at + (size_t) (q0 - f_p0);
+                    std::memcpy(hd, (shadow ? sh : fh).data() + at * hf, (size_t) T * hf * 4);
+                    std::memcpy(pd, (shadow ? sp : fpre).data() + at * kPreFloats, (size_t) T * kPreFloats * 4);
+                    int64_t consumed = q0 + T;
+                    if (paired) {
+                        (shadow ? shadow_next : normal_next) = consumed;
+                        consumed = std::min(shadow_next, normal_next);
+                    }
+                    const size_t drop = (size_t) (consumed - f_p0);
+                    f_at += drop;
+                    f_n -= drop;
+                    f_p0 = consumed;
                     return true;
                 };
                 const auto t0 = std::chrono::steady_clock::now();

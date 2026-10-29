@@ -7,10 +7,12 @@ param(
     [string]$Root = "",                  # the StrataRPCD folder (default: the folder above this script's)
     [string]$Config = "",                # setup's run config (default: the strata-deepseek-v4.1-flash-*.json in $Root)
     [string]$Listen = "0.0.0.0:39501",   # where the coordinator connects (this PC's port)
-    [int]$Split = 20,                    # the worker's first layer: the same on both PCs
+    [string]$Worker = "",              # middle stage only: downstream C endpoint
+    [int]$Split = 0,                    # the worker's first layer: the same on both PCs
     [ValidateSet("fp32", "bf16", "fp16")][string]$Wire = "bf16",   # the rows on the link, the same on both PCs: bf16 (half the bytes), fp32 exact
     [int]$Context = 0,                   # 0: the config's --max-context (it must match the coordinator's)
     [int]$PrefillChunk = 0,              # the prompt chunk on this PC (0: the engine's own, 4096 on a 16 GB card): smaller leaves more VRAM for experts
+    [int]$MiddleEnd = 0,                # 0: config value or A+C; 24: opt-in A+B+C
     [switch]$Vision,                     # encode images on A's GPU; image routing on both PCs
     [switch]$Sessions,                   # opt-in manual paired disk sessions, on both PCs
     [string]$SessionDir = "",            # this PC's own session folder
@@ -33,6 +35,16 @@ $cfg = Get-Content $Config -Raw | ConvertFrom-Json
 # setup's engine arguments (the pack, the context, ...), then this PC's role
 $a = New-Object System.Collections.Generic.List[string]
 $given = @($cfg.args)
+foreach ($setting in @(@("Split", "--layer-stage-split"), @("MiddleEnd", "--layer-stage-middle-end"), @("Worker", "--layer-stage-client"))) {
+    $current = Get-Variable -Name $setting[0] -ValueOnly
+    if (-not $current) {
+        $index = [array]::IndexOf($given, $setting[1])
+        if ($index -ge 0 -and $index + 1 -lt $given.Count) { Set-Variable -Name $setting[0] -Value $given[$index + 1] }
+    }
+}
+if (-not $Split) { $Split = 20 }
+if ($Worker -and -not $MiddleEnd) { throw "a forwarding worker requires -MiddleEnd (or a three-stage config)" }
+if ($MiddleEnd -and $MiddleEnd -notin @(24, 28, 32, 36)) { throw "MiddleEnd must be 24, 28, 32 or 36" }
 $useVision = $Vision -or ($given -contains "--layer-stage-vision")
 $useSessions = $Sessions -or ($given -contains "--layer-stage-sessions")
 if (-not $SessionDir) {
@@ -54,11 +66,13 @@ if ($useSessions) {
     if (-not $SessionDir) { $SessionDir = Join-Path $Root "sessions-worker" }
     $a.Add("--layer-stage-session-dir"); $a.Add($SessionDir)
 }
+if ($Worker) { $a.Add("--layer-stage-client"); $a.Add($Worker) }
 foreach ($x in @("--layer-stage-server", $Listen, "--layer-stage-split", [string]$Split, "--layer-stage-wire", $Wire)) { $a.Add($x) }
 
+if ($MiddleEnd) { $a.Add("--layer-stage-middle-end"); $a.Add([string]$MiddleEnd) }
 if ($cfg.env) { foreach ($p in $cfg.env.PSObject.Properties) { Set-Item -Path "env:$($p.Name)" -Value ([string]$p.Value) } }
 if ($Stats) { $env:STRATA_LAYER_STAGE_STATS = "1" }
-$log = Join-Path $Root ("stratarpcd-worker-" + (Get-Date -Format "yyyyMMdd-HHmmss") + ".log")
+$log = Join-Path $Root ($(if ($Worker) { "stratarpcd-middle-" } else { "stratarpcd-worker-" }) + (Get-Date -Format "yyyyMMdd-HHmmss") + ".log")
 Write-Host "StrataRPCD worker"
 Write-Host "  engine: $exe"
 Write-Host "  config: $Config"

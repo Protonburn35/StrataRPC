@@ -24,6 +24,14 @@ int main() {
     check(restored.state == file.state && restored.ref.id == file.ref.id && restored.ref.prefix == file.ref.prefix &&
           restored.images.size() == 1 && restored.images[0].hash == 777, "round trip differs");
     check(stage::same_spec(restored.spec, file.spec, err), "spec round trip differs");
+    file.spec.middle_end = 24;
+    const auto abc = (root / "abc.srpc").string();
+    check(session::write(abc, file, size, err), "three-stage write failed");
+    check(session::read(abc, restored, size, err), "three-stage read failed");
+    check(stage::same_spec(restored.spec, file.spec, err), "three-stage topology lost");
+    restored.spec.middle_end = 0;
+    check(!stage::same_spec(restored.spec, file.spec, err), "two/three-stage snapshot mismatch accepted");
+    file.spec.middle_end = 0;
     check(!session::read(path, restored, size, err, 1024), "restore ignored memory budget");
     // Replacing the coordinator file is supported, and a damaged payload must fail before any model load.
     file.state[0] ^= 1;
