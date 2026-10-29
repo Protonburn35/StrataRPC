@@ -42,6 +42,7 @@ jobs:
           python-version: "3.12"
 
       # the toolkit from conda (the PCs use NVIDIA's installer); no shell init, so no cmd AutoRun picks another toolset
+      # No optional profiler-API/NVTX packages: ordinary inference must build with the basic toolkit as on the PCs.
       - uses: mamba-org/setup-micromamba@add3a49764cedee8ee24e82dfde87f5bc2914462
         with:
           micromamba-version: "2.0.7-0"
@@ -50,8 +51,7 @@ jobs:
           post-cleanup: none
           create-args: >-
             --override-channels -c nvidia -c conda-forge
-            cuda-version=13.2 cuda-nvcc cuda-cudart-dev cuda-cudart-static libcublas-dev cuda-nvtx-dev
-            cuda-profiler-api cuda-cccl
+            cuda-version=13.2 cuda-nvcc cuda-cudart-dev cuda-cudart-static libcublas-dev cuda-cccl
 
       - name: Install CMake and Ninja
         shell: pwsh

@@ -27,10 +27,20 @@
 
 #include "ggml.h"
 
-#include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
-#if !defined(STRATA_USE_HIP)
+// Profiling headers are optional CUDA components (not installed by every Windows toolkit).
+// Ordinary inference must build without them; keep Nsight capture and markers when they are present.
+#if __has_include(<cuda_profiler_api.h>)
+#include <cuda_profiler_api.h>
+#define STRATA_GLM_HAS_PROFILER_API 1
+#else
+#define STRATA_GLM_HAS_PROFILER_API 0
+#endif
+#if !defined(STRATA_USE_HIP) && __has_include(<nvtx3/nvToolsExt.h>)
 #include <nvtx3/nvToolsExt.h>
+#define STRATA_GLM_HAS_NVTX 1
+#else
+#define STRATA_GLM_HAS_NVTX 0
 #endif
 
 #include <algorithm>
@@ -6624,6 +6634,13 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
         err = "glm spec: needs a split with the NextN block";
         return false;
     }
+#if !STRATA_GLM_HAS_PROFILER_API
+    if (getenv("STRATA_GLM_NSYS") != nullptr) {
+        err = "glm spec: MAYA_GLM_NSYS needs the optional CUDA profiler API headers; install the profiling "
+              "components and rebuild, or unset MAYA_GLM_NSYS";
+        return false;
+    }
+#endif
     Glm5Model* hl = spec_head_last();
     Glm5Model* B = hl->split_next_.get();     // the tail group's first part (spec_tail runs from it)
     Glm5Model* TL = spec_tail_last();         // its last: the token, the logits and the draft block live there
@@ -6778,26 +6795,32 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
     double tp[6] = {0, 0, 0, 0, 0, 0};
     int64_t np = 0;
     auto tnow = std::chrono::steady_clock::now();
+#if STRATA_GLM_HAS_NVTX
     static const char* const lap_names[6] = {"wait tail", "draft", "redo", "enqueue tail", "enqueue head", "emit"};
+#endif
     const auto lap = [&](int i) {
         if (!sprof) return;
         const auto t = std::chrono::steady_clock::now();
         tp[i] += std::chrono::duration<double, std::milli>(t - tnow).count();
         tnow = t;
-#if !defined(STRATA_USE_HIP)
+#if STRATA_GLM_HAS_NVTX
         nvtxRangePop();
         nvtxRangePushA(lap_names[(i + 1) % 6]);
 #endif
     };
     // STRATA_GLM_NSYS=<from>,<to>: a profiler capture window over those steps (nsys --capture-range=cudaProfilerApi)
+#if STRATA_GLM_HAS_PROFILER_API
     int64_t nsys_from = -1, nsys_to = -1;
     if (const char* ns = getenv("STRATA_GLM_NSYS")) std::sscanf(ns, "%lld,%lld", (long long*) &nsys_from, (long long*) &nsys_to);
-#if !defined(STRATA_USE_HIP)
+#endif
+#if STRATA_GLM_HAS_NVTX
     if (sprof) nvtxRangePushA("emit");
 #endif
     for (;;) {
+#if STRATA_GLM_HAS_PROFILER_API
         if (np == nsys_from) cudaProfilerStart();
         if (np == nsys_to) cudaProfilerStop();
+#endif
         // (1) the tail's token for position q+1 -> y (the truth for position q+2)
         int y2 = -1;
         lap(5);

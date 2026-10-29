@@ -4,6 +4,26 @@ Read this first. Claude and Sol (GPT/Codex) both work here. Fetch before you sta
 this file with every push, and never force-push. Doc-only commits carry `[skip ci]`. Never commit
 `STRATA_RPC_TOKEN`, raw logs or other private data.
 
+## Windows setup fix (2026-10-29, Codex)
+
+The user's first setup on A reached the CUDA build but stopped on `glm_fast_path.cu`:
+`fatal error C1083: Cannot open include file: 'cuda_profiler_api.h'`. This is an optional profiling component,
+not a missing compiler. The log confirms A already has CUDA **13.2.78**, VS 2022 Build Tools **14.44.35207**,
+driver **621.01** and a working Python **3.13.5** environment. Python packages and pinned llama.cpp downloaded
+successfully. Model download had not yet been reached. The missing Git warning was not the fatal error.
+
+- `glm_fast_path.cu` now detects profiler-API and NVTX headers independently. Normal inference and host timing
+  build without those extras. If the headers are installed, the existing profiler capture and markers remain.
+  Explicit `MAYA_GLM_NSYS` capture is refused clearly when profiler-API support was not compiled in.
+- Windows CI no longer installs the optional profiler-API/NVTX packages, so its full engine build checks the
+  basic toolkit path used by the PCs. CUDA 13.2, MSVC and sm_89 + sm_120 remain the build targets.
+- **Local validation:** the complete changed CUDA translation unit compiled for sm_89 + sm_120 with both optional
+  headers absent; the HIP-name mapping check passes. No model arithmetic, sampling or inference setting changed.
+  Windows CI will recheck the full engine after this push; GPU inference remains untested here.
+- **Recovery:** replace only `src/core/glm_fast_path.cu` with this branch's updated file and rerun
+  `START-HERE.bat --yes --download-model --no-start`. Existing build objects are reused. No compiler/Python
+  reinstallation is needed for this error, and the user's model files need not be removed.
+
 ## Current continuation (2026-10-29, Codex)
 
 The user asked to resume this branch after Claude. Work alone. The first model run on the user's GPUs is still
