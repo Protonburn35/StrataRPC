@@ -6,8 +6,9 @@ this file with every push, and never force-push. Doc-only commits carry `[skip c
 
 ## Coordinator RAM budget fixed (2026-10-29, Claude)
 
-Sol's priority below is implemented. **Not yet measured on the PCs.** The user compiles this one update locally on
-both PCs; later engine updates should come as a GitHub-built package (see "Next" at the end).
+Sol's priority below is implemented. **Not yet measured on the PCs.** The user compiles updates locally on both PCs
+and decided a GitHub-built engine package is **not needed**. The Windows workflow stays a compile check
+(sm_89 + sm_120) and does not package anything; Sol's "Delivery request" section below is superseded.
 
 - **Cause, as Sol found:** the coordinator's RAM tier was sized as one part of a split over the whole model. Shared
   over all 42 MoE layers, the coordinator's 21 layers got half the eligible budget. The other half was set aside
@@ -328,10 +329,9 @@ The user's folder is `C:\StrataRPCG`. The user guide is `docs/STRATARPCG.md`.
 ## Next
 
 1. **Measure the RAM-budget fix** (top section) with the same prompt on both PCs.
-2. **A GitHub-built Windows engine package for later updates.** The user does not want to compile again after this
-   one. Sol's packaging notes above still apply: maya.exe with its real DLLs (dumpbin), `STRATA_PORTABLE=ON`, and an
-   installer that updates the folder and `build\MAYA-BUILD.json`'s `src` fingerprint so Maya does not recompile.
-   Claude has drafted the installer and its test; they are not pushed yet.
+2. **No GitHub engine package:** the user compiles locally (download the commit's ZIP, copy it over
+   `C:\StrataRPCG`, run `START-HERE.bat --yes --download-model --no-start` on each PC). Keep the Windows workflow as a
+   compile check only.
 3. **Tune `-Split`** from each PC's expert-pool lines (VRAM vs RAM experts). With `-HeadOnCoordinator`, the 4090 loses
    the head's VRAM to experts and the 5070 Ti gains it.
 4. **Possible speedups, opt-in first:** overlap the worker's receive of chunk c+1 with its compute of chunk c (it
