@@ -4,6 +4,30 @@ Read this first. Claude and Sol (GPT/Codex) both work here. Fetch before you sta
 this file with every push, and never force-push. Doc-only commits carry `[skip ci]`. Never commit
 `STRATA_RPC_TOKEN`, raw logs or other private data.
 
+## Current continuation (2026-10-29, Codex)
+
+The user asked to resume this branch after Claude. Work alone. The first model run on the user's GPUs is still
+the next hardware step; this cloud host has no GPU or access to the home PCs. Do not add tuning defaults or claim
+a throughput improvement before collecting both PCs' logs.
+
+- Claude's Windows validation **passed**: [run 40913650336](https://github.com/Protonburn35/StrataRPC/actions/runs/40913650336),
+  source `a4744854`. The MSVC protocol tests, Windows PowerShell 5.1 launcher checks and full CUDA build for
+  sm_89 + sm_120 all succeeded. That workflow is a compile check, with no downloadable engine package.
+- The general Python workflow [failed](https://github.com/Protonburn35/StrataRPC/actions/runs/40913650381)
+  in `FailedRestartKeepsContext`: after a restart reaches EOF before READY, the process may not have exited yet,
+  and `alive()` incorrectly said it was ready to use. A failed restart now explicitly marks it ended, while
+  retaining the previous context, info and request routes so the next request can retry.
+- The regression now holds the failed child alive after closing stdout, eliminating the exit-status race, and
+  checks a subsequent successful retry. It fails against the previous code and passes with the fix.
+- Local checks pass: GLM-stage and transport tests (2), PowerShell launcher checks (20), tools suite
+  (594 tests, 31 skipped), server suite (541 tests, 11 skipped) and HIP-name mapping. The old cloud test
+  environment needed CI's `jsonschema>=4.18,<5` dependency installed before the server suite could pass.
+  No C++ engine, model, sampling, split or GPU-memory settings changed.
+- For the first run, keep Claude's 512K FP16-cache, split 24, BF16-wire and worker-head defaults. Use `-Stats`
+  on both PCs. Check short text first, then a picture and follow-up, then paired save/restore with `-Sessions`
+  on both. Compare decode using the same prompts and sampling before trying a different split/head location.
+  Use `-ApiHost 192.168.50.206` on the coordinator if LAN API access is wanted; its default remains loopback.
+
 ## What this branch is (2026-10-29, Claude)
 
 GLM-5.3-Flash split by layers over the user's two PCs, built on **Project Maya v1.1.38** (`cf6472cc`, mw00/project-maya)

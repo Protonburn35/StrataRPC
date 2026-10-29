@@ -2218,20 +2218,46 @@ class FailedRestartKeepsContext(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             gone = Path(d) / "gone"
             exe = Path(d) / "engine"
-            exe.write_text("#!/bin/sh\n"
-                           f"[ -e '{gone}' ] && exit 1\n"
-                           "echo 'READY 4096 stop'\n"
-                           "cat > /dev/null\n")
+            # Close stdout before exiting on a failed start. The server sees EOF while the process still
+            # exists: this makes the failure deterministic instead of racing the OS's exit status in poll().
+            exe.write_text(f"#!{sys.executable}\n"
+                           "import os, sys\n"
+                           f"if os.path.exists({str(gone)!r}):\n"
+                           "    os.close(1)\n"
+                           "    sys.stdin.readline()\n"
+                           "    raise SystemExit(1)\n"
+                           "print('READY 4096 stop', flush=True)\n"
+                           "for line in sys.stdin:\n"
+                           "    if line.strip() == 'QUIT':\n"
+                           "        break\n")
             exe.chmod(0o755)
             eng = StrataEngine(str(exe), [])
+            processes = [eng.proc]
+
+            def cleanup():
+                for proc in processes:
+                    if proc.poll() is None:
+                        proc.kill()
+                    proc.wait(timeout=5)
+                    proc.stdin.close()
+                    proc.stdout.close()
+            self.addCleanup(cleanup)
             self.assertEqual(eng.max_context, 4096)
             gone.touch()                                # from now on it cannot start
             eng.proc.kill()
             eng.proc.wait()
+            self.assertIsNone(eng.lines.get(timeout=5))  # the old reader finished before the next start
             with self.assertRaises(RuntimeError):
                 eng.restart()
+            processes.append(eng.proc)
             self.assertEqual(eng.max_context, 4096)
+            self.assertIsNone(eng.proc.poll())           # stdout closed, but the child has not exited yet
             self.assertFalse(eng.alive())               # (so the next request's ensure_engine tries again)
+            gone.unlink()
+            eng.restart()
+            processes.append(eng.proc)
+            self.assertTrue(eng.alive())
+            self.assertEqual(eng.max_context, 4096)
 
 
 @unittest.skipUnless(os.name == "posix", "the fake engine is a script with a #! line")

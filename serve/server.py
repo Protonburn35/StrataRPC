@@ -1040,6 +1040,9 @@ class StrataEngine:
         try:
             self.__init__(*self.spawn)
         except Exception:
+            # EOF before READY is a failed start even if poll() has not observed the process's exit yet.
+            # ensure_engine must retry it rather than send the next request to a process that never became ready.
+            self.ended = True
             # (#351: a start that fails - a GPU that fell off the bus - left max_context 0, so every later request
             #  failed its size check with "exceeds the context (0)" before ensure_engine could try again; the context
             #  stays what it was, the next request starts it again or says why it cannot)
