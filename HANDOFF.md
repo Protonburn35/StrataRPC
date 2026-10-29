@@ -4,6 +4,37 @@ Read this first. Claude and Sol (GPT/Codex) both work here. Fetch before you sta
 this file with every push, and never force-push. Doc-only commits carry `[skip ci]`. Never commit
 `STRATA_RPC_TOKEN`, raw logs or other private data.
 
+## The model is now the 3.5-bit file (2026-10-29, Claude)
+
+**The user's decision:** delete the 3.0-bit file and run pfeifferj's GSQ-RCO **3.5-bit** GGUF. The user does reverse
+engineering and Switch recomp ports, where exactness matters. Both files don't fit on the disks, and DeepSeek
+(StrataRPCD) remains the faster option when speed matters. Keep Maya's vision files.
+
+- **The file:** `GLM-5.3-Flash-GSQ-RCO-3.5bit.gguf`, 137,073,274,080 bytes, sha256 `12c32d32...658f1b`, same pinned
+  revision `892aabe2`. Same tensors and non-expert types as 3.0-bit.
+  - Experts: layer 3 gate/up Q4_K with down Q3_K; layers 4-37 Q3_K; layer 38 gate/up Q3_K with down Q2_K;
+    layers 39-44 Q2_K.
+  - The packer keeps gate/up and down types separately (`native_experts.txt` `gu_type` / `d_type`), and so does the
+    engine. **No engine change.**
+- **Setup:**
+  - `maya.py` MODELS has `GSQ-RCO-3.5bit`, with Maya's vision files; its download folder is
+    `models-glm\GSQ-RCO-3.5bit`.
+  - `START-HERE.bat` now defaults to `--model GSQ-RCO-3.5bit`; `--model GSQ-RCO-3.0bit` still selects 3-bit.
+  - The config is `maya-gsq-rco-3.5bit.json` and the coordinator's log is `maya-gsq-rco-3.5bit-stratarpcg.log`.
+  - `tools/test_maya_quants.py` knows both names.
+- **Vision files:** they live in the model's folder (`<download dir>\vision`). The switch moves them from
+  `models-glm\GSQ-RCO-3.0bit\vision` to `models-glm\GSQ-RCO-3.5bit\vision` before the 3.0-bit GGUF and pack are
+  deleted, so they are not downloaded again.
+- **Expected cost (estimate, not measured):**
+  - decode about 20% slower (expert bytes +15% on the 4090's layers, +22% on the 5070 Ti's), so roughly 4.6-5.0 tok/s
+    instead of 5.8;
+  - prompt reading 15-20% slower.
+- **Quality per pfeifferj:**
+  - perplexity +4.5% vs Q8_0 (3.0-bit: +9.1%);
+  - KL 0.071 (0.142);
+  - MMLU-Pro 60.55% (60.0%; the difference is within noise).
+- **Saved chats** from the 3.0-bit model will not restore: the model identity differs.
+
 ## Measured on the PCs: RAM fix and crash fix work (2026-10-29, Claude)
 
 Engine `80d285f0`, split 24, worker head, BF16, 512K context, temperature 1.0 / top_p 0.95. These are the user's logs
@@ -307,8 +338,9 @@ therefore carries Maya's history. StrataRPC (`main`, Qwen) and StrataRPCD (`stra
 The user's folder is `C:\StrataRPCG`. The user guide is `docs/STRATARPCG.md`.
 
 **User decisions** (do not change without asking):
-- **Model:** pfeifferj/GLM-5.3-Flash-GSQ-RCO-GGUF, 3.0-bit file (117.5 GB, revision `892aabe2`, sha256
-  `a60586ce…d63d7b`). Maya's vision files come from peasantsmith/GLM-5.3-Flash-Maya-GGUF `vision/`.
+- **Model:** pfeifferj/GLM-5.3-Flash-GSQ-RCO-GGUF, **3.5-bit file since 2026-10-29** (137.1 GB, sha256
+  `12c32d32...658f1b`). Before that it was the 3.0-bit file (117.5 GB, sha256 `a60586ce…d63d7b`); both are at revision
+  `892aabe2`. Maya's vision files come from peasantsmith/GLM-5.3-Flash-Maya-GGUF `vision/`.
 - **Context:** 512K, FP16 cache. 256K only if measurably faster.
 - **PCs:** the 4090 PC (192.168.50.206) is coordinator and server, currently using `-ApiHost 192.168.50.206`
   on port 8081 (launcher default `127.0.0.1`). The 5070 Ti PC

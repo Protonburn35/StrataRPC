@@ -240,17 +240,38 @@ MODELS = {
                            "3627575df16bd152db0f3fd7e488d270b33f3a9e6c7fa3b1b8ac381faafde882",
                        "GLM-5.3-Flash-vocab.gguf":
                            "8f53cb1bd2e631c14ef413e3284735d9e53f3c508d07a6f609e705b487105912"}}},
-    # StrataRPCG: pfeifferj's GSQ-RCO 3.0-bit GGUF (GSQ experts mostly Q2_K, Q3_K / Q4_K in layers 3-8, Q8_0 attention and
-    # shared experts; no MTP block - nothing drafts with it), one file; the vision files are Maya's (its encoder reads
-    # them).  The model card measured it against a Q8_0 conversion of the FP8 release: MMLU-Pro 60.0% vs 61.95%,
+    # StrataRPCG: pfeifferj's GSQ-RCO 3.0-bit GGUF (GSQ experts mostly Q2_K, Q3_K / Q4_K in layers 3-8, Q8_0 attention
+    # and shared experts; no MTP block - nothing drafts with it), one file; the vision files are Maya's (its encoder
+    # reads them).  The model card measured it against a Q8_0 conversion of the FP8 release: MMLU-Pro 60.0% vs 61.95%,
     # perplexity +9.1%.  Revision pinned to the commit its SHA256SUMS lists this file in.
     "GSQ-RCO-3.0bit": {
-        "about": "pfeifferj's GSQ-RCO 3.0-bit GGUF (StrataRPCG's model): GSQ-trained experts, mostly Q2_K with Q3_K / "
-                 "Q4_K in the first MoE layers, Q8_0 attention and shared experts; no MTP block (no drafting)",
+        "about": "pfeifferj's GSQ-RCO 3.0-bit GGUF (StrataRPCG's faster choice): GSQ-trained experts, mostly Q2_K "
+                 "with Q3_K / Q4_K in the first MoE layers, Q8_0 attention and shared experts; no MTP block (no "
+                 "drafting)",
         "repo": "pfeifferj/GLM-5.3-Flash-GSQ-RCO-GGUF", "revision": "892aabe2e45835f58f3f24bf03dc5427d345e230",
         "folder": "", "file": "GLM-5.3-Flash-GSQ-RCO-3.0bit.gguf", "shards": 1, "download_gb": 117.5,
         "sha256": {"GLM-5.3-Flash-GSQ-RCO-3.0bit.gguf":
                        "a60586ce30494bf61a2f3eb0da72ae212ea9f9957434e4061a137889e7d63d7b"},
+        "vision": {
+            "repo": "peasantsmith/GLM-5.3-Flash-Maya-GGUF", "revision": "main",
+            "folder": "vision", "mmproj": "mmproj-GLM-5.3-Flash-F16.gguf", "vocab": "GLM-5.3-Flash-vocab.gguf",
+            "download_gb": 1.14,
+            "sha256": {"mmproj-GLM-5.3-Flash-F16.gguf":
+                           "3627575df16bd152db0f3fd7e488d270b33f3a9e6c7fa3b1b8ac381faafde882",
+                       "GLM-5.3-Flash-vocab.gguf":
+                           "8f53cb1bd2e631c14ef413e3284735d9e53f3c508d07a6f609e705b487105912"}}},
+    # StrataRPCG's model (START-HERE.bat's default since 2026-10-29): the same repository's 3.5-bit GGUF - the same
+    # tensors and types as the 3.0-bit one (Q8_0 attention and shared experts), more of its experts at Q3_K (layers
+    # 4-37; Q4_K / Q3_K in layer 3, Q2_K from layer 38); 137.1 GB.
+    # The model card: perplexity +4.5% against the Q8_0 conversion (3.0-bit: +9.1%), MMLU-Pro 60.55% (3.0-bit 60.0%,
+    # within its noise).  Same pinned revision.
+    "GSQ-RCO-3.5bit": {
+        "about": "pfeifferj's GSQ-RCO 3.5-bit GGUF (StrataRPCG's model): the 3.0-bit file's layout with more "
+                 "experts at Q3_K, half its divergence from Q8_0; 20 GB more to hold; no MTP block (no drafting)",
+        "repo": "pfeifferj/GLM-5.3-Flash-GSQ-RCO-GGUF", "revision": "892aabe2e45835f58f3f24bf03dc5427d345e230",
+        "folder": "", "file": "GLM-5.3-Flash-GSQ-RCO-3.5bit.gguf", "shards": 1, "download_gb": 137.1,
+        "sha256": {"GLM-5.3-Flash-GSQ-RCO-3.5bit.gguf":
+                       "12c32d32c284337d0e9da759dbd559fb41567a4b1c57ede0259057e6f8658f1b"},
         "vision": {
             "repo": "peasantsmith/GLM-5.3-Flash-Maya-GGUF", "revision": "main",
             "folder": "vision", "mmproj": "mmproj-GLM-5.3-Flash-F16.gguf", "vocab": "GLM-5.3-Flash-vocab.gguf",

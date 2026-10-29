@@ -1,6 +1,6 @@
 # StrataRPCG: GLM-5.3-Flash over two PCs
 
-StrataRPCG runs **GLM-5.3-Flash** (pfeifferj's GSQ-RCO 3.0-bit GGUF, 117.5 GB) on two PCs with Project Maya's GLM
+StrataRPCG runs **GLM-5.3-Flash** (pfeifferj's GSQ-RCO 3.5-bit GGUF, 137.1 GB) on two PCs with Project Maya's GLM
 engine, split by layers:
 
 | PC | Address | Role | Runs |
@@ -35,9 +35,9 @@ The branch is `stratarpcg`. StrataRPC (Qwen) and StrataRPCD (DeepSeek) are uncha
      development with C++") and the CUDA toolkit (13.x for the 5070 Ti). If one is missing, setup says so and prints
      the command that installs it.
    - **Compiles the engine** for that PC's GPU (10-30 minutes the first time).
-   - **Asks before it downloads** the model (117.5 GB) and the picture files (1.1 GB, from Maya's repository). They go
+   - **Asks before it downloads** the model (137.1 GB) and the picture files (1.1 GB, from Maya's repository). They go
      to `C:\Strata-data\models-glm`, next to your other Strata data.
-   - **Builds the model's pack** and writes its config, `C:\StrataRPCG\maya-gsq-rco-3.0bit.json`. It does not start
+   - **Builds the model's pack** and writes its config, `C:\StrataRPCG\maya-gsq-rco-3.5bit.json`. It does not start
      the model.
    - **Defaults:** a 512K context (FP16 cache) and no drafter. Anything you add wins over the defaults, e.g.
      `START-HERE.bat --context 262144`.
@@ -132,7 +132,7 @@ The page opens at **http://127.0.0.1:8081**. The OpenAI-style API is at `http://
 - **A wrong secret or different settings stop it at once**, with the reason (see the table below).
 - **To stop:** Ctrl+C in each window.
 - **Logs:** the worker writes `C:\StrataRPCG\stratarpcg-worker-<date>.log`; the 4090 writes
-  `C:\StrataRPCG\maya-gsq-rco-3.0bit-stratarpcg.log`.
+  `C:\StrataRPCG\maya-gsq-rco-3.5bit-stratarpcg.log`.
 - **To see what a script would run without starting anything:** add `-DryRun`.
 
 ## Options
