@@ -4,6 +4,27 @@ Read this first. Claude and Sol (GPT/Codex) both work here. Fetch before you sta
 this file with every push, and never force-push. Doc-only commits carry `[skip ci]`. Never commit
 `STRATA_RPC_TOKEN`, raw logs or other private data.
 
+## Measured on the PCs: RAM fix and crash fix work (2026-10-29, Claude)
+
+Engine `80d285f0`, split 24, worker head, BF16, 512K context, temperature 1.0 / top_p 0.95. These are the user's logs
+(raw files not committed).
+
+- **4090 RAM tier:** **7.68 GB, 867 slots**, up from 3.68-3.92 GB / 415-443 slots. The expert tiers warm 25.0 GB
+  (was 20.7).
+- **5070 Ti RAM tier:** 10.51 GB / 1367 slots, still under its pinning cap. It was 10.74 GB before the 2 GB row reserve.
+- **The ~152K-token prompt that crashed before now completes**, without the crash.
+- **Decode after the 152K prompt, same prompt and same VRAM hit rate (63.2% -> 63.6%):**
+  - 204 -> 177 ms a token, **4.90 -> 5.64 tok/s (+15%)**;
+  - the 4090's disk reads 47.7 -> 37.1 a token, their service time 76 -> 60 ms a token.
+- **Short context:** about 5.8 tok/s, as before. That prompt's VRAM hit was lower (64.8% vs 67-71% earlier), so it is
+  not a clean comparison.
+- **Prompt reading,** measured on the worker for the 114,688-token first call (97.8 s in all):
+  - 50.6 s the worker's own compute;
+  - **31.9 s receiving rows (3758 MB at 118 MB/s, gigabit wire speed)**;
+  - 13.9 s waiting for the coordinator.
+  - The worker receives and computes in turn. Overlapping them (Next, item 4) is the measured opportunity for long
+    prompts; decode would not change. Claude offered it to the user; not started.
+
 ## Long-prompt crash on the 4090 and its memory follow-up (2026-10-29, Claude)
 
 **Not yet run on the PCs.**
