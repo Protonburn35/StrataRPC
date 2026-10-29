@@ -23,6 +23,10 @@ a throughput improvement before collecting both PCs' logs.
   (594 tests, 31 skipped), server suite (541 tests, 11 skipped) and HIP-name mapping. The old cloud test
   environment needed CI's `jsonschema>=4.18,<5` dependency installed before the server suite could pass.
   No C++ engine, model, sampling, split or GPU-memory settings changed.
+- **GitHub recheck passed:** [run 40921417875](https://github.com/Protonburn35/StrataRPC/actions/runs/40921417875),
+  source `f4a7041a`. Backend-name mapping, the full server suite and installer/tools suite all passed.
+  The follow-up documentation commit only records this result; the original successful Windows build above
+  still covers the unchanged C++ engine and start scripts.
 - For the first run, keep Claude's 512K FP16-cache, split 24, BF16-wire and worker-head defaults. Use `-Stats`
   on both PCs. Check short text first, then a picture and follow-up, then paired save/restore with `-Sessions`
   on both. Compare decode using the same prompts and sampling before trying a different split/head location.
