@@ -377,7 +377,11 @@ The user's folder is `C:\StrataRPCG`. The user guide is `docs/STRATARPCG.md`.
 1. **Measure the RAM-budget fix** (top section) with the same prompt on both PCs.
 2. **No GitHub engine package:** the user compiles locally with the "Updating" commands in `docs/STRATARPCG.md`.
    Keep the Windows workflow as a compile check only.
-3. **Tune `-Split`** from each PC's expert-pool lines (VRAM vs RAM experts). With `-HeadOnCoordinator`, the 4090 loses
-   the head's VRAM to experts and the 5070 Ti gains it.
+3. **`-Split` stays 24 (the user's decision, 2026-10-29).** Claude estimated `-Split 26` at 0-3% (about 6.0 -> 6.1 tok/s),
+   possibly slower, and the user declined to try it. Don't suggest it again without new measurements.
+   - Both halves already cost about 3.5-4 ms per MoE layer a token (4090 about 75-80 ms, 5070 Ti about 70-90 ms).
+   - Moving layers redistributes the same fast memory: the 4090's fixed VRAM pool covers more layers.
+   - The limit is disk reads on both PCs: about 35-48 reads a token on the 4090, 55-75 ms. Both PCs together keep about
+     40-45 GB of about 110 GB of experts in VRAM or RAM.
 4. **Possible speedups, opt-in first:** overlap the worker's receive of chunk c+1 with its compute of chunk c (it
    receives and computes in turn now); prefetch the worker's first-layer experts during the 4090's half of decode.
