@@ -27,7 +27,7 @@ The branch is `stratarpcg`. StrataRPC (Qwen) and StrataRPCD (DeepSeek) are uncha
    git clone -b stratarpcg https://github.com/Protonburn35/StrataRPC C:\StrataRPCG
    ```
 
-   - **Updating later:** `cd C:\StrataRPCG` then `git pull`. The next start recompiles what changed.
+   - **Updating later:** see [Updating](#updating) below (no Git needed).
 
 2. **Run `START-HERE.bat`** in `C:\StrataRPCG` (double-click, or from a terminal). It runs Project Maya's setup for
    this model:
@@ -54,6 +54,43 @@ The branch is `stratarpcg`. StrataRPC (Qwen) and StrataRPCD (DeepSeek) are uncha
    ```powershell
    Get-NetFirewallRule -Direction Inbound | Where-Object DisplayName -like "*Strata*" | ForEach-Object { "{0}: port {1}" -f $_.DisplayName, ($_ | Get-NetFirewallPortFilter).LocalPort }
    ```
+
+## Updating
+
+Do this on **both PCs** for each new version.
+
+1. **Stop StrataRPCG** on that PC (Ctrl+C in its windows), and back up `C:\StrataRPCG` if you want to be able to go
+   back. The copy overwrites the branch's own files. Your configs (`maya-*.json`), `.venv`, `build`, the model, its
+   pack and your saved chats are not in the download, so they stay.
+2. **Download the version and copy it over the folder.** In PowerShell, `$c` picks the version: `stratarpcg` is the
+   newest, or put a commit id from `HANDOFF.md` (e.g. `c82cf424579841eb1c6a3a1eab41e903db137064`) for that exact one.
+
+   ```powershell
+   $ProgressPreference = "SilentlyContinue"
+   [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+   $c = "stratarpcg"
+   $zip = "$env:TEMP\stratarpcg-$c.zip"
+   $dir = "$env:TEMP\stratarpcg-$c"
+   Invoke-WebRequest "https://github.com/Protonburn35/StrataRPC/archive/$c.zip" -OutFile $zip
+   Unblock-File $zip
+   Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
+   Expand-Archive $zip -DestinationPath $dir
+   $src = (Get-ChildItem $dir -Directory | Select-Object -First 1).FullName
+   robocopy $src C:\StrataRPCG /E /NFL /NDL /NJH /NP
+   ```
+
+   - **Robocopy's "Extras"** are your own files; it leaves them alone. An exit code of 1 means files were copied.
+3. **Compile the engine.** This reuses the model, pack, picture encoder and settings, and takes 10-30 minutes:
+
+   ```powershell
+   cd C:\StrataRPCG
+   .\START-HERE.bat --yes --download-model --no-start
+   ```
+
+   It should end with `engine compiled: C:\StrataRPCG\build\maya.exe`.
+4. **Start as usual** (the 5070 Ti first; see the next section).
+
+- **With Git instead:** `cd C:\StrataRPCG`, then `git pull`, then step 3.
 
 ## Each time
 

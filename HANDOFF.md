@@ -35,9 +35,12 @@ and decided a GitHub-built engine package is **not needed**. The Windows workflo
   - disk loads per token and the disk-miss service time;
   - the VRAM hit rate;
   - decode and prefill speed.
-- **Install route the user chose:** download the commit's ZIP, copy it over `C:\StrataRPCG` (the user backs the folder
-  up first) and run `START-HERE.bat --yes --download-model --no-start` on each PC. That recompiles the engine and
-  reuses the model, pack, picture encoder and configs.
+- **How the user updates (every time):** `docs/STRATARPCG.md`, section "Updating". The user backs up
+  `C:\StrataRPCG`, then downloads `https://github.com/Protonburn35/StrataRPC/archive/<commit or stratarpcg>.zip`,
+  copies it over the folder with `robocopy ... /E`, and runs `START-HERE.bat --yes --download-model --no-start` on
+  each PC. That recompiles the engine and reuses the model, pack, picture encoder and configs.
+  - Give the user those commands with the pushed commit id. The 4090 has no Git, so never assume `git pull`.
+  - This fix is commit `c82cf424579841eb1c6a3a1eab41e903db137064`.
 
 ## Latest hardware results and Claude's next fix (2026-10-29, Codex)
 
@@ -329,9 +332,8 @@ The user's folder is `C:\StrataRPCG`. The user guide is `docs/STRATARPCG.md`.
 ## Next
 
 1. **Measure the RAM-budget fix** (top section) with the same prompt on both PCs.
-2. **No GitHub engine package:** the user compiles locally (download the commit's ZIP, copy it over
-   `C:\StrataRPCG`, run `START-HERE.bat --yes --download-model --no-start` on each PC). Keep the Windows workflow as a
-   compile check only.
+2. **No GitHub engine package:** the user compiles locally with the "Updating" commands in `docs/STRATARPCG.md`.
+   Keep the Windows workflow as a compile check only.
 3. **Tune `-Split`** from each PC's expert-pool lines (VRAM vs RAM experts). With `-HeadOnCoordinator`, the 4090 loses
    the head's VRAM to experts and the 5070 Ti gains it.
 4. **Possible speedups, opt-in first:** overlap the worker's receive of chunk c+1 with its compute of chunk c (it
