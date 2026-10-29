@@ -34,10 +34,8 @@ this file with every push, and never force-push. Doc-only commits carry `[skip c
     check Task Manager → Details → "Commit size" to see which process grows.
 - **Validation:** the CUDA engine builds (Linux, sm_89); `glm_stage_test` passes. The Windows workflow re-checks sm_89 +
   sm_120 on this push.
-- **Reinstall route:** the user will delete `C:\StrataRPCG` on both PCs and recreate it from the commit's ZIP, then run
-  `START-HERE.bat --yes --download-model --no-start`.
-  - That compiles the engine and the picture encoder from scratch.
-  - It reuses the model, pack and verified checksums in `C:\Strata-data\models-glm`.
+- **Reinstall route:** delete and recreate `C:\StrataRPCG` (see "How the user updates" below). This version is commit
+  `80d285f0`, fingerprint `3083f3751ef91de7`.
 
 ## Coordinator RAM budget fixed (2026-10-29, Claude)
 
@@ -70,12 +68,22 @@ and decided a GitHub-built engine package is **not needed**. The Windows workflo
   - disk loads per token and the disk-miss service time;
   - the VRAM hit rate;
   - decode and prefill speed.
-- **How the user updates (every time):** `docs/STRATARPCG.md`, section "Updating". The user backs up
-  `C:\StrataRPCG`, then downloads `https://github.com/Protonburn35/StrataRPC/archive/<commit or stratarpcg>.zip`,
-  copies it over the folder with `robocopy ... /E`, and runs `START-HERE.bat --yes --download-model --no-start` on
-  each PC. That recompiles the engine and reuses the model, pack, picture encoder and configs.
-  - Give the user those commands with the pushed commit id. The 4090 has no Git, so never assume `git pull`.
-  - This fix is commit `c82cf424579841eb1c6a3a1eab41e903db137064`.
+- **How the user updates (every time, the user's standing choice):** delete `C:\StrataRPCG` on both PCs and recreate it.
+  The commands are in `docs/STRATARPCG.md`, section "Updating":
+  1. `Remove-Item C:\StrataRPCG -Recurse -Force`;
+  2. download `https://github.com/Protonburn35/StrataRPC/archive/<commit>.zip`;
+  3. `robocopy` it into `C:\StrataRPCG`;
+  4. `START-HERE.bat --yes --download-model --no-start`.
+
+  Notes for whoever gives the commands:
+  - Give the user these commands with the pushed commit id, and the expected `build\MAYA-BUILD.json` `"src"`
+    fingerprint (`setup.source_hash(ENGINE_SOURCES)` of that commit).
+  - The 4090 has no Git, so never assume `git pull`.
+  - A fresh folder rebuilds `.venv`, llama.cpp's source, the engine and the picture encoder. The model, pack and
+    verified checksums stay in `C:\Strata-data\models-glm`.
+  - Remind the user to back up saved chats (`sessions-host` / `sessions-worker`) and any config edits first.
+  - RAM fix: `c82cf424579841eb1c6a3a1eab41e903db137064` (fingerprint `2f61316a08205342`).
+  - Memory follow-up: `80d285f0aa3d6f09f0a228455ef95f2f54f40f62` (fingerprint `3083f3751ef91de7`).
 
 ## Latest hardware results and Claude's next fix (2026-10-29, Codex)
 

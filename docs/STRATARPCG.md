@@ -57,15 +57,20 @@ The branch is `stratarpcg`. StrataRPC (Qwen) and StrataRPCD (DeepSeek) are uncha
 
 ## Updating
 
-Do this on **both PCs** for each new version.
+Do this on **both PCs** for each new version. The folder is deleted and made again from the download, so every
+version starts clean.
 
-1. **Stop StrataRPCG** on that PC (Ctrl+C in its windows), and back up `C:\StrataRPCG` if you want to be able to go
-   back. The copy overwrites the branch's own files. Your configs (`maya-*.json`), `.venv`, `build`, the model, its
-   pack and your saved chats are not in the download, so they stay.
-2. **Download the version and copy it over the folder.** In PowerShell, `$c` picks the version: `stratarpcg` is the
-   newest, or put a commit id from `HANDOFF.md` (e.g. `c82cf424579841eb1c6a3a1eab41e903db137064`) for that exact one.
+1. **Stop StrataRPCG** on that PC (Ctrl+C in its windows).
+2. **Back up what you want to keep from `C:\StrataRPCG`.** The model, its pack and their checksums live in
+   `C:\Strata-data\models-glm` and are kept. Everything in `C:\StrataRPCG` is deleted:
+   - your saved chats (`sessions-host` on the 4090, `sessions-worker` on the 5070 Ti);
+   - the logs;
+   - any change you made to a config (`maya-*.json`), such as an API key. Setup writes the configs again.
+3. **Delete the folder, download the version and put it in place.** In PowerShell, `$c` picks the version:
+   `stratarpcg` is the newest, or put a commit id from `HANDOFF.md` for that exact one.
 
    ```powershell
+   Remove-Item C:\StrataRPCG -Recurse -Force
    $ProgressPreference = "SilentlyContinue"
    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
    $c = "stratarpcg"
@@ -79,18 +84,25 @@ Do this on **both PCs** for each new version.
    robocopy $src C:\StrataRPCG /E /NFL /NDL /NJH /NP
    ```
 
-   - **Robocopy's "Extras"** are your own files; it leaves them alone. An exit code of 1 means files were copied.
-3. **Compile the engine.** This reuses the model, pack, picture encoder and settings, and takes 10-30 minutes:
+4. **Set up and compile.** In a fresh folder, setup:
+   - makes the Python environment again;
+   - downloads llama.cpp's source;
+   - compiles the engine and the picture encoder from scratch.
+
+   It finds the model and its pack in `C:\Strata-data\models-glm`, so nothing large is downloaded. Expect longer
+   than an in-place update (roughly 30-60 minutes).
 
    ```powershell
    cd C:\StrataRPCG
    .\START-HERE.bat --yes --download-model --no-start
    ```
 
-   It should end with `engine compiled: C:\StrataRPCG\build\maya.exe`.
-4. **Start as usual** (the 5070 Ti first; see the next section).
+   It should end with `engine compiled: C:\StrataRPCG\build\maya.exe`. `build\MAYA-BUILD.json`'s `"src"` is the
+   version's fingerprint, which `HANDOFF.md` lists for each version.
+5. **Start as usual** (the 5070 Ti first; see the next section).
 
-- **With Git instead:** `cd C:\StrataRPCG`, then `git pull`, then step 3.
+- **Keeping the folder instead:** leave out the `Remove-Item C:\StrataRPCG` line. The copy then overwrites only the
+  branch's files and keeps your configs, environment, build and saved chats. Step 4 then only recompiles what changed.
 
 ## Each time
 
