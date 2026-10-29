@@ -3,55 +3,35 @@
 Read this first. Claude and Sol (GPT/Codex) both work here. Fetch before you start, keep the other's commits, update this
 file with every push, and never force-push.
 
-## Current continuation: optional A+B+C (2026-10-29, Codex)
+## Current continuation: return to A+C (2026-10-29, Codex)
 
-The user authorized implementing a three-stage DeepSeek setup while retaining the working A+C preset.
-Work alone. Laptop B is **192.168.50.129, Ryzen AI 9 HX 370, RTX 4060 Laptop 8 GB, 32 GB RAM**.
-The user will run START-HERE on B; explicitly choose IST-DAS 2.25 and no-start, then install this fork's new
-engine on every participating PC. See `docs/STRATARPCD-THREE-PC.md` for the complete configs/commands.
+The user tested the optional A+B+C setup and reported that it slowed inference down. No timing logs or
+controlled comparison were supplied for that report. The user asked to remove the laptop stage and return
+the GitHub source to the previous two-PC build. Do not reintroduce Stage B unless the user asks for it again.
 
-- **Protocol 3**, update all peers together. Original two-PC presets remain available. New presets are
-  `configs/stratarpcd/strata-stratarpcd-abc-{a,b,c}.json`; build-local includes all five JSONs and both guides.
-  A+C still runs 0-19 / 20-39. A+B+C runs A 0-19, B 20-23, C source 20 plus 24-39 and the head.
-- **Why C repeats source 20:** layers after 20 reuse its compressed KV, index keys and candidates. B sends
-  both its original input and its final residual/pre rows. C reconstructs 20 locally, replaces its residual/pre
-  at 24 with B's output, and 24 computes its own indexer picks. This avoids transferring growing KV caches.
-  C loads 17 layers rather than 20, B loads four. This duplicates computation and **does not establish a speedup**.
-- `--layer-stage-middle-end 24` opts in on all peers. Validated later indexer boundaries are 24/28/32/36;
-  do not use arbitrary cuts or drop the shared source. The model's actual layout is checked before loading.
-  B forwards prompts in bounded 2048-token feeds. Three-stage mode disables prompt skipping to consume/rebuild
-  every paired row, so prefill can cost more. Two-PC behavior keeps its existing prompt path.
-- Controls, image spans, checkpoints, sampling and logits traverse A->B->C. A alone encodes pictures on GPU;
-  no laptop encoder or DSpark. Six experts, 1M declared context and BF16 remain the presets. No temperature rule,
-  pruning or new weight conversion. Three-stage downstream sampling failures propagate rather than becoming EOS.
-- Manual save is **C then B then A**, same snapshot ID, each local native state on its own SSD. Restore verifies
-  local files/topology and reconnects downstream. Partial failures reset the chain. A's three-PC folder is
-  `C:\StrataRPCD\sessions-abc`, B/C use `sessions-abc-b` / `sessions-abc-c`. A+C snapshots are incompatible with
-  A+B+C and refused across modes. Existing two-PC DS4PAIR2 envelopes remain readable; new topology uses DS4PAIR3.
-  Existing RAM/disk guards and 8 GiB per-file cap remain. No automatic disk save was added.
-- Launchers preserve topology flags from explicit input configs. B uses start-worker with both server/client;
-  C's split becomes 24 only in its ABC preset. A writes a separate ABC runtime JSON. Stop engines before switching
-  modes. Firewall: B admits A (.206), C additionally admits B (.129); retain C's A allowance for A+C.
-- **Validation so far:** GPU-free two/three-stage protocol, dependency-layout and session-envelope tests pass;
-  FP32 and BF16 synthetic chains cover streamed prompts crossing the forwarding bound, decode, image spans,
-  checkpoints, save/reset/restore and downstream sampling failure. Four PowerShell launcher/config tests and
-  43 existing Python session/API tests pass. Linux CUDA 13.2 compilation passed for sm_89 and sm_120 (no GPU).
-  Protocol and session-envelope tests also pass ASan/UBSan.
-  **Windows build passed:** [run 40853673787](https://github.com/Protonburn35/StrataRPC/actions/runs/40853673787),
-  source `bf4c056246ab83a59da8c05f28ba725fb38c83e9`, native version `0.1.52 build bf4c05624`, CUDA 13.2 /
-  MSVC 14.44.35207 / sm_89 + sm_120. Windows launcher tests (4) and CPU tests (3), compilation, package and upload
-  all succeeded. [Download the 407 MB engine package](https://github.com/Protonburn35/StrataRPC/actions/runs/40853673787/artifacts/12889408046).
-  Packaging verified all five presets, both guides and the launch scripts. The subsequent documentation commit adds
-  this evidence and clarifies the extra BF16 activation boundary; it does not change the built source.
-  Hardware checks remain pending. HIP/SYCL toolchains are not installed here.
-  No actual model output, GPU snapshot restore, numerical parity, throughput or full-1M-state claim is made.
+- The three-PC implementation (`bf4c0562`) and its follow-up documentation (`fd222124`) are reverted with
+  an ordinary commit; history is retained. Engine, launchers, configs, tests and build workflow match
+  pre-experiment `42f96d84` exactly. Only this handoff adds the rollback record.
+- **Protocol 2, A+C only:** A (4090, .206) runs layers 0-19, GPU vision and Engram; C (5070 Ti, .143)
+  runs layers 20-39, the head and sampling. Vision and paired manual save/restore remain available.
+  IST-DAS 2.25 bpw, 1M declared context, BF16, six experts and no DSpark remain the chosen settings.
+- Restore the backed-up two-PC engine package on **both** PCs, stop the laptop worker, and use
+  `strata-stratarpcd-worker.json` / `strata-stratarpcd-coordinator.json`, not the removed ABC presets.
+  Start C first at `192.168.50.143:39501`; after READY, start A with `-Worker 192.168.50.143:39501`
+  and `-Port 8081`. Keep `-Vision -Sessions -Stats` and the same existing token in both PowerShell windows.
+  Never commit the token. The user chose A's HTTP host `127.0.0.1`; that only affects API access.
+- The previous verified [Windows package](https://github.com/Protonburn35/StrataRPC/actions/runs/40718452176/artifacts/12831277803)
+  is from `24d1b14d` (the engine/config source underlying `42f96d84`). No replacement build is needed
+  for this exact source restoration. The three-PC artifact is superseded; do not recommend it.
+- Firewall cleanup removes only the laptop-stage rules: C's `StrataRPCD laptop to 5070 Ti` / `StrataRPCD B to C`,
+  and B's `StrataRPCD 4090 to laptop` / `StrataRPCD A to B` (alternate names used in chat and the guide).
+  **Keep C's existing inbound TCP 39501 rule admitting A at `192.168.50.206`.** No new A rule was added.
+  The laptop may still be a chat client if the API is separately exposed on A's LAN address.
+- **Rollback validation:** exact Git tree comparison against `42f96d84` passes for every file except
+  this handoff. All three CPU protocol/session/transport tests and all three PowerShell launcher
+  regression tests pass on the cloud host. No new GPU timing or on-PC validation was performed here.
 
-First hardware check: compare short text and image/follow-up, then manual save, switch, restore, restart all three
-and restore. Keep the same client history/attachments. Benchmark A+C vs A+B+C with identical prompts/sampling.
-Use A/B -Stats decode totals/waits to locate stage cost; do not assume network bandwidth is limiting. The user
-asked about SSD latency: low read MB/s alone does not establish or exclude an I/O bottleneck.
-
-## Current continuation: vision and paired manual sessions (2026-10-28, Codex)
+## Previous update: vision and paired manual sessions (2026-10-28, Codex)
 
 The user confirmed A + C works and now uses **IST-DAS 2.25 bpw only, 1M context, BF16 transfers,
 all six experts, no DSpark**. Work alone: the user explicitly complained about sub-agent usage.
@@ -169,19 +149,18 @@ from `C:\StrataRPCD-project`, copied into `C:\StrataRPCD\engine-rpcd`):
 
 ## Goal
 
-Run DeepSeek-V4.1-Flash (IST-DAS 2.00 bpw) across PCs with layer-stage RPC, the way StrataRPC `main` runs
-Qwen3.8-Flash-Next ("qfn") on two PCs. Phase 1 is PC A + PC C. Phase 2 adds the laptop (B) as a third stage, after the
-user has tested phase 1.
+Run DeepSeek-V4.1-Flash (IST-DAS 2.25 bpw) on PC A + PC C with layer-stage RPC, the way StrataRPC `main` runs
+Qwen3.8-Flash-Next ("qfn") on two PCs. The laptop-stage experiment was removed at the user's request on 2026-10-29.
 
 | PC | Hardware | Role |
 |---|---|---|
 | A (192.168.50.206) | RTX 4090 24 GB, 7800X3D, 32 GB RAM | coordinator: API, embedding table, Engram, layers 0-19 |
 | C (192.168.50.143) | RTX 5070 Ti 16 GB, 9800X3D, 32 GB RAM | worker: layers 20-39, head, sampling |
-| B (192.168.50.129) | RTX 4060 Laptop 8 GB, HX 370, 32 GB RAM | phase 2 |
+| B (192.168.50.129) | RTX 4060 Laptop 8 GB, Ryzen AI 9 HX 370, 32 GB RAM | not an inference stage |
 
 Network: the worker listens on port 39501 (StrataRPC's qfn worker uses 39001). C's inbound firewall rule lists
-remote addresses: `-RemoteAddress 192.168.50.206` (A only; the user removed the laptop on 2026-10-28). When planning phase 2, check which PC connects to
-which: every listening PC needs an inbound rule, and a rule with an address list must include each PC that connects to it.
+remote addresses: `-RemoteAddress 192.168.50.206` (A only). The user is removing the extra laptop-stage firewall
+rules after reverting to A+C on 2026-10-29.
 
 The user keeps the whole model in a `StrataRPCD` folder on every PC: the GGUF shards, the Engram table, the DSpark GGUF
 and the pack. This is separate from the qfn setup on `main`.

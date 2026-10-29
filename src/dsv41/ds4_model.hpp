@@ -69,7 +69,6 @@ struct Options {
     // GPU vision and manual paired disk sessions are separate opt-ins;
     // experts per word default to the model's (full quality) so both stages agree.  0 / -1: the whole model, as before.
     int stage_begin = 0, stage_end = -1;
-    int stage_middle_end = 0;         // opt-in A+B+C; B ends here, C repeats shared source 20 then resumes here
     std::string stage_client;         // the coordinator: the worker's host:port
     std::string stage_token;          // the shared secret (STRATA_RPC_TOKEN)
     bool stage_vision = false;       // coordinator GPU vision and image routing, opt-in on both stages

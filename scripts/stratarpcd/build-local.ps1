@@ -179,8 +179,6 @@ if (Test-Path $configs) {
 }
 $instructions = Join-Path $Root "docs\STRATARPCD-FIRST-RUN.md"
 if (Test-Path $instructions) { Copy-Item $instructions $out }
-$three = Join-Path $Root "docs\STRATARPCD-THREE-PC.md"
-if (Test-Path $three) { Copy-Item $three $out }
 Set-Content (Join-Path $out "BUILD.txt") "$id, CUDA $(Split-Path -Leaf $Cuda), MSVC $($msvc.Name), $Arch"
 Write-Host ""
 Write-Host "Built: $out"

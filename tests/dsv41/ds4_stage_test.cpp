@@ -159,7 +159,7 @@ struct Worker {
     std::string endpoint;
     std::vector<std::string> ended;   // why each connection ended
 
-    Worker(const Spec& spec, int port, Backend* backend = nullptr) : server("secret", spec, backend ? *backend : model) {
+    Worker(const Spec& spec, int port) : server("secret", spec, model) {
         endpoint = "127.0.0.1:" + std::to_string(port);
         std::string err;
         if (!rpc::listen(endpoint, ls, err)) {
@@ -425,145 +425,11 @@ void test_split_rules() {
     CHECK(cut_layers(v41.kv_src, 0, 20) == std::vector<int>({2, 8, 14}));
     CHECK(cut_layers(v41.ix_src, 20, 40) == std::vector<int>({0, 4, 8, 12, 16}));
     CHECK(join(v41.eg_layers) == "1, 14");
-    std::vector<int> layers;
-    CHECK(three_stage_layers(v41, 20, 24, 0, 20, layers, why) && layers.size() == 20);
-    CHECK(three_stage_layers(v41, 20, 24, 20, 24, layers, why) && layers == std::vector<int>({20,21,22,23}));
-    CHECK(three_stage_layers(v41, 20, 24, 24, 40, layers, why) && layers.front() == 20 && layers[1] == 24 && layers.size() == 17);
-    CHECK(three_stage_layers(v41, 20, 28, 28, 40, layers, why) && layers[1] == 28 && layers.size() == 13);
-    CHECK(!three_stage_layers(v41, 20, 26, 26, 40, layers, why));
-    CHECK(!three_stage_layers(v41, 20, 24, 20, 40, layers, why));
-    CHECK(!three_stage_layers(early, 20, 28, 28, 40, layers, why));
-}
-
-// C consumes two independent streams: original input to source 20, then B's output. Read all source
-// rows first to exercise the bounded queue used by C's layer-major prompt path.
-struct TailModel : FakeModel {
-    std::atomic<bool> fail_sample{false};
-    int sample(const Sampling& s) override { return fail_sample ? -1 : FakeModel::sample(s); }
-    bool feed(const int32_t* t, int n, int lr, int snap, const RowFn& rows, std::string& err) override {
-        for (int at = 0; at < n; at += 73) {
-            const int count = std::min(73, n - at);
-            std::vector<float> h((size_t) count * kHc * kDim), pre((size_t) count * kPreFloats);
-            // Windows are a single piece; prompts can ask for arbitrary piece sizes.
-            if (n <= kPieceRows) {
-                h.resize((size_t) n * kHc * kDim); pre.resize((size_t) n * kPreFloats);
-                if (!rows(p, n, h.data(), pre.data(), err)) return false;
-            } else if (!rows(p + at, count, h.data(), pre.data(), err)) return false;
-            const int seen = n <= kPieceRows ? n : count;
-            for (int r = 0; r < seen; ++r) {
-                for (size_t i = 0; i < (size_t) kHc * kDim; ++i)
-                    CHECK(std::fabs(h[(size_t) r * kHc * kDim + i] - h_value(p + at + r, i)) < 0.03f);
-            }
-            if (n <= kPieceRows) break;
-        }
-        const RowFn final = [&](int64_t q, int count, float* h, float* pre, std::string& e) {
-            if (!rows(q, count, h, pre, e)) return false;
-            for (int r = 0; r < count; ++r) for (size_t i = 0; i < (size_t) kHc * kDim; ++i) {
-                const float want = h_value(q + r, i);
-                CHECK(std::fabs(h[(size_t) r * kHc * kDim + i] - 1.0f - want) < 0.04f);
-                h[(size_t) r * kHc * kDim + i] = want;
-            }
-            for (size_t i = 0; i < (size_t) count * kPreFloats; ++i) pre[i] -= 2.0f;
-            return true;
-        };
-        return FakeModel::feed(t, n, lr, snap, final, err);
-    }
-};
-
-struct MiddleModel : FakeModel {
-    Client next;
-    MiddleModel(const Spec& spec, const std::string& endpoint) {
-        std::string err;
-        CHECK(next.connect(endpoint, "secret", spec, err));
-    }
-    void reset() override { FakeModel::reset(); std::string err; (void) next.reset(err); }
-    void checkpoint(int slot) override { FakeModel::checkpoint(slot); std::string err; CHECK(next.checkpoint(slot, p, err)); }
-    void pin() override { std::string err; CHECK(next.pin(err)); }
-    bool restore(int64_t limit) override {
-        bool ok = false; int64_t after = -1; std::string err;
-        return next.restore(limit, ok, after, err) && ok && FakeModel::restore(limit) && p == after;
-    }
-    void images(const std::vector<ImageSpan>& v) override {
-        FakeModel::images(v); std::string err; CHECK(next.images(p, v, err));
-    }
-    int sample(const Sampling& s) override { int token = -1; std::string err; return next.sample(s, token, err) ? token : -1; }
-    bool logits(std::vector<float>& out) override { std::string err; return next.logits(out, err); }
-    bool snapshot(bool save, const SnapshotRef& ref, uint64_t& bytes, std::string& err) override {
-        return next.snapshot(save, ref, bytes, err) && FakeModel::snapshot(save, ref, bytes, err);
-    }
-    bool feed(const int32_t* t, int n, int lr, int snap, const RowFn& rows, std::string& err) override {
-        if (n > kMiddleRows) {
-            for (int at = 0; at < n; at += kMiddleRows) {
-                const int count = std::min(kMiddleRows, n - at);
-                if (!feed(t + at, count, std::min(count, std::max(0, lr - (n - at - count))),
-                          at + count == n ? snap : -1, rows, err)) return false;
-            }
-            return true;
-        }
-        std::vector<float> input((size_t) n * kHc * kDim), pre((size_t) n * kPreFloats);
-        if (!rows(p, n, input.data(), pre.data(), err)) return false;
-        next.set_shadow_rows([&](int64_t q, int count, float* h, float* pr, std::string&) {
-            std::memcpy(h, input.data() + (size_t) (q - p) * kHc * kDim, (size_t) count * kHc * kDim * 4);
-            std::memcpy(pr, pre.data() + (size_t) (q - p) * kPreFloats, (size_t) count * kPreFloats * 4);
-            return true;
-        });
-        std::vector<float> h = input, pr = pre;
-        for (float& v : h) v += 1.0f;
-        for (float& v : pr) v += 2.0f;
-        int64_t after = -1;
-        if (n <= kPieceRows && snap < 0) {
-            if (!next.window(p, t, n, lr, h.data(), pr.data(), after, err)) return false;
-        } else {
-            if (!next.prompt_begin(p, t, n, lr, snap, err) || !next.prompt_rows(p, n, h.data(), pr.data(), err) ||
-                !next.prompt_end(false, after, err)) return false;
-        }
-        if (snap >= 0) ck[snap & 3] = p + n - 1;
-        toks.insert(toks.end(), t, t + n); p += n;
-        next.set_shadow_rows(nullptr);
-        return after == p;
-    }
-};
-
-void test_three_stages(int port, LayerStageWireFormat wire) {
-    Spec spec = make_spec(wire); spec.middle_end = 24; spec.sessions = true; spec.image_token = 17;
-    Spec tail_spec = spec; tail_spec.split = 24;
-    TailModel tail; tail.tolerance = wire == LayerStageWireFormat::fp32 ? 1e-5f : 0.05f;
-    Worker c(tail_spec, port, &tail);
-    MiddleModel mid(tail_spec, c.endpoint);
-    Worker b(spec, port + 1, &mid);
-    Client a; std::string err;
-    CHECK(a.connect(b.endpoint, "secret", spec, err));
-    CHECK(a.images(0, {{10, 5, 444}}, err));
-    auto t = tokens(3007, 9);
-    CHECK(a.prompt_begin(0, t.data(), (int) t.size(), 1, 1, err));
-    CHECK(stream(a, 0, (int) t.size(), 333, err));
-    int64_t after = -1;
-    CHECK(a.prompt_end(false, after, err)); CHECK(after == 3007);
-    CHECK(tail.rows_seen == 3007 && tail.bad_rows == 0 && tail.image_spans.size() == 1);
-    CHECK(a.checkpoint(2, after, err));
-    const SnapshotRef ref{"0123456789abcdef0123456789abcdef", after, prefix_hash(t)};
-    uint64_t bytes = 0; CHECK(a.snapshot(true, ref, bytes, err));
-    std::vector<float> h, pre; make_rows(after, 1, h, pre); int32_t token = 7;
-    CHECK(a.window(after, &token, 1, 1, h.data(), pre.data(), after, err));
-    CHECK(after == 3008 && tail.p == after && mid.p == after);
-    bool restored = false; CHECK(a.restore(3007, restored, after, err) && restored && after == 3007);
-    Sampling sampling; sampling.temperature = 0.8f; sampling.top_p = 0.95f; sampling.seed = 123;
-    int sampled = -1; CHECK(a.sample(sampling, sampled, err) && sampled >= 0);
-    CHECK(a.reset(err)); CHECK(tail.p == 0 && mid.p == 0);
-    CHECK(a.snapshot(false, ref, bytes, err)); CHECK(tail.p == 3007 && mid.p == 3007);
-    CHECK(a.sample(sampling, sampled, err) && sampled >= 0);
-    Spec wrong = spec; wrong.middle_end = 28;
-    CHECK(!same_spec(spec, wrong, err));
-    tail.fail_sample = true;
-    CHECK(!a.sample(sampling, sampled, err));   // C's failure propagates through B, rather than returning an EOS token
-    a.close();
 }
 
 }  // namespace
 
 int main() {
-    test_three_stages(port_base() + 30, LayerStageWireFormat::fp32);
-    test_three_stages(port_base() + 35, LayerStageWireFormat::bf16);
     test_vision_sessions(port_base() + 15);
     test_split_rules();
     const int base = port_base();

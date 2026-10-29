@@ -34,8 +34,7 @@ inline void put(std::vector<uint8_t>& b, uint64_t x) {
     for (int i = 0; i < 8; ++i) b.push_back((uint8_t) (x >> (8 * i)));
 }
 inline std::vector<uint8_t> metadata(const File& f) {
-    std::vector<uint8_t> b{'D','S','4','P','A','I','R', uint8_t(f.spec.middle_end ? '3' : '2')};
-    if (f.spec.middle_end) put(b, f.spec.middle_end);
+    std::vector<uint8_t> b{'D','S','4','P','A','I','R','2'};
     for (uint64_t x : {f.spec.identity_a, f.spec.identity_b, (uint64_t) f.spec.n_layers, (uint64_t) f.spec.split,
                       (uint64_t) f.spec.dim, (uint64_t) f.spec.hc, (uint64_t) f.spec.vocab, f.spec.max_context,
                       (uint64_t) f.spec.wire, (uint64_t) (int64_t) f.spec.image_token, (uint64_t) f.spec.sessions,
@@ -93,9 +92,7 @@ inline bool read(const std::string& path, File& f, uint64_t& bytes, std::string&
     std::ifstream in(path, std::ios::binary);
     std::vector<uint8_t> b((size_t) size);
     in.read((char*) b.data(), (std::streamsize) b.size());
-    if (!in || (std::memcmp(b.data(), "DS4PAIR2", 8) != 0 && std::memcmp(b.data(), "DS4PAIR3", 8) != 0)) {
-        err = "snapshot is truncated or has the wrong format"; return false;
-    }
+    if (!in || std::memcmp(b.data(), "DS4PAIR2", 8) != 0) { err = "snapshot is truncated or has the wrong format"; return false; }
     size_t at = 8;
     bool ok = true;
     const auto get = [&]() {
@@ -104,7 +101,6 @@ inline bool read(const std::string& path, File& f, uint64_t& bytes, std::string&
         for (int i = 0; i < 8; ++i) x |= (uint64_t) b[at++] << (8 * i);
         return x;
     };
-    f.spec.middle_end = b[7] == '3' ? (uint32_t) get() : 0;
     f.spec.identity_a = get(); f.spec.identity_b = get();
     f.spec.n_layers = (uint32_t) get(); f.spec.split = (uint32_t) get();
     f.spec.dim = (uint32_t) get(); f.spec.hc = (uint32_t) get(); f.spec.vocab = (uint32_t) get();

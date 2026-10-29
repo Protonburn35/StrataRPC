@@ -1009,10 +1009,6 @@ struct Model::Impl {
     Stats st;
     // ---- StrataRPC layer stage (ds4_stage.hpp): this process's layers are the model's [lb, lb + g.nl) of nl_all
     int lb = 0, nl_all = 0;
-    std::vector<int> stage_layers;     // C may own [20, middle_end..39], with 20 reconstructing shared attention
-    bool stage_shadow = false;
-    int64_t shadow_p0 = 0;
-    std::vector<float> shadow_h, shadow_pre;
     bool stage_in = false;            // the worker: its first layer's input is the coordinator's rows, not the embedding
     bool stage_out = false;           // the coordinator: its last layer's rows go to the worker; it has no head
     std::string ident;                // the whole model's identity (both stages must build the same)
@@ -1971,12 +1967,12 @@ struct Model::Impl {
         nl_all = g.nl;
         const int b = o.stage_begin, e = o.stage_end < 0 ? g.nl : o.stage_end;
         if (b == 0 && e == g.nl) return true;   // the whole model
-        if (b < 0 || e > g.nl || b >= e || (!o.stage_middle_end && b > 0 && e < g.nl)) {
+        if (b < 0 || e > g.nl || b >= e || (b > 0 && e < g.nl)) {
             err = "layer stage: layers " + std::to_string(b) + "-" + std::to_string(e - 1) + " are not the first or the "
                   "last part of the model's " + std::to_string(g.nl);
             return false;
         }
-        const int split = o.stage_middle_end ? 20 : b > 0 ? b : e;
+        const int split = b > 0 ? b : e;
         stage::Layout lay;
         lay.n_layers = g.nl;
         lay.kv_src = g.kv_src;
@@ -1987,12 +1983,6 @@ struct Model::Impl {
         if (!stage::check_split(lay, split, why)) {
             err = "--layer-stage-split " + std::to_string(split) + ": " + why;
             return false;
-        }
-        if (o.stage_middle_end) {
-            if (!stage::three_stage_layers(lay, split, o.stage_middle_end, b, e, stage_layers, err)) return false;
-            stage_shadow = b == o.stage_middle_end;
-        } else {
-            for (int i = b; i < e; ++i) stage_layers.push_back(i);
         }
         const auto list = [](const std::vector<int>& v) { return stage::join(v); };
         // the experts a word takes, decided here so both stages take the same: as asked, or the model's (full quality)
@@ -2018,26 +2008,16 @@ struct Model::Impl {
                 id << n << ' ' << t.dtype << ' ' << t.bytes << '\n';
             }
             ident = id.str();
-            if (o.stage_middle_end) ident += " three-stage=" + std::to_string(o.stage_middle_end);
         }
         lb = b;
         stage_in = b > 0;
         stage_out = e < g.nl;
         // the geometry of layers [b, e): the per-layer lists cut to the range and shifted; the drafter and the vision
         // tower off; the Engram (every layer of it the coordinator's) and the candidates where they are
-        const auto remap = [&](const std::vector<int>& source) {
-            std::vector<int> result;
-            for (size_t i = 0; i < stage_layers.size(); ++i)
-                if (std::find(source.begin(), source.end(), stage_layers[i]) != source.end()) result.push_back((int) i);
-            return result;
-        };
-        std::vector<int> ratios;
-        for (int i : stage_layers) ratios.push_back(g.ratios[(size_t) i]);
-        g.ratios = std::move(ratios);
-        g.kv_src = remap(g.kv_src);
-        g.ix_src = remap(g.ix_src);
-        const auto candidate = std::find(stage_layers.begin(), stage_layers.end(), g.cand_src);
-        g.cand_src = candidate == stage_layers.end() ? -1 : (int) (candidate - stage_layers.begin());
+        g.ratios = std::vector<int>(g.ratios.begin() + b, g.ratios.begin() + e);
+        g.kv_src = stage::cut_layers(g.kv_src, b, e);
+        g.ix_src = stage::cut_layers(g.ix_src, b, e);
+        g.cand_src = g.cand_src >= b && g.cand_src < e ? g.cand_src - b : -1;
         if (stage_in) {
             g.eg_layers.clear();
             pk.eg_layers = 0;
@@ -2047,14 +2027,14 @@ struct Model::Impl {
         o.dspark = o.dspark_auto = false;
         if (!o.stage_vision) o.vision = false;
         if (stage_in && o.vision) img_tok = (int) pk.num("image_token_id", -1);
-        g.nl = (int) stage_layers.size();
+        g.nl = e - b;
         // the tensor table: this stage's layers, the embedding table on the coordinator, the head on the worker
         for (auto it = pk.t.begin(); it != pk.t.end();) {
             const std::string& n = it->first;
             bool keep = true;
             if (n.rfind("layers.", 0) == 0) {
                 const int li = std::atoi(n.c_str() + 7);
-                keep = std::find(stage_layers.begin(), stage_layers.end(), li) != stage_layers.end();
+                keep = li >= b && li < e;
             } else if (n.rfind("mtp.", 0) == 0 ||
                        ((stage_in || !o.vision) && (n.rfind("vision.", 0) == 0 || n.rfind("aligner.", 0) == 0)))
                 keep = false;
@@ -2064,12 +2044,8 @@ struct Model::Impl {
                 keep = false;
             it = keep ? std::next(it) : pk.t.erase(it);
         }
-        std::fprintf(stderr, "ds4 stage: %s, layers %d-%d of %d%s\n",
-                     stage_in && stage_out ? "middle worker" : stage_out ? "coordinator" : "worker", b, e - 1,
-                     nl_all, stage_in && stage_out ? " (forwards to C; no head)" :
-                     stage_out ? " (the embedding, the Engram; the rest on the worker)" : " and the head");
-        if (o.stage_middle_end) std::fprintf(stderr, "ds4 stage: three-PC layer map [%s]%s\n",
-            stage::join(stage_layers).c_str(), stage_shadow ? " (20 reconstructs shared KV/candidates)" : "");
+        std::fprintf(stderr, "ds4 stage: %s, layers %d-%d of %d%s\n", stage_out ? "coordinator" : "worker", b, e - 1,
+                     nl_all, stage_out ? " (the embedding, the Engram; the rest on the worker)" : " and the head");
         return true;
     }
 
@@ -2264,8 +2240,7 @@ struct Model::Impl {
             Layer& l = L[(size_t) il];
             l.il = il;
             l.mtp = il >= g.nl;
-            l.name = l.mtp ? "mtp." + std::to_string(il - g.nl) + "." : "layers." +
-                std::to_string(stage_layers.empty() ? il : stage_layers[(size_t) il]) + ".";
+            l.name = l.mtp ? "mtp." + std::to_string(il - g.nl) + "." : "layers." + std::to_string(il + lb) + ".";   // (a stage's: the model's numbers)
             l.n_exp = l.mtp ? g.d_n_exp : g.n_exp;
             l.k_exp = l.mtp ? g.d_k : g.k_exp;
             if (!l.mtp) {   // experts a word takes: --experts N / the faster-mode rule (ds4_experts_rule.hpp), DS4_TOPK=N over both (a test)
@@ -2814,19 +2789,9 @@ struct Model::Impl {
         if (!o.profile.empty()) {
             std::FILE* f = std::fopen(o.profile.c_str(), "rb");
             // (a layer stage: its layers' rows of the whole model's profile)
-            if (f != nullptr && lb > 0 && !stage_shadow && std::fseek(f, (long) ((size_t) lb * g.n_exp * 4), SEEK_SET) != 0) {
+            if (f != nullptr && lb > 0 && std::fseek(f, (long) ((size_t) lb * g.n_exp * 4), SEEK_SET) != 0) {
                 std::fclose(f);
                 f = nullptr;
-            }
-            if (f != nullptr) {
-                if (stage_shadow) {
-                    for (size_t i = 0; i < stage_layers.size(); ++i) {
-                        if (std::fseek(f, (long) ((size_t) stage_layers[i] * g.n_exp * 4), SEEK_SET) == 0)
-                            (void) std::fread(prof.data() + i * g.n_exp, 4, (size_t) g.n_exp, f);
-                    }
-                    std::fclose(f);
-                    f = nullptr;
-                }
             }
             if (f != nullptr) {
                 std::vector<uint32_t> p(prof.size());
@@ -8025,7 +7990,6 @@ struct Model::Impl {
                     for (int i = 0; i < x.n; ++i)
                         CK(cudaMemcpyAsync(x.dst[i], x.src[i], x.bytes[i], cudaMemcpyHostToDevice, s));
                 }
-                if (stage_shadow && il == 1 && !stage_import(d, c.h, c.pre, p0, T, err)) return false;
                 if (last_k && g.n_mtp > 0) {   // the drafter's taps: the last chunk's last rows
                     const auto it = std::find(g.d_targets.begin(), g.d_targets.end(), il);
                     if (it != g.d_targets.end()) {
@@ -8212,7 +8176,6 @@ struct Model::Impl {
                         set_flag(a.hand_ack + ((size_t) slot * 8 + mi) * 32, wp.win, s);
                     }
                 }
-                if (stage_shadow && il == 1 && !stage_import(d, c.h, c.pre, p0, T, err)) return false;
                 for (int sidx : {L0.src, L0.ix_src ? L0.ik_src : -1}) {
                     if (sidx < 0 || got[(size_t) sidx]) continue;
                     got[(size_t) sidx] = 1;
@@ -8667,7 +8630,6 @@ struct Model::Impl {
         return m;
     }
     int yoco_layer() const {
-        if (o.stage_middle_end) return -1;   // every paired row must rebuild the shared source on C
         if (yoco_mode() == 0 || chunk <= 0 || g.nl < 2 || (int) g.ratios.size() < g.nl) return -1;
         int yl = -1;
         for (int il = 0; il < g.nl && yl < 0; ++il)
@@ -9069,13 +9031,6 @@ struct Model::Impl {
             const int nr = std::min(stage::kPieceRows, T - r0);
             if (r0 > 0) CK(cudaEventSynchronize(d.ev_out));   // (the piece before has left sx_h)
             if (!stage_rows(p0 + r0, nr, sx_h, sx_pre, err)) return false;
-            if (stage_in && stage_out) {
-                if (p0 + r0 != shadow_p0 + (int64_t) (shadow_pre.size() / stage::kPreFloats)) {
-                    err = "middle-stage source rows arrived out of order"; return false;
-                }
-                shadow_h.insert(shadow_h.end(), sx_h, sx_h + (size_t) nr * HD);
-                shadow_pre.insert(shadow_pre.end(), sx_pre, sx_pre + (size_t) nr * stage::kPreFloats);
-            }
             CK(cudaMemcpyAsync(dh + (size_t) r0 * HD, sx_h, (size_t) nr * HD * 4, cudaMemcpyHostToDevice, d.st));
             CK(cudaMemcpyAsync(dpre + (size_t) r0 * 8, sx_pre, (size_t) nr * 8 * 4, cudaMemcpyHostToDevice, d.st));
             CK(cudaEventRecord(d.ev_out, d.st));
@@ -9226,8 +9181,6 @@ struct Model::Impl {
                 CK(cudaMemcpyAsync(b.cand, bb + nh + np + nk, nc, cudaMemcpyHostToDevice, b.st));
                 cur = l.dev;
             }
-            if (stage_shadow && il == 1 && !stage_import(devs[(size_t) l.dev],
-                                                        devs[(size_t) l.dev].h, devs[(size_t) l.dev].pre, p0, T, err)) return false;
             if (!tap(devs[(size_t) l.dev], il, T, err)) return false;
             if (!layer(l, 0, p0, T, wplan, err)) return false;
             if (dump_h != nullptr) {   // DS4_DUMP_H: every layer's residual stream, for tools/ds4/compare.py --layers
@@ -9312,7 +9265,6 @@ struct Model::Impl {
                     xfer_get(hand_xfer(a.hand, d, T, false), a.hand_flag, wp.win, s);
                 }
             }
-            if (stage_shadow && il == 1 && !stage_import(d, d.h, d.pre, p0, T, err)) return false;
             // the compressed KV / index keys another group's source layer wrote this window
             for (int sidx : {L0.src, L0.ix_src ? L0.ik_src : -1}) {
                 if (sidx < 0 || got[(size_t) sidx]) continue;
@@ -9916,18 +9868,6 @@ struct Model::Impl {
             image_dirty = false;
         }
         const int64_t p0 = pos;
-        if (stage_in) {
-            shadow_p0 = p0; shadow_h.clear(); shadow_pre.clear();
-            link->set_shadow_rows([this](int64_t q0, int T, float* h, float* pre, std::string& e) {
-                const int64_t at = q0 - shadow_p0;
-                if (at < 0 || at + T > (int64_t) (shadow_pre.size() / stage::kPreFloats)) {
-                    e = "middle stage no longer holds the shared-source rows"; return false;
-                }
-                std::memcpy(h, shadow_h.data() + (size_t) at * g.hc * g.dim, (size_t) T * g.hc * g.dim * 4);
-                std::memcpy(pre, shadow_pre.data() + (size_t) at * stage::kPreFloats, (size_t) T * stage::kPreFloats * 4);
-                return true;
-            });
-        }
         const double t0 = now_ms(), w0 = link->wait_ms();
         const uint64_t b0 = link->bytes_sent();
         if (n <= kWin && snap < 0) {
@@ -9995,9 +9935,9 @@ struct Model::Impl {
                 while (std::fread(&v, 4, 1, r) == 1) all.push_back(v);
                 std::fclose(r);
             }
-            if (all.size() < (size_t) nl_all * g.n_exp) all.resize((size_t) nl_all * g.n_exp, 0u);
-            for (size_t i = 0; i < stage_layers.size(); ++i)
-                std::copy_n(prof.data() + i * g.n_exp, g.n_exp, all.data() + (size_t) stage_layers[i] * g.n_exp);
+            const size_t at = (size_t) lb * g.n_exp;
+            if (all.size() < at + prof.size()) all.resize(at + prof.size(), 0u);
+            std::copy(prof.begin(), prof.end(), all.begin() + (long) at);
         }
         const std::vector<uint32_t>& out = stage_in || stage_out ? all : prof;
         std::FILE* f = std::fopen(tmp.c_str(), "wb");
@@ -10061,8 +10001,7 @@ bool Model::load(const Options& o, std::string& err) {
     if (!p.stage_in && !p.stage_out && !p.o.stage_sessions) return true;
     // StrataRPC: what the two stages check at the handshake
     p.spec.n_layers = (uint32_t) p.nl_all;
-    p.spec.split = (uint32_t) (p.stage_out ? p.o.stage_end : p.lb);
-    p.spec.middle_end = (uint32_t) p.o.stage_middle_end;
+    p.spec.split = (uint32_t) (p.stage_out ? p.g.nl : p.lb);
     p.spec.dim = (uint32_t) p.g.dim;
     p.spec.hc = (uint32_t) p.g.hc;
     p.spec.vocab = (uint32_t) p.g.vocab;
@@ -10079,13 +10018,8 @@ bool Model::load(const Options& o, std::string& err) {
     for (int i = 0;; ++i) {
         std::string e;
         if (p.stage_connect(e)) {
-            if (p.o.stage_middle_end && !p.stage_in)
-                std::fprintf(stderr, "ds4 stage: connected to B at %s (layers 20-%d; head remains on C; wire %s)\n",
-                             p.o.stage_client.c_str(), p.o.stage_middle_end - 1, stage::wire_name(p.spec.wire));
-            else
-                std::fprintf(stderr, "ds4 stage: connected to the worker at %s (it runs layers %u-%u and the head; wire %s)%s\n",
-                             p.o.stage_client.c_str(), p.spec.split, p.spec.n_layers - 1, stage::wire_name(p.spec.wire),
-                             p.o.stage_middle_end ? " plus shared source 20" : "");
+            std::fprintf(stderr, "ds4 stage: connected to the worker at %s (it runs layers %u-%u and the head; wire %s)\n",
+                         p.o.stage_client.c_str(), p.spec.split, p.spec.n_layers - 1, stage::wire_name(p.spec.wire));
             return true;
         }
         if (e.find("handshake") != std::string::npos || now_ms() - t0 > wait_ms) {
@@ -10124,7 +10058,7 @@ int Model::sample(float t, float tp, int tk, float mp, uint64_t seed, uint64_t c
     std::string err;
     if (p.stage_up(err) && p.link->sample(s, tok, err)) return tok;
     std::fprintf(stderr, "ds4 stage: sampling on the worker failed (%s) - the answer ends here\n", err.c_str());
-    return p.o.stage_middle_end ? -1 : p.g.eos;
+    return p.g.eos;
 }
 bool Model::logits(std::vector<float>& out) {
     Impl& p = *p_;
@@ -10151,10 +10085,6 @@ bool Model::stage_snapshot(bool save, const stage::SnapshotRef& ref, uint64_t& b
             err = "worker conversation differs from the coordinator"; return false;
         }
         f.spec = p.spec; f.ref = ref; f.worker = true; f.images = p.known_images;
-        if (p.stage_out) {
-            uint64_t downstream = 0;
-            if (!p.stage_up(err) || !p.link->snapshot(true, ref, downstream, err)) return false;
-        }
         if (!p.slot_save(f.state, err, true)) return false;
         if (!session::write(path, f, bytes, err, true)) return false;
         std::fprintf(stderr, "ds4 sessions: worker saved %s (%llu bytes)\n", path.c_str(), (unsigned long long) bytes);
@@ -10167,12 +10097,8 @@ bool Model::stage_snapshot(bool save, const stage::SnapshotRef& ref, uint64_t& b
         return false;
     }
     p.known_images = f.images; p.imgs.clear();
-    if (p.stage_out) {
-        uint64_t downstream = 0;
-        if (!p.stage_connect(err) || !p.link->snapshot(false, ref, downstream, err)) { reset(); return false; }
-    }
     if (!p.slot_load(f.state.data(), f.state.size(), ref.position, err) || stage::prefix_hash(p.toks) != ref.prefix) {
-        reset(); if (err.empty()) err = "worker snapshot prefix mismatch"; return false;
+        p.reset(); if (err.empty()) err = "worker snapshot prefix mismatch"; return false;
     }
     std::fprintf(stderr, "ds4 sessions: worker restored %s\n", path.c_str());
     return true;

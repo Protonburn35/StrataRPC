@@ -98,8 +98,6 @@ void usage() {
                  "           --layer-stage-sessions          enable manual paired disk save/restore on both stages\n"
                  "           --layer-stage-session-dir DIR   worker snapshot folder (required for worker sessions)\n"
                  "           --layer-stage-split K           the worker's first layer (V4.1: 20)\n"
-                 "           --layer-stage-middle-end K      opt-in three PCs: B runs 20..K-1; C reconstructs 20, then K..\n"
-                 "                                           V4.1 K: 24 (default preset), 28, 32 or 36; B has both server/client\n"
                  "           --layer-stage-server HOST:PORT  the worker: layers K.. and the head, serving the coordinator\n"
                  "           --layer-stage-client HOST:PORT  the coordinator (with --serve): layers ..K-1, the worker at HOST:PORT\n"
                  "           --layer-stage-wire fp32|bf16|fp16  the rows on the link (fp32 exact, the default; the others lossy)\n");
@@ -109,48 +107,26 @@ void usage() {
 // the coordinator, which owns the conversation; the profile is written back whenever a coordinator starts over
 struct StageBackend : strata::ds4::stage::Backend {
     strata::ds4::Model& m;
-    bool middle;
-    std::vector<float> reply_logits;
-    explicit StageBackend(strata::ds4::Model& mm, bool mid = false) : m(mm), middle(mid) {}
+    explicit StageBackend(strata::ds4::Model& mm) : m(mm) {}
     int64_t pos() const override { return m.pos(); }
     void reset() override {
-        reply_logits.clear();
         if (m.pos() > 0) m.save_profile();
         m.reset();
     }
     void checkpoint(int slot) override { m.checkpoint(slot); }
-    bool restore(int64_t limit) override { reply_logits.clear(); return m.restore(limit); }
+    bool restore(int64_t limit) override { return m.restore(limit); }
     void pin() override { m.pin(); }
     bool feed(const int32_t* t, int n, int logits_rows, int snap_slot, const strata::ds4::stage::RowFn& rows,
               std::string& err) override {
         m.set_stage_rows(rows);
-        struct ClearRows { strata::ds4::Model& model; ~ClearRows() { model.set_stage_rows(nullptr); } } clear{m};
-        reply_logits.clear();
-        bool ok = true;
-        // Bound B's retained source rows and C's paired-row queue even for a 1M-token request.
-        const int limit = middle ? strata::ds4::stage::kMiddleRows : n;
-        for (int at = 0; ok && at < n; at += limit) {
-            const int count = std::min(limit, n - at);
-            const int lr = middle ? std::min(count, std::max(0, logits_rows - (n - at - count))) : logits_rows;
-            ok = snap_slot >= 0 && at + count == n ? m.feed_mark(t + at, count, lr, snap_slot, err)
-                                                   : m.feed(t + at, count, lr, err);
-            if (ok && middle && logits_rows > 1 && lr > 0) {
-                std::vector<float> part;
-                ok = m.logits(part);
-                if (ok) reply_logits.insert(reply_logits.end(), part.begin(), part.end());
-                else err = "middle stage could not collect downstream logits";
-            }
-        }
+        const bool ok = snap_slot >= 0 ? m.feed_mark(t, n, logits_rows, snap_slot, err) : m.feed(t, n, logits_rows, err);
         m.set_stage_rows(nullptr);
         return ok;
     }
     int sample(const strata::ds4::stage::Sampling& s) override {
         return m.sample(s.temperature, s.top_p, s.top_k, s.min_p, s.seed, s.counter);
     }
-    bool logits(std::vector<float>& out) override {
-        if (!reply_logits.empty()) { out = reply_logits; return true; }
-        return m.logits(out);
-    }
+    bool logits(std::vector<float>& out) override { return m.logits(out); }
     void images(const std::vector<strata::ds4::stage::ImageSpan>& images) override { m.set_image_spans(images); }
     bool snapshot(bool save, const strata::ds4::stage::SnapshotRef& ref, uint64_t& bytes, std::string& err) override {
         try { return m.stage_snapshot(save, ref, bytes, err); }
@@ -163,7 +139,6 @@ int stage_worker(strata::ds4::Model& m, const strata::ds4::Options& o, const std
     st::Spec spec;
     spec.n_layers = (uint32_t) m.stage_layers();
     spec.split = (uint32_t) o.stage_begin;
-    spec.middle_end = (uint32_t) o.stage_middle_end;
     spec.dim = (uint32_t) m.dim();
     spec.hc = (uint32_t) m.hc();
     spec.vocab = (uint32_t) m.vocab();
@@ -172,7 +147,7 @@ int stage_worker(strata::ds4::Model& m, const strata::ds4::Options& o, const std
     spec.image_token = m.image_token();
     spec.sessions = o.stage_sessions;
     st::hash_text(m.stage_identity(), spec.identity_a, spec.identity_b);
-    StageBackend backend(m, o.stage_middle_end && !o.stage_client.empty());
+    StageBackend backend(m);
     st::Server server(o.stage_token, spec, backend);
     std::printf("READY layer-stage worker %s\n", endpoint.c_str());
     std::fflush(stdout);
@@ -1004,10 +979,6 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             std::printf("%s\n", out.c_str());
         };
         for (;;) {
-            if (tok < 0) {
-                std::printf("ERR layer-stage sampling failed; live state reset\n");
-                m.reset(); held.clear(); finish = "cancel"; break;
-            }
             if (in.stop.load()) {
                 finish = "cancel";
                 break;
@@ -1409,7 +1380,6 @@ int main(int argc, char** argv) {
         else if (a == "--layer-stage-client") o.stage_client = val("--layer-stage-client");
         else if (a == "--layer-stage-server") stage_server = val("--layer-stage-server");
         else if (a == "--layer-stage-split") stage_split = std::atoi(val("--layer-stage-split").c_str());
-        else if (a == "--layer-stage-middle-end") o.stage_middle_end = std::atoi(val("--layer-stage-middle-end").c_str());
         else if (a == "--layer-stage-wire") stage_wire = val("--layer-stage-wire");
         else if (a == "--help" || a == "-h") {
             usage();
@@ -1434,7 +1404,7 @@ int main(int argc, char** argv) {
     }
     if (!o.stage_client.empty() || !stage_server.empty()) {   // StrataRPC: this PC's part of a layer stage split
         strata::core::LayerStageWireFormat wf;
-        if (!o.stage_client.empty() && !stage_server.empty() && !o.stage_middle_end) {
+        if (!o.stage_client.empty() && !stage_server.empty()) {
             std::fprintf(stderr, "maya-ds4: --layer-stage-client and --layer-stage-server are the two PCs' roles: one each\n");
             return 2;
         }
@@ -1466,15 +1436,7 @@ int main(int argc, char** argv) {
         setenv("STRATA_DS4_SLOT_KEEP", "0", 1);
 #endif
         o.stage_begin = stage_server.empty() ? 0 : stage_split;
-        o.stage_end = stage_server.empty() ? stage_split :
-                      !o.stage_client.empty() ? o.stage_middle_end : -1;
-    }
-    if (o.stage_middle_end && (o.stage_middle_end <= 21 ||
-        (o.stage_client.empty() && stage_server.empty()) ||
-        (stage_server.empty() && stage_split != 20) ||
-        (!stage_server.empty() && !o.stage_client.empty() && stage_split != 20) ||
-        (!stage_server.empty() && o.stage_client.empty() && stage_split != o.stage_middle_end))) {
-        std::fprintf(stderr, "three stages require A split 20, B split 20 + client, C split middle-end\n"); return 2;
+        o.stage_end = stage_server.empty() ? stage_split : -1;
     }
     if (o.stage_sessions && !stage_server.empty() && o.stage_session_dir.empty()) {
         std::fprintf(stderr, "maya-ds4: worker sessions require --layer-stage-session-dir DIR\n");

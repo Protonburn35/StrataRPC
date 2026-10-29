@@ -1,8 +1,6 @@
 # Vision and manual saved chats: A + C
 
-Both PCs need this build. Its layer-stage protocol is version 3; it refuses an older peer.
-This remains the A+C preset. Optional A+B+C configs and commands are in
-[STRATARPCD-THREE-PC.md](STRATARPCD-THREE-PC.md); stop the engines before changing modes.
+Both PCs need this build. Its layer-stage protocol is version 2; it refuses an older peer.
 The supplied configs use IST-DAS 2.25 bpw, 1,048,576 tokens of context, BF16 stage transfers,
 split 20, all six experts, default prompt chunks, and no DSpark. They explicitly enable vision
 and manual disk sessions. Ordinary launchers keep both new features off unless requested.

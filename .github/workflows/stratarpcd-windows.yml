@@ -1,6 +1,6 @@
 name: StrataRPCD Windows engine
 
-# strata-dsv41.exe for RTX 4090 / RTX 4060 Laptop (sm_89) and RTX 5070 Ti (sm_120).
+# strata-dsv41.exe with the layer-stage split (src/dsv41/ds4_stage.*), for an RTX 4090 (sm_89) and an RTX 5070 Ti (sm_120).
 # Builds on pushes to the stratarpcd branch that touch the engine (a commit whose title has [skip ci] does not), or by hand.
 on:
   push:
