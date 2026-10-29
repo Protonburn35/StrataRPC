@@ -45,6 +45,10 @@ struct CpuAnswer;
 struct MoeDev;
 }  // namespace strata::kernels::glmf
 
+namespace strata::glm::stage {
+class Client;
+}  // namespace strata::glm::stage
+
 namespace strata::core {
 
 namespace glmfast {
@@ -227,9 +231,10 @@ public:
     bool ckpt_save_snapshot(int slot, std::string& err);
     /// Conversation slots: the snapshot (its KDA states) and every DSA cache's rows up to its position, every half,
     /// written to a file; slot_load puts them back as the live state and the snapshot, so a conversation set aside
-    /// while others ran continues where it was.  The bytes written, or 0 + err.
-    uint64_t slot_save(const std::string& path, std::string& err);
-    bool slot_load(const std::string& path, int64_t n_pos, std::string& err);
+    /// while others ran continues where it was.  The bytes written, or 0 + err.  head: bytes written before the slot
+    /// (a disk session's header), which slot_load skips (skip).
+    uint64_t slot_save(const std::string& path, std::string& err, const std::string& head = {});
+    bool slot_load(const std::string& path, int64_t n_pos, std::string& err, uint64_t skip = 0);
     /// The same, in host RAM: the exact bytes the file version writes, in a caller-held buffer whose
     /// lifetime is the conversation's (engine-side: the run's).  Nothing reaches the disk.  The bytes
     /// written, or 0 + err (out of RAM, no snapshot).  slot_load takes the buffer back as the live
@@ -1064,6 +1069,58 @@ public:
     /// Debug: every half's sequence state (KDA states + conv histories, DSA caches) to <path>.<half>.bin, with the
     /// per-layer offsets in <path>.<half>.txt - two runs that should agree are compared per layer and component.
     bool dump_state(const std::string& path);
+
+    // ---- StrataRPCG: the layer stage over two PCs (src/core/glm_stage_model.cu, include/strata/core/glm_stage.hpp).
+    // Off unless a driver attaches a link: one part per PC, the coordinator's layers [0, split), the worker's the rest.
+    /// Where the output head is loaded (set before load_pack): -1 on the part of the last layer (as without a stage),
+    /// 1 on this part, 0 not on this part.  --layer-stage-head coordinator: 1 on the coordinator, 0 on the worker.
+    void set_head_here(int where) { head_here_ = where; }
+    bool head_loaded() const { return ws_map_.count("output.weight") != 0; }
+    /// The coordinator: from now on every position also runs the worker's layers behind `link` (its connection made);
+    /// head_here: the head and the sampling are this part's (--layer-stage-head coordinator), else the worker's.
+    bool stage_attach(strata::glm::stage::Client* link, bool head_here, std::string& err);
+    bool stage_on() const { return stage_ != nullptr; }
+    /// The worker's side of each request (the server's backend calls these on the worker's model):
+    /// one position p from its input row (the coordinator's last layer's streams, hc x n_embd FP32): this part's layers,
+    /// then the head's argmax into token (the head here; logits kept for sample_token), else the last layer's streams
+    /// into r_out (hc x n_embd FP32)
+    bool stage_step(int64_t p, const float* row, int& token, float* r_out, std::string& err);
+    /// a prompt the coordinator streams: begin (the chunk this part takes, <= T), each chunk's rows into
+    /// stage_prompt_rows() then stage_prompt_chunk, end (the pool's tail back)
+    bool stage_prompt_begin(int64_t p0, int64_t n, int T, int& t_bound, std::string& err);
+    float* stage_prompt_rows() { return stage_rows_.empty() ? nullptr : stage_rows_.data(); }
+    bool stage_prompt_chunk(int64_t p0, int T, std::string& err);
+    bool stage_prompt_end(bool completed, std::string& err);
+    /// the last step's logits on the host (the head here)
+    bool stage_logits(std::vector<float>& out, std::string& err);
+    /// the position checkpoint `slot` holds (-1: none), once a copy in flight has landed
+    int64_t ckpt_pos_of(int slot);
+    /// a text the two PCs' packs must agree on (their model identity): the geometry, the pack's index and the shards
+    std::string stage_identity(const std::string& pack_dir) const;
+
+private:
+    strata::glm::stage::Client* stage_ = nullptr;          // the coordinator's link (null: no stage)
+    bool stage_head_local_ = false;                        // ... the head is this part's
+    uint64_t stage_epoch_ = 0;                             // ... the link's epoch this state belongs to
+    int head_here_ = -1;                                   // set_head_here
+    std::vector<float> stage_rows_;                        // the worker's prompt rows (one chunk), or the
+                                                           // coordinator's chunk on its way out
+    std::vector<float> stage_row_;                         // one position's row in and out (2 x hc x n_embd)
+    int stage_T_bound_ = 0;                                // the worker's chunk in the prompt being streamed
+    int64_t stage_p0_ = 0, stage_n_ = 0;                   // (the worker) the prompt's span
+    bool stage_prompt_open_ = false;
+    // the coordinator's prompt sender: a chunk's rows out to the worker on its own thread while this part reads the next
+    struct StageSender;
+    StageSender* stage_tx_ = nullptr;
+    bool stage_link_ok(std::string& err);                  // reconnect after a failure (the state starts over)
+    bool stage_hand_over(Glm5Model* tail, int64_t p, int& token, std::string& err);   // fast_token's remote half
+    bool stage_send_chunk(Glm5Model* tail, int64_t p0, int T, std::string& err);       // prefill_run's remote half
+    bool stage_send_wait(std::string& err);               // ... every chunk handed over has reached the worker
+    void stage_drop_state();                               // the snapshot and checkpoints no longer match the worker's
+    void stage_stop();                                     // the destructor: the sender thread ends
+    int stage_sample(strata::kernels::SamplerParams& sp, std::string& err);   // sample_token with the worker's head
+    const float* stage_bias(int slot, const std::vector<std::pair<int32_t, float>>& bias, std::string& err);
+    int stage_bias_slot_ = -1;                             // ... the request's table on the worker (logit_bias_table)
 
 private:
     // scratch offsets, in floats into sc_

@@ -17,6 +17,7 @@
 // lands), so a batched call is literally the same per-token steps as single-token calls - which
 // is what glm_model_test's batched-vs-streamed equivalence pins.
 #include "glm_fast_state.hpp"
+#include "strata/core/glm_stage.hpp"
 
 #include "strata/kernels/glm_dsa.hpp"
 #include "strata/kernels/glm_fast.hpp"
@@ -621,6 +622,7 @@ bool Glm5Geometry::from_gguf(const strata::GgufFile& g, Glm5Geometry& out, std::
 // ================================ the model ================================
 
 Glm5Model::~Glm5Model() {
+    stage_stop();
     ckpt_join();
     if (split_next_) split_next_.reset();   // the tail half first (its service thread, its device)
     cudaSetDevice(dev_);   // every free below belongs to this half's device
@@ -856,6 +858,11 @@ void Glm5Model::reset() {
         split_next_->reset();
         cudaSetDevice(dev_);
     }
+    if (stage_ != nullptr) {   // the worker's layers start over too (connected again after a failure)
+        std::string e;
+        if (!stage_link_ok(e) || !stage_->reset(e))
+            std::fprintf(stderr, "glm stage: the worker did not reset: %s\n", e.c_str());
+    }
 }
 
 // ---- KV streaming (strata/kernels/glm_kv_stream.hpp)
@@ -1029,6 +1036,7 @@ bool Glm5Model::forward(const std::vector<int32_t>& tokens, std::vector<float>& 
 const float* Glm5Model::logit_bias_table(int slot, const std::vector<std::pair<int32_t, float>>& bias,
                                          std::string& err) {
     if (bias.empty()) return nullptr;
+    if (stage_ != nullptr && !stage_head_local_) return stage_bias(slot, bias, err);   // (the worker's sampler)
     if (slot < 0 || slot >= seq_count()) {
         err = "logit_bias: no conversation slot " + std::to_string(slot);
         return nullptr;
@@ -1069,6 +1077,7 @@ int Glm5Model::sample_token(strata::kernels::SamplerParams& sp, std::string& err
     // the fast path already ran the greedy argmax on the device at the end of the forward (an unbiased one)
     if (fast_ != nullptr && sp.greedy && sp.logit_bias == nullptr && sp.penalty_last_n <= 0 && last_tok_ >= 0)
         return last_tok_;
+    if (stage_ != nullptr && !stage_head_local_) return stage_sample(sp, err);   // (the head is the worker's)
     Glm5Model* tail = this;
     while (tail->split_next_) tail = tail->split_next_.get();
     if (tail->d_tok_ == nullptr) {
@@ -2854,7 +2863,8 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
             return il >= l0_ && il < l1_;
         }
         if (n == "token_embd.weight") return l0_ == 0;
-        if (n == "output.weight" || n == "output_norm.weight") return l1_ == g_.n_layers;
+        // (a layer stage can put the head on either PC: set_head_here)
+        if (n == "output.weight" || n == "output_norm.weight") return head_here_ >= 0 ? head_here_ == 1 : l1_ == g_.n_layers;
         return true;
     };
 

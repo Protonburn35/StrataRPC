@@ -1,0 +1,120 @@
+name: StrataRPCG Windows engine
+
+# The GLM-5.3-Flash layer stage (src/core/glm_stage*, --layer-stage-* in src/program/generate.cpp) compiled as
+# START-HERE.bat's setup compiles it on the PCs - Visual Studio 2022's MSVC, CUDA 13.2, Ninja - for an RTX 4090 (sm_89)
+# and an RTX 5070 Ti (sm_120); the stage protocol's tests (no GPU) and the start scripts under Windows PowerShell 5.1.
+# A compile check: each PC builds its own engine during setup, so nothing is packaged.  Runs on pushes to the stratarpcg
+# branch that touch the engine or the scripts (a commit whose title has [skip ci] does not), or by hand.
+on:
+  push:
+    branches: [stratarpcg]
+    paths:
+      - src/**
+      - include/**
+      - cmake/**
+      - CMakeLists.txt
+      - tests/core/glm_stage_test.cpp
+      - tests/core/rpc_transport_test.cpp
+      - tests/stratarpcg/**
+      - scripts/stratarpcg/**
+      - .github/workflows/stratarpcg-windows.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-cuda:
+    runs-on: windows-2022
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+
+      # llama.cpp at the commit setup pins (setup.py LLAMA_CPP_COMMIT), where setup puts it: ggml for the CPU's experts
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          repository: ggml-org/llama.cpp
+          ref: 3cf03257f219afbe7334045ff7c6a06ac68c627d
+          path: third_party/llama.cpp
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.12"
+
+      # the toolkit from conda (the PCs use NVIDIA's installer); no shell init, so no cmd AutoRun picks another toolset
+      - uses: mamba-org/setup-micromamba@add3a49764cedee8ee24e82dfde87f5bc2914462
+        with:
+          micromamba-version: "2.0.7-0"
+          environment-name: cuda-build
+          init-shell: none
+          post-cleanup: none
+          create-args: >-
+            --override-channels -c nvidia -c conda-forge
+            cuda-version=13.2 cuda-nvcc cuda-cudart-dev cuda-cudart-static libcublas-dev cuda-nvtx-dev
+            cuda-profiler-api cuda-cccl
+
+      - name: Install CMake and Ninja
+        shell: pwsh
+        run: python -m pip install --disable-pip-version-check cmake==4.4.3 ninja==1.13.0
+
+      - name: The start scripts under Windows PowerShell 5.1 (a made-up setup)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          foreach ($f in @(Get-ChildItem scripts/stratarpcg/*.ps1) + @(Get-ChildItem tests/stratarpcg/*.ps1)) {
+            $e = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$e)
+            if ($e) { $e | ForEach-Object { Write-Output ("{0}:{1}: {2}" -f $f.Name, $_.Extent.StartLineNumber, $_.Message) }; exit 1 }
+          }
+          powershell -NoProfile -ExecutionPolicy Bypass -File tests/stratarpcg/test_launchers.ps1
+          exit $LASTEXITCODE
+
+      - name: Find Visual Studio 2022's newest MSVC toolset and the toolkit
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * `
+                  -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $msvc = Get-ChildItem (Join-Path $vs "VC\Tools\MSVC") -Directory | Where-Object Name -like "14.4*" |
+                  Sort-Object { [version]$_.Name } -Descending | Select-Object -First 1
+          if (-not $msvc) { throw "no MSVC 14.4x toolset in $vs" }
+          $cuda = Join-Path $env:MAMBA_ROOT_PREFIX "envs\cuda-build\Library"
+          if (-not (Test-Path "$cuda\bin\nvcc.exe")) { throw "nvcc.exe is missing in $cuda\bin" }
+          "VSINSTALL=$vs" >> $env:GITHUB_ENV
+          "MSVCVER=$($msvc.Name)" >> $env:GITHUB_ENV
+          "CUDA_ROOT=$cuda" >> $env:GITHUB_ENV
+          Write-Output "Visual Studio: $vs, MSVC $($msvc.Name)"
+          & "$cuda\bin\nvcc.exe" --version
+
+      - name: Layer-stage protocol tests (MSVC, no GPU)
+        shell: cmd
+        run: |
+          set "VSCMD_ARG_VCVARS_VER="
+          set "VCToolsVersion="
+          call "%VSINSTALL%\Common7\Tools\VsDevCmd.bat" -arch=amd64 -host_arch=amd64 -vcvars_ver=%MSVCVER% || exit /b 1
+          cmake -S . -B build-stage -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=OFF -DSTRATA_ENABLE_HIP=OFF -DSTRATA_NATIVE_EXPERTS=OFF -DSTRATA_BUILD_TESTS=ON || exit /b 1
+          cmake --build build-stage --target glm_stage_test rpc_transport_test || exit /b 1
+          ctest --test-dir build-stage -R "^(glm_stage_test|rpc_transport_test)$" --output-on-failure || exit /b 1
+
+      # maya.py's compile_engine: the same CMake settings, the `maya` target, CUDAToolkit_ROOT of the nvcc it builds with
+      - name: Compile maya.exe for sm_89 and sm_120 as setup does
+        shell: cmd
+        run: |
+          set "VSCMD_ARG_VCVARS_VER="
+          set "VCToolsVersion="
+          call "%VSINSTALL%\Common7\Tools\VsDevCmd.bat" -arch=amd64 -host_arch=amd64 -vcvars_ver=%MSVCVER% || exit /b 1
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON "-DCMAKE_CUDA_ARCHITECTURES=89;120" -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_BUILD_TESTS=OFF "-DCMAKE_CUDA_COMPILER=%CUDA_ROOT%\bin\nvcc.exe" "-DCUDAToolkit_ROOT=%CUDA_ROOT%" "-DSTRATA_GGML_DIR=%CD%\third_party\llama.cpp" || exit /b 1
+          cmake --build build --target maya -j 3 || exit /b 1
+          where /r build maya.exe || exit /b 1
+
+      - name: The engine takes the layer-stage flags
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem build -Recurse -Filter maya.exe | Select-Object -First 1
+          $env:PATH = "$env:CUDA_ROOT\bin;$env:PATH"
+          $help = & $exe.FullName --help 2>&1 | Out-String
+          foreach ($f in "--layer-stage-client", "--layer-stage-server", "--layer-stage-split", "--layer-stage-wire",
+                         "--layer-stage-head", "--layer-stage-sessions", "--layer-stage-session-dir", "--layer-stage-gpu") {
+            if ($help -notmatch [regex]::Escape($f)) { Write-Output $help; throw "maya.exe --help does not list $f" }
+          }
+          Write-Output "maya.exe lists every --layer-stage-* flag"
+          $global:LASTEXITCODE = 0

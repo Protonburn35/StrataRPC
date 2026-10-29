@@ -26,6 +26,26 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import iq_pack  # noqa: E402
 
 
+class Glm5NextKeepF32(unittest.TestCase):
+    """StrataRPCG: --compat-bf16 keeps a small F32 tensor whose values are not exact in BF16 (GSQ-RCO's KDA decay bias,
+    router selection bias, mHC base / scale) as F32 - the engine widens such rows to F32 at load anyway."""
+
+    def test_small_inexact_kept(self):
+        import numpy as np
+        v = np.array([0.1, 1.0 / 3.0, 2.5], dtype=np.float32)
+        self.assertTrue(iq_pack.keeps_f32("F32", [3], v, "glm5-next"))
+        self.assertTrue(iq_pack.keeps_f32("F32", [3], v, "glm5next"))
+
+    def test_exact_or_large_or_other_converted(self):
+        import numpy as np
+        exact = np.array([0.5, 1.0, -2.0], dtype=np.float32)   # exact in BF16: converts without loss
+        self.assertFalse(iq_pack.keeps_f32("F32", [3], exact, "glm5-next"))
+        big = np.full(iq_pack.KEEP_F32_BELOW, 0.1, dtype=np.float32)   # the engine keeps it BF16 on the GPU
+        self.assertFalse(iq_pack.keeps_f32("F32", [iq_pack.KEEP_F32_BELOW], big, "glm5-next"))
+        self.assertFalse(iq_pack.keeps_f32("F32", [3], np.array([0.1] * 3, dtype=np.float32), "qwen4exp"))
+        self.assertFalse(iq_pack.keeps_f32("BF16", [3], np.zeros(3, dtype=np.uint16), "glm5-next"))
+
+
 class Glm5NextBf16List(unittest.TestCase):
     def test_glm5_mhc_names_preserved(self):
         for name in ("blk.0.hc_attn_fn.weight", "blk.3.hc_attn_base.weight", "blk.3.hc_attn_scale.weight",

@@ -97,6 +97,21 @@ GLM5NEXT_NATIVE_OK = (
     "token_embd.weight", "output.weight",
 )
 ARCHITECTURES = ("qwen4exp", "glm5-next", "glm5next")   # unsloth spells it without the hyphen
+# glm5-next: the engine keeps a dense float row of at least this many values in BF16 on the GPU and widens a smaller one
+# to F32 (src/core/glm_model.cu pack_row_vram); --compat-bf16 leaves a smaller F32 row that is not exact in BF16 as F32
+KEEP_F32_BELOW = 65536
+
+
+def keeps_f32(type_name: str, shape, values: np.ndarray, arch: str) -> bool:
+    """--compat-bf16 on glm5-next: whether an F32 tensor of this shape and these values stays F32 - fewer than
+    KEEP_F32_BELOW values (the engine widens them to F32 at load) and at least one not exact in BF16 (rounding would
+    change it).  Everything else converts as before (exact values convert without loss)."""
+    if type_name != "F32" or arch not in ("glm5-next", "glm5next"):
+        return False
+    if int(np.prod([int(d) for d in shape])) >= KEEP_F32_BELOW:
+        return False
+    u = np.frombuffer(np.ascontiguousarray(values).tobytes(), dtype=np.uint32)
+    return bool(np.count_nonzero(u & 0xFFFF))
 
 
 def needs_bf16(name: str, type_name: str, arch: str = "qwen4exp") -> bool:
@@ -210,6 +225,7 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False, arch: st
     rows, at = [], 0
     served = 0
     converted = []
+    kept_f32 = []
     with open(out / "dense.bin", "wb") as fo:
         for name, (g, t, mm, _) in model.where.items():
             if is_expert(t.name) or t.name in NOT_IN_PACK:
@@ -227,6 +243,15 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False, arch: st
                 return 1
             ne0, ne1 = index_shape(t.shape)
             convert = compat_bf16 and needs_bf16(t.name, t.type_name, arch) and t.type_name != "BF16"
+            # StrataRPCG: a small F32 tensor whose values are not all exactly BF16 (a KDA decay bias, the router's
+            # selection bias, an mHC base or scale - GSQ-RCO's GGUFs keep these F32) stays F32: the engine widens rows
+            # of fewer than KEEP_F32_BELOW values to F32 at load anyway (glm_model.cu pack_row_vram), so rounding them
+            # would only lose precision.  A large one, or one whose values are exact in BF16, converts as before.
+            if convert and t.type_name == "F32" and arch in ("glm5-next", "glm5next") and \
+                    int(np.prod([int(d) for d in t.shape])) < KEEP_F32_BELOW and \
+                    keeps_f32(t.type_name, t.shape, tensor_bytes(mm, g, t), arch):
+                convert = False
+                kept_f32.append(t.name)
             if t.type_name in FLOAT or convert:
                 raw = tensor_bytes(mm, g, t).tobytes()
                 if convert:
@@ -264,10 +289,13 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False, arch: st
     write_index(out, rows, src, served, 0)
     if compat_bf16:
         (out / "compat-bf16.json").write_text(json.dumps({
-            "source": str(src), "rounding": "nearest-even", "tensors": converted,
+            "source": str(src), "rounding": "nearest-even", "tensors": converted, "kept_f32": kept_f32,
         }, indent=2) + "\n", encoding="utf-8")
         print("compat-bf16: %d tensors, %.2f GiB; expert and PLE table bytes unchanged"
               % (len(converted), sum(t["bytes"] for t in converted) / 2**30))
+        if kept_f32:
+            print("compat-bf16: %d small F32 tensors kept F32 (their values are not BF16; the engine reads them as F32)"
+                  % len(kept_f32))
     return 0
 
 

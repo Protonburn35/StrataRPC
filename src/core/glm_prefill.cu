@@ -17,6 +17,7 @@
 // routing also feeds the expert tiers' LFU counts, so the decode that follows starts from this conversation's
 // experts.  STRATA_GLM_NO_PREFILL=1 keeps the token-at-a-time prompt (A/B).
 #include "glm_fast_state.hpp"
+#include "strata/core/glm_stage.hpp"
 
 #include "strata/core/exl3_mma_rows.hpp"
 #include "strata/core/prefill_chunks.hpp"
@@ -4228,20 +4229,31 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
     // GPU: from 8 tokens - an agent session's later turns (13.5K of history + a short user turn, Maya-S24 on a V100,
     // two cooled rounds of three turns): prompt 1,041 / 648 / 521 ms at 32 -> 488 / 405 / 577 at 8 (4: 508 / 397 /
     // 576, 16: 502 / 716 / 540); a split keeps 32
-    int64_t min_n = split_next_ == nullptr && n_parts_ <= 1 ? 8 : 32;
+    int64_t min_n = split_next_ == nullptr && n_parts_ <= 1 && stage_ == nullptr ? 8 : 32;
     if (const char* mn = getenv("STRATA_GLM_PREFILL_MIN")) min_n = std::max<int64_t>(1, std::atoll(mn));
     if ((int64_t) tokens.size() < min_n) return false;
     // the chunk for this prompt: no bigger than it needs (rounded up to 64), so it borrows only that much; a prompt
     // longer than the largest chunk is cut into EQUAL chunks (the parts of a split pipeline chunks)
     int Tmax = pf_->T;
     for (Glm5Model* m = split_next_.get(); m != nullptr; m = m->split_next_.get()) Tmax = std::min(Tmax, m->pf_->T);
+    // StrataRPCG: a layer stage reads the prompt as a split does (equal chunks, the two PCs pipelined); the chunk can
+    // be capped (STRATA_GLM_STAGE_CHUNK=<tokens>: less RAM for the rows on their way between the PCs)
+    if (stage_ != nullptr) {
+        if (const char* sc = getenv("STRATA_GLM_STAGE_CHUNK"); sc != nullptr && std::atoi(sc) > 0)
+            Tmax = std::min(Tmax, std::max(kMinPrefillChunk, std::atoi(sc)));
+        std::string le;
+        if (!stage_->connected()) {
+            err = "glm stage: the link to the worker is down (the next request connects again)";
+            return false;
+        }
+    }
     const int64_t nn = (int64_t) tokens.size();
     // one GPU has no pipeline to balance: full chunks and the remainder last - every chunk stages nearly every expert,
     // so 8449 tokens as 8192 + 257 cost about one chunk's experts, as two equal 4225s about two (240 -> ~300 tok/s).
     // A split: equal chunks, prefill_floor of them at least (prefill_min_chunks, STRATA_GLM_PREFILL_MIN_CHUNKS)
     const int Trun_max = prefill_force_chunk > 0
                           ? std::min(Tmax, prefill_force_chunk)
-                          : strata::core::prefill_chunk_len(nn, Tmax, split_next_ != nullptr,
+                          : strata::core::prefill_chunk_len(nn, Tmax, split_next_ != nullptr || stage_ != nullptr,
                                                             prefill_floor(nn, prefill_min_chunks));
     bool ok = true;
     progress_at("the prompt: lending the expert pool's tail");   // (the serve watchdog's stages, issue #40)
@@ -4270,6 +4282,15 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
             cudaSetDevice(m->dev_);
             if (!m->prefill_lend(err)) { ok = false; break; }
         }
+    }
+    // StrataRPCG: the worker lends its own pool's tail for the same chunk (it may take a smaller one)
+    bool stage_open = false;
+    if (ok && stage_ != nullptr) {
+        progress_at("the prompt: the layer-stage worker's prompt path");
+        stage_T_bound_ = 0;
+        if (stage_->prompt_begin(pos_, nn, Trun, stage_T_bound_, err)) stage_open = true;
+        else ok = false;
+        cudaSetDevice(dev_);
     }
     // STRATA_GLM_STALL_TEST=<s> (a test of the serve watchdog): every batched prompt stops here for s seconds
     static const int stall_test = [] {
@@ -4301,6 +4322,18 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
         std::string return_err;
         if (!m->prefill_return(return_err)) {
             if (ok) err = return_err;
+            ok = false;
+        }
+    }
+    if (stage_open) {   // StrataRPCG: every chunk handed over has reached the worker, then its prompt ends there too
+        std::string se;
+        if (!stage_send_wait(se) && ok) {
+            err = se;
+            ok = false;
+        }
+        int64_t pos_after = 0;
+        if (!stage_->prompt_end(ok, pos_after, se) && ok) {
+            err = "glm stage: " + se;
             ok = false;
         }
     }
@@ -4486,6 +4519,7 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
     const size_t row_b = ggml_row_size((ggml_type) pack_emb_type_, E);
     int Tc = pf_->T_bound;
     for (Glm5Model* m = split_next_.get(); m != nullptr; m = m->split_next_.get()) Tc = std::min(Tc, m->pf_->T_bound);
+    if (stage_ != nullptr && stage_T_bound_ > 0) Tc = std::min(Tc, stage_T_bound_);   // (the worker's chunk too)
     const int64_t pos_start = pos_;
     const int nc = (int) ((n + Tc - 1) / Tc);
     const auto chunk_len = [&](int c) { return (int) std::min<int64_t>(Tc, n - (int64_t) c * Tc); };
@@ -4522,7 +4556,9 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
     std::vector<Glm5Model*> parts;
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) parts.push_back(m);
     const int np = (int) parts.size();
-    const bool pipelined = np > 1 && nc > 1 && getenv("STRATA_GLM_PREFILL_SERIAL") == nullptr;
+    // (a layer stage runs one part on this PC: its chunks go to the worker from stage_send_chunk's thread, which is the
+    // pipeline between the two PCs - the local pipeline below is for parts on this PC's own GPUs)
+    const bool pipelined = np > 1 && nc > 1 && getenv("STRATA_GLM_PREFILL_SERIAL") == nullptr && stage_ == nullptr;
     for (Glm5Model* m : parts) {   // (the stage lines' per-prompt sums: the parts accumulate them chunk by chunk)
         m->pf_->pr_wall = 0;
         m->pf_->pr_hop = 0;
@@ -4649,6 +4685,9 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                 prev = m;
             }
             if (cancelled) break;
+            // StrataRPCG: this chunk's rows from this PC's last layer to the worker (on the sender's thread, while this
+            // PC reads the next chunk)
+            if (stage_ != nullptr && !stage_send_chunk(prev, p0, T, err)) return false;
             pos_ = p0 + T;
             for (Glm5Model* m = split_next_.get(); m != nullptr; m = m->split_next_.get()) m->pos_ = pos_;
             ++pf_->chunks;
@@ -4893,6 +4932,227 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
     if (gaps_run > 0)
         std::fprintf(stderr, "glm prefill: %lld tokens in %.1f ms with %llu decode gaps (%.1f ms of them, %.0f%%)\n",
                      (long long) n, ms, (unsigned long long) gaps_run, gaps_ms, 100.0 * gaps_ms / std::max(1.0, ms));
+    return true;
+}
+
+// ---------------------------------------------------------------- StrataRPCG: the coordinator's chunks to the worker
+// prefill_run hands each chunk's rows (this part's last layer's residual, T x hc x n_embd) to a thread of their own,
+// which streams them to the worker and returns once the worker's layers have read them - while this part reads the
+// next chunk.  One buffer: the next chunk's rows come down once the one before has been read there.
+struct Glm5Model::StageSender {
+    std::thread th;
+    std::mutex mu;
+    std::condition_variable cv;
+    bool busy = false, quit = false, failed = false;
+    int64_t p0 = 0;
+    int T = 0;
+    std::string err;
+    double send_ms = 0;
+};
+
+bool Glm5Model::stage_send_chunk(Glm5Model* tail, int64_t p0, int T, std::string& err) {
+    if (stage_tx_ == nullptr) {
+        stage_tx_ = new StageSender();
+        StageSender* X = stage_tx_;
+        X->th = std::thread([this, X] {
+            for (;;) {
+                int64_t q0 = 0;
+                int n = 0;
+                {
+                    std::unique_lock<std::mutex> lk(X->mu);
+                    X->cv.wait(lk, [&] { return X->busy || X->quit; });
+                    if (X->quit) return;
+                    q0 = X->p0;
+                    n = X->T;
+                }
+                const auto t0 = std::chrono::steady_clock::now();
+                std::string e;
+                const bool ok = stage_->prompt_chunk(q0, n, stage_rows_.data(), e);
+                {
+                    std::lock_guard<std::mutex> lk(X->mu);
+                    if (!ok) {
+                        X->failed = true;
+                        X->err = "glm stage: " + e;
+                    }
+                    X->send_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                    X->busy = false;
+                }
+                X->cv.notify_all();
+            }
+        });
+    }
+    StageSender* X = stage_tx_;
+    {
+        std::unique_lock<std::mutex> lk(X->mu);
+        X->cv.wait(lk, [&] { return !X->busy; });   // (the chunk before has been read by the worker)
+        if (X->failed) {
+            err = X->err;
+            return false;
+        }
+    }
+    const size_t n = (size_t) T * (size_t) g_.hc * (size_t) g_.n_embd;
+    try {
+        if (stage_rows_.size() < n) stage_rows_.resize(n);
+    } catch (const std::bad_alloc&) {
+        err = "glm stage: no RAM for a chunk's rows";
+        return false;
+    }
+    cudaSetDevice(tail->dev_);
+    if (!glmfast::cuda_ok(cudaMemcpyAsync(stage_rows_.data(), tail->pf_->R, n * sizeof(float), cudaMemcpyDeviceToHost,
+                                          tail->fast_->cs),
+                          "glm stage prompt rows out", err) ||
+        !glmfast::cuda_ok(cudaStreamSynchronize(tail->fast_->cs), "glm stage prompt rows out", err))
+        return false;
+    cudaSetDevice(dev_);
+    {
+        std::lock_guard<std::mutex> lk(X->mu);
+        X->p0 = p0;
+        X->T = T;
+        X->busy = true;
+    }
+    X->cv.notify_all();
+    return true;
+}
+
+bool Glm5Model::stage_send_wait(std::string& err) {
+    StageSender* X = stage_tx_;
+    if (X == nullptr) return true;
+    std::unique_lock<std::mutex> lk(X->mu);
+    X->cv.wait(lk, [&] { return !X->busy; });
+    if (X->failed) {
+        X->failed = false;   // (reported once; the next prompt starts clean)
+        err = X->err;
+        return false;
+    }
+    return true;
+}
+
+void Glm5Model::stage_stop() {
+    StageSender* X = stage_tx_;
+    if (X == nullptr) return;
+    {
+        std::lock_guard<std::mutex> lk(X->mu);
+        X->quit = true;
+    }
+    X->cv.notify_all();
+    if (X->th.joinable()) X->th.join();
+    delete X;
+    stage_tx_ = nullptr;
+}
+
+// ---------------------------------------------------------------- StrataRPCG: the worker's half of a prompt
+// The coordinator reads the prompt through its layers chunk by chunk and hands each chunk's residual rows over; this
+// part (layers split .. last) reads them as a later part of a split on one PC reads a hop: the rows into R, its layers
+// over the chunk.  begin lends this part's pool tail for chunks of at most T (smaller when its layout does not fit),
+// end gives it back.
+bool Glm5Model::stage_prompt_begin(int64_t p0, int64_t n, int T, int& t_bound, std::string& err) {
+    err.clear();
+    if (stage_prompt_open_) {
+        err = "a prompt is already open";
+        return false;
+    }
+    if (fast_ == nullptr || pf_ == nullptr || split_next_ != nullptr) {
+        err = "the worker's prompt path needs the fast path on one GPU";
+        return false;
+    }
+    if (vis_lent_) {
+        err = "the pool's tail is lent to the vision encoder";
+        return false;
+    }
+    if (p0 != pos_ || n < 1 || pos_ + n > max_ctx_) {
+        err = "the prompt at " + std::to_string(p0) + " (" + std::to_string(n) + " tokens) does not fit the worker at " +
+              std::to_string(pos_);
+        return false;
+    }
+    cudaSetDevice(dev_);
+    int Trun = std::max(1, std::min(T, pf_->T));
+    for (;;) {
+        if (prefill_carve(Trun, pos_ + n)) break;
+        if (Trun <= kMinPrefillChunk) {
+            err = "glm prefill: the layout of a chunk of " + std::to_string(Trun) +
+                  " tokens does not fit the lendable region";
+            return false;
+        }
+        Trun = std::max(kMinPrefillChunk, Trun / 2);
+        std::fprintf(stderr, "glm prefill: CUDA%d the chunk is %d tokens now (its layout did not fit)\n", dev_, Trun);
+    }
+    if (!prefill_lend(err)) {
+        std::string e2;
+        prefill_return(e2);
+        return false;
+    }
+    t_bound = std::min(Trun, pf_->T_bound);
+    try {
+        stage_rows_.assign((size_t) t_bound * (size_t) g_.hc * (size_t) g_.n_embd, 0.0f);
+    } catch (const std::bad_alloc&) {
+        std::string e2;
+        prefill_return(e2);
+        err = "no RAM for a chunk's rows";
+        return false;
+    }
+    pf_->pr_wall = 0;
+    pf_->pr_hop = 0;
+    stage_p0_ = p0;
+    stage_n_ = n;
+    stage_T_bound_ = t_bound;
+    stage_prompt_open_ = true;
+    return true;
+}
+
+bool Glm5Model::stage_prompt_chunk(int64_t p0, int T, std::string& err) {
+    if (!stage_prompt_open_ || T < 1 || T > stage_T_bound_ || p0 != pos_ || p0 + T > stage_p0_ + stage_n_) {
+        err = "a prompt chunk out of order";
+        return false;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    cudaSetDevice(dev_);
+    PrefillState* S = pf_;
+    const size_t bytes = (size_t) T * (size_t) g_.hc * (size_t) g_.n_embd * sizeof(float);
+    if (S->stages && S->sev_h0 != nullptr) cudaEventRecord(S->sev_h0, fast_->cs);
+    S->sev_hop = S->stages;   // (prefill_half reads it: this chunk came over the hop - here, over the network)
+    if (!glmfast::cuda_ok(cudaMemcpyAsync(S->R, stage_rows_.data(), bytes, cudaMemcpyHostToDevice, fast_->cs),
+                          "glm stage prompt rows in", err))
+        return false;
+    if (S->stages && S->sev_h1 != nullptr) cudaEventRecord(S->sev_h1, fast_->cs);
+    S->chunk_i = (int) ((p0 - stage_p0_) / std::max(1, stage_T_bound_)) + 1;
+    S->chunk_n = (int) ((stage_n_ + stage_T_bound_ - 1) / std::max(1, stage_T_bound_));
+    try {
+        if (!prefill_half(p0, T, err)) return false;
+    } catch (const std::exception& e) {
+        err = e.what();
+        return false;
+    }
+    if (!glmfast::cuda_ok(cudaStreamSynchronize(fast_->cs), "glm stage prompt compute", err) ||
+        !glmfast::cuda_ok(cudaStreamSynchronize(fast_->copy), "glm stage prompt copies", err))
+        return false;
+    if (gb::launch_errors() > 0 || strata::kernels::glmf::launch_errors() > 0) {
+        err = "glm prefill: " + std::to_string(gb::launch_errors() + strata::kernels::glmf::launch_errors()) +
+              " kernel launch(es) failed (see stderr)";
+        return false;
+    }
+    pos_ = p0 + T;
+    ++S->chunks;
+    S->ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    S->tokens += T;
+    return true;
+}
+
+bool Glm5Model::stage_prompt_end(bool completed, std::string& err) {
+    if (!stage_prompt_open_) return true;
+    stage_prompt_open_ = false;
+    cudaSetDevice(dev_);
+    std::string re;
+    const bool ok = prefill_return(re);
+    stage_rows_.clear();
+    stage_rows_.shrink_to_fit();
+    if (!ok) {
+        err = re;
+        return false;
+    }
+    if (completed && pos_ != stage_p0_ + stage_n_) {
+        err = "the prompt ended at " + std::to_string(pos_) + " of " + std::to_string(stage_p0_ + stage_n_);
+        return false;
+    }
     return true;
 }
 

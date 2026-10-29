@@ -47,6 +47,7 @@
 #include "strata/prefill/failure.hpp"
 #include "strata/core/native_dense.hpp"
 #include "strata/core/glm_model.hpp"
+#include "strata/core/glm_stage.hpp"
 #include "strata/core/mtp_rows.hpp"
 #include "strata/core/split_groups.hpp"
 #include "strata/core/prefix_cut.hpp"
@@ -304,6 +305,15 @@ struct Options {
     /// the later stages' devices "D1,D2,.." (default: the next visible GPUs; "0" with one K: both stages on this
     /// GPU, sharing everything - the bit-exact A/B of the hand-off)
     std::string split_device;
+    /// StrataRPCG: GLM-5.3-Flash split over two PCs by layers (glm_stage_worker, glm_pack_generate; off when empty)
+    std::string stage_client;            ///< --layer-stage-client HOST:PORT: this PC is the coordinator
+    std::string stage_server;            ///< --layer-stage-server HOST:PORT: this PC is the worker
+    int stage_split = 0;                 ///< --layer-stage-split K: the worker's first layer
+    std::string stage_wire = "bf16";     ///< --layer-stage-wire fp32 | bf16 | fp16 (the rows between the PCs)
+    std::string stage_head = "worker";   ///< --layer-stage-head worker | coordinator (the output head and the sampling)
+    bool stage_sessions = false;         ///< --layer-stage-sessions: paired disk sessions (SAVE / RESTORE)
+    std::string stage_session_dir;       ///< --layer-stage-session-dir DIR: the worker's half of each session
+    int stage_gpu = 0;                   ///< --layer-stage-gpu N: this PC's GPU
     /// Plan v0.3 P8: stay resident and take requests on stdin (see the --serve block in main).
     bool serve = false;
     /// The vision path: keep a per-cell (t, h, w) rotary position table so --serve can take GENI requests.
@@ -348,6 +358,15 @@ void usage() {
                  "  --pack DIR           the pack directory (default pack/full)\n"
                  "  --glm-pack DIR       a GLM-5.3-Flash pack (M3.1): the verified Glm5Model runner behind the\n"
                  "                       same wire contract (T <id> / DONE; --serve reads GEN lines)\n"
+                 "  --layer-stage-client HOST:PORT | --layer-stage-server HOST:PORT\n"
+                 "                       (--glm-pack, StrataRPCG) split the model over two PCs by layers: the\n"
+                 "                       coordinator (--serve, the API's PC) holds the embedding, the pictures and\n"
+                 "                       layers 0 .. K-1; the worker layers K .. 44.  Both: --layer-stage-split K,\n"
+                 "                       the same --max-context, --layer-stage-wire fp32|bf16|fp16 (bf16),\n"
+                 "                       --layer-stage-head worker|coordinator (where the output head and the\n"
+                 "                       sampling run; worker), --layer-stage-gpu N (0), and STRATA_RPC_TOKEN in\n"
+                 "                       the environment.  --layer-stage-sessions (both) with the worker's\n"
+                 "                       --layer-stage-session-dir DIR: SAVE / RESTORE <file> write each PC's half\n"
                  "  --dflash GGUF        (--glm-pack) draft with a DFlash2 block drafter made for the model: each\n"
                  "                       round it drafts up to --spec T - 1 tokens (default its block size - 1), one\n"
                  "                       verify window checks them; --spec-min-p P stops a draft at a selector\n"
@@ -1039,6 +1058,406 @@ static bool cuda_context_broken(const std::string& why) {
     return false;
 }
 
+// ---- StrataRPCG: GLM-5.3-Flash split over two PCs by layers (include/strata/core/glm_stage.hpp) ----------------------
+// --layer-stage-client HOST:PORT (the coordinator: the PC the server runs on - the embedding, pictures and layers
+// 0 .. K-1) and --layer-stage-server HOST:PORT (the worker: layers K .. 44, and the head unless --layer-stage-head
+// coordinator puts it on the coordinator), with the same --layer-stage-split K, --layer-stage-wire, --layer-stage-head,
+// context and model files on both PCs and the same STRATA_RPC_TOKEN in both environments.  One GPU on each PC
+// (--layer-stage-gpu N picks it), one conversation at a time (no --parallel), no drafting (the GSQ-RCO files carry no
+// MTP block; DFlash2 is refused).  Off unless one of the two is given: every other path is Maya's as it was.
+namespace glm_session {
+
+// A paired disk session (SAVE / RESTORE, the server's /slots/0?action=save|restore): each PC writes its own layers'
+// state - Glm5Model::slot_save's stream - behind this header, the worker first (<session dir>/<id>.gslot), then the
+// coordinator (the file the request names, which carries the conversation's tokens and the id of the worker's half).
+// One PC alone (no layer stage) writes only the coordinator's file, its id unused.
+constexpr char kMagic[8] = {'S', 'R', 'P', 'G', 'S', 'E', 'S', '1'};
+constexpr uint32_t kVersion = 1;
+
+struct Head {
+    uint32_t role = 0;                  // 0: the coordinator's file (or one PC's), 1: the worker's half
+    uint64_t id_a = 0, id_b = 0;        // the model identity (both PCs' packs; Glm5Model::stage_identity)
+    uint32_t split = 0, head = 0, wire = 0;   // the layer stage (0 / 2 / 0 for one PC alone: no stage)
+    uint64_t ctx = 0;
+    std::string snap_id = std::string(32, '0');
+    int64_t n = 0;                      // the positions the state holds (the snapshot's)
+    uint64_t prefix = 0;                // strata::glm::stage::prefix_hash of the tokens
+    uint64_t img = 0;                   // the pictures' hash at those positions (img_hash)
+    std::vector<int32_t> tokens;        // the coordinator's file: the tokens (the worker's: none)
+};
+
+inline uint64_t fnv(const std::string& b) {
+    uint64_t h = 1469598103934665603ull;
+    for (unsigned char c : b) h = (h ^ c) * 1099511628211ull;
+    return h;
+}
+
+inline std::string pack(const Head& h) {
+    std::string b(kMagic, 8);
+    const auto put = [&](const void* p, size_t n) { b.append((const char*) p, n); };
+    const uint64_t nt = h.tokens.size();
+    put(&kVersion, 4);
+    put(&h.role, 4);
+    put(&h.id_a, 8);
+    put(&h.id_b, 8);
+    put(&h.split, 4);
+    put(&h.head, 4);
+    put(&h.wire, 4);
+    const uint32_t reserved = 0;
+    put(&reserved, 4);
+    put(&h.ctx, 8);
+    put(h.snap_id.data(), 32);
+    put(&h.n, 8);
+    put(&h.prefix, 8);
+    put(&h.img, 8);
+    put(&nt, 8);
+    put(h.tokens.data(), (size_t) nt * 4);
+    const uint64_t sum = fnv(b);
+    put(&sum, 8);
+    return b;
+}
+
+// the header of `path` -> h and its length (false + err: not a session file of this format, or damaged)
+inline bool read(const std::string& path, Head& h, uint64_t& header_len, uint64_t max_ctx, std::string& err) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        err = "cannot read " + path;
+        return false;
+    }
+    std::string b(8 + 4 + 4 + 8 + 8 + 4 + 4 + 4 + 4 + 8 + 32 + 8 + 8 + 8 + 8, '\0');
+    if (!f.read(b.data(), (std::streamsize) b.size()) || std::memcmp(b.data(), kMagic, 8) != 0) {
+        err = "not a StrataRPCG session file";
+        return false;
+    }
+    size_t at = 8;
+    const auto get = [&](void* p, size_t n) { std::memcpy(p, b.data() + at, n); at += n; };
+    uint32_t version = 0, reserved = 0;
+    uint64_t nt = 0;
+    get(&version, 4);
+    get(&h.role, 4);
+    get(&h.id_a, 8);
+    get(&h.id_b, 8);
+    get(&h.split, 4);
+    get(&h.head, 4);
+    get(&h.wire, 4);
+    get(&reserved, 4);
+    get(&h.ctx, 8);
+    h.snap_id.assign(b.data() + at, 32);
+    at += 32;
+    get(&h.n, 8);
+    get(&h.prefix, 8);
+    get(&h.img, 8);
+    get(&nt, 8);
+    if (version != kVersion) {
+        err = "a session file of another version (" + std::to_string(version) + ")";
+        return false;
+    }
+    if (h.n <= 0 || (uint64_t) h.n > max_ctx || nt > max_ctx || (h.role == 0 && (int64_t) nt != h.n) || h.role > 1) {
+        err = "a damaged session file";
+        return false;
+    }
+    h.tokens.resize((size_t) nt);
+    uint64_t sum = 0;
+    if (nt > 0 && !f.read((char*) h.tokens.data(), (std::streamsize) (nt * 4))) {
+        err = "a truncated session file";
+        return false;
+    }
+    if (!f.read((char*) &sum, 8)) {
+        err = "a truncated session file";
+        return false;
+    }
+    b.append((const char*) h.tokens.data(), (size_t) nt * 4);
+    if (sum != fnv(b)) {
+        err = "a damaged session file (its header's checksum differs)";
+        return false;
+    }
+    header_len = b.size() + 8;
+    return true;
+}
+
+// at least this much free on the disk before a session is written (MAYA_GLM_SESSION_MIN_FREE_MIB, 4096)
+inline bool room(const std::string& path, std::string& err) {
+    namespace fs = std::filesystem;
+    const char* v = std::getenv("STRATA_GLM_SESSION_MIN_FREE_MIB");
+    const uint64_t need = (uint64_t) (v != nullptr ? std::max(0LL, std::atoll(v)) : 4096LL) << 20;
+    std::error_code ec;
+    fs::path dir = fs::path(path).parent_path();
+    if (dir.empty()) dir = ".";
+    const auto sp = fs::space(dir, ec);
+    if (ec) return true;   // (unknown: the write itself says)
+    if (sp.available < need) {
+        err = "only " + std::to_string(sp.available >> 20) + " MiB free on the session folder's disk (" +
+              std::to_string(need >> 20) + " MiB kept free)";
+        return false;
+    }
+    return true;
+}
+
+}  // namespace glm_session
+
+// the worker's model as the protocol server drives it
+struct GlmStageBackend : strata::glm::stage::Backend {
+    strata::core::Glm5Model& m;
+    std::string session_dir;
+    uint64_t id_a = 0, id_b = 0;
+    uint32_t split = 0, head = 0, wire = 0;
+    uint64_t ctx = 0;
+    std::map<int, const float*> bias_tab;   // the requests' logit-bias tables (Glm5Model::logit_bias_table)
+
+    explicit GlmStageBackend(strata::core::Glm5Model& model) : m(model) {}
+    int64_t pos() const override { return m.position(); }
+    void reset() override { m.reset(); }
+    bool snap_save(std::string&) override { return m.snapshot_save(); }
+    bool snap_restore(int64_t& p, std::string& err) override {
+        if (!m.snapshot_restore()) {
+            err = "no snapshot";
+            return false;
+        }
+        p = m.position();
+        return true;
+    }
+    int64_t snap_pos() const override { return m.snapshot_pos(); }
+    bool ckpt_save(int slot, bool from_snapshot, std::string& err) override {
+        return from_snapshot ? m.ckpt_save_snapshot(slot, err) : m.ckpt_save(slot, err);
+    }
+    bool ckpt_restore(int slot, int64_t& p, std::string& err) override {
+        if (!m.ckpt_restore(slot, err)) return false;
+        p = m.position();
+        return true;
+    }
+    int64_t ckpt_pos(int slot) override { return m.ckpt_pos_of(slot); }
+    bool step(int64_t p, const float* row, int& token, float* r_out, std::string& err) override {
+        return m.stage_step(p, row, token, r_out, err);
+    }
+    bool prompt_begin(int64_t p0, int64_t n, int T, int& t_bound, std::string& err) override {
+        return m.stage_prompt_begin(p0, n, T, t_bound, err);
+    }
+    float* prompt_rows() override { return m.stage_prompt_rows(); }
+    bool prompt_chunk(int64_t p0, int T, std::string& err) override { return m.stage_prompt_chunk(p0, T, err); }
+    bool prompt_end(bool completed, std::string& err) override { return m.stage_prompt_end(completed, err); }
+    int sample(const strata::glm::stage::Sampling& s, std::string& err) override {
+        strata::kernels::SamplerParams sp;
+        sp.top_k = s.top_k;
+        sp.top_p = s.top_p;
+        sp.min_p = s.min_p;
+        sp.temperature = s.temperature;
+        sp.min_keep = s.min_keep;
+        sp.penalty_last_n = s.penalty_last_n;
+        sp.penalty_repeat = s.penalty_repeat;
+        sp.penalty_freq = s.penalty_freq;
+        sp.penalty_present = s.penalty_present;
+        sp.seed = s.seed;
+        sp.counter = s.counter;
+        sp.greedy = s.greedy;
+        if (s.penalty_last_n > 0) sp.host_history = &s.history;
+        if (s.bias_slot >= 0) {
+            const auto it = bias_tab.find(s.bias_slot);
+            if (it == bias_tab.end() || it->second == nullptr) {
+                err = "no logit-bias table " + std::to_string(s.bias_slot);
+                return -1;
+            }
+            sp.logit_bias = it->second;
+        }
+        return m.sample_token(sp, err);
+    }
+    bool bias(int slot, const std::vector<std::pair<int32_t, float>>& b, std::string& err) override {
+        const float* t = m.logit_bias_table(slot, b, err);
+        if (t == nullptr && !b.empty()) return false;
+        bias_tab[slot] = t;
+        return true;
+    }
+    bool logits(std::vector<float>& out, std::string& err) override { return m.stage_logits(out, err); }
+    bool session(bool save, const strata::glm::stage::SnapshotRef& ref, uint64_t& bytes, std::string& err) override {
+        namespace fs = std::filesystem;
+        if (session_dir.empty()) {
+            err = "no --layer-stage-session-dir on the worker";
+            return false;
+        }
+        const std::string path = (fs::path(session_dir) / (ref.id + ".gslot")).string();
+        const auto t0 = std::chrono::steady_clock::now();
+        if (save) {
+            if (m.snapshot_pos() != ref.position) {
+                err = "the worker's snapshot is at " + std::to_string(m.snapshot_pos()) + ", not " +
+                      std::to_string(ref.position);
+                return false;
+            }
+            if (!glm_session::room(path, err)) return false;
+            glm_session::Head h;
+            h.role = 1;
+            h.id_a = id_a;
+            h.id_b = id_b;
+            h.split = split;
+            h.head = head;
+            h.wire = wire;
+            h.ctx = ctx;
+            h.snap_id = ref.id;
+            h.n = ref.position;
+            h.prefix = ref.prefix;
+            const std::string tmp = path + ".tmp";
+            bytes = m.slot_save(tmp, err, glm_session::pack(h));
+            std::error_code ec;
+            if (bytes == 0) {
+                fs::remove(tmp, ec);
+                return false;
+            }
+            fs::rename(tmp, path, ec);
+            if (ec) {
+                fs::remove(tmp, ec);
+                err = "cannot publish " + path;
+                return false;
+            }
+            std::fprintf(stderr, "glm stage: session %s saved (%lld positions, %.2f GB) in %.0f ms\n", path.c_str(),
+                         (long long) ref.position, (double) bytes / 1e9,
+                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+            return true;
+        }
+        glm_session::Head h;
+        uint64_t hl = 0;
+        if (!glm_session::read(path, h, hl, ctx, err)) return false;
+        if (h.role != 1 || h.snap_id != ref.id || h.n != ref.position || h.prefix != ref.prefix || h.id_a != id_a ||
+            h.id_b != id_b || h.split != split || h.head != head || h.wire != wire || h.ctx != ctx) {
+            err = "the worker's session file " + path + " belongs to another conversation, model or layer stage";
+            return false;
+        }
+        if (!m.slot_load(path, h.n, err, hl)) {
+            m.reset();   // (a half-read state is no conversation: start over)
+            return false;
+        }
+        std::error_code ec;
+        bytes = (uint64_t) fs::file_size(path, ec);
+        std::fprintf(stderr, "glm stage: session %s restored (%lld positions) in %.0f ms\n", path.c_str(),
+                     (long long) h.n,
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+        return true;
+    }
+};
+
+// the layer stage's checks and environment, before the model loads (both ends)
+static bool glm_stage_prepare(const Options& o, bool worker, std::string& err) {
+    strata::glm::stage::LayerStageWireFormat wf;
+    if (!strata::glm::stage::parse_wire(o.stage_wire, wf)) {
+        err = "--layer-stage-wire takes fp32, bf16 or fp16 (not " + o.stage_wire + ")";
+        return false;
+    }
+    if (o.stage_head != "worker" && o.stage_head != "coordinator") {
+        err = "--layer-stage-head takes worker or coordinator (not " + o.stage_head + ")";
+        return false;
+    }
+    if (o.stage_split < 1) {
+        err = "--layer-stage-split K (the worker's first layer, 1 .. 44) is needed with a layer stage";
+        return false;
+    }
+    if (!o.layer_split.empty() || std::getenv("STRATA_GLM_SPLIT") != nullptr) {
+        err = "a layer stage runs one GPU on each PC: --layer-split / MAYA_GLM_SPLIT are not used with it";
+        return false;
+    }
+    if (const char* sq = std::getenv("STRATA_GLM_SEQS"); sq != nullptr && std::atoi(sq) > 1) {
+        err = "a layer stage answers one request at a time: remove --parallel";
+        return false;
+    }
+    if (!o.dflash.empty() || (std::getenv("STRATA_GLM_DFLASH") != nullptr && std::getenv("STRATA_GLM_DFLASH")[0])) {
+        err = "drafting (DFlash2) is not available in a layer stage";
+        return false;
+    }
+    if (std::getenv("STRATA_RPC_TOKEN") == nullptr || std::getenv("STRATA_RPC_TOKEN")[0] == '\0') {
+        err = "set STRATA_RPC_TOKEN (the same secret on both PCs) before starting a layer stage";
+        return false;
+    }
+    set_env("STRATA_GLM_NO_MTP", "1");   // (the draft block is not loaded: no drafting across the link)
+    if (!worker) set_env("STRATA_GLM_SLOTS", "0");   // (the automatic conversation slots: one PC's files only)
+    if (worker && o.stage_sessions && o.stage_session_dir.empty()) {
+        err = "--layer-stage-sessions on the worker needs --layer-stage-session-dir DIR";
+        return false;
+    }
+    return true;
+}
+
+static strata::glm::stage::Spec glm_stage_spec(const Options& o, const strata::core::Glm5Model& model) {
+    strata::glm::stage::Spec spec;
+    strata::glm::stage::hash_text(model.stage_identity(o.glm_pack), spec.identity_a, spec.identity_b);
+    const auto& g = model.geometry();
+    spec.n_layers = (uint32_t) g.n_layers;
+    spec.split = (uint32_t) o.stage_split;
+    spec.dim = (uint32_t) g.n_embd;
+    spec.hc = (uint32_t) g.hc;
+    spec.vocab = (uint32_t) g.n_vocab;
+    spec.max_context = (uint64_t) o.max_context;
+    spec.head_on_coordinator = o.stage_head == "coordinator";
+    spec.sessions = o.stage_sessions;
+    strata::glm::stage::parse_wire(o.stage_wire, spec.wire);
+    return spec;
+}
+
+// maya --glm-pack DIR --layer-stage-server HOST:PORT --layer-stage-split K ...: the worker.  It loads layers K .. 44 of
+// the pack on its GPU (and the head, unless the coordinator holds it) and serves one coordinator at a time; READY once
+// it listens.  The API is the coordinator's: this end has no server of its own.
+static int glm_stage_worker(const Options& o) {
+#if !defined(_WIN32)
+    std::signal(SIGPIPE, SIG_IGN);
+#endif
+    std::string err;
+    if (!glm_stage_prepare(o, true, err)) {
+        std::fprintf(stderr, "maya generate: %s\n", err.c_str());
+        return 2;
+    }
+    if (!o.prefill_arg.empty()) set_env("STRATA_GLM_PREFILL", o.prefill_arg.c_str());
+    strata::core::Glm5Model model;
+    if (!o.expert_profile.empty()) model.set_expert_profile(o.expert_profile);
+    model.set_head_here(o.stage_head == "coordinator" ? 0 : 1);
+    if (!model.load_pack(o.glm_pack, o.max_context, err, o.stage_gpu, o.stage_split, 0)) {
+        std::fprintf(stderr, "maya generate: %s\n", err.c_str());
+        return 1;
+    }
+    std::string why;
+    if (!strata::glm::stage::check_split(model.geometry().n_layers, o.stage_split, why)) {
+        std::fprintf(stderr, "maya generate: --layer-stage-split %d: %s\n", o.stage_split, why.c_str());
+        return 2;
+    }
+    if (!model.fast()) {
+        std::fprintf(stderr, "maya generate: a layer stage needs the fast path (is MAYA_GLM_SLOW set?)\n");
+        return 2;
+    }
+    model.set_host_logits(false);
+    const strata::glm::stage::Spec spec = glm_stage_spec(o, model);
+    GlmStageBackend backend(model);
+    backend.id_a = spec.identity_a;
+    backend.id_b = spec.identity_b;
+    backend.split = spec.split;
+    backend.head = spec.head_on_coordinator ? 1 : 0;
+    backend.wire = (uint32_t) spec.wire;
+    backend.ctx = spec.max_context;
+    if (o.stage_sessions) {
+        std::error_code ec;
+        std::filesystem::create_directories(o.stage_session_dir, ec);
+        if (ec || !std::filesystem::is_directory(o.stage_session_dir)) {
+            std::fprintf(stderr, "maya generate: --layer-stage-session-dir %s cannot be created\n",
+                         o.stage_session_dir.c_str());
+            return 2;
+        }
+        backend.session_dir = o.stage_session_dir;
+    }
+    for (const auto& r : model.vram_report())
+        std::fprintf(stderr, "glm stage: CUDA%d layers [%d, %d)%s: weights %.2f GB, experts %.2f GB (%lld slots), "
+                             "context %.2f GB in VRAM + %.2f GB in RAM, %llu MiB free\n",
+                     r.dev, r.l0, r.l1, model.head_loaded() ? " + the head" : "", (double) r.weights / 1e9,
+                     (double) r.pool / 1e9, (long long) r.slots, (double) r.kv / 1e9, (double) r.kv_ram / 1e9,
+                     (unsigned long long) (r.free >> 20));
+    const char* tok = std::getenv("STRATA_RPC_TOKEN");
+    strata::glm::stage::Server server(tok != nullptr ? tok : "", spec, backend);
+    std::printf("READY layer-stage worker %s\n", o.stage_server.c_str());
+    std::fflush(stdout);
+    std::fprintf(stderr, "glm stage: worker, layers %d-%d of %d%s (wire %s)\n", o.stage_split,
+                 model.geometry().n_layers - 1, model.geometry().n_layers,
+                 spec.head_on_coordinator ? ", the head on the coordinator" : " and the head",
+                 strata::glm::stage::wire_name(spec.wire));
+    if (!server.serve_forever(o.stage_server, err)) {
+        std::fprintf(stderr, "maya generate: the layer-stage worker cannot listen on %s: %s\n", o.stage_server.c_str(),
+                     err.c_str());
+        return 1;
+    }
+    return 0;
+}
+
 static int glm_pack_generate(const Options& o) {
 #if !defined(_WIN32)
     // serving: the server ends the engine with QUIT (or by closing its input), and the engine then sets the conversation
@@ -1058,8 +1477,16 @@ static int glm_pack_generate(const Options& o) {
         std::signal(SIGBREAK, SIG_IGN);
     }
 #endif
+    // StrataRPCG: the link to the worker, when this PC is a layer stage's coordinator (it outlives the model: the
+    // model's prompt sender uses it until the model ends)
+    strata::glm::stage::Client stage_link;
+    const bool stage_mode = !o.stage_client.empty();
     strata::core::Glm5Model model;
     std::string err;
+    if (stage_mode && !glm_stage_prepare(o, false, err)) {
+        std::fprintf(stderr, "maya generate: %s\n", err.c_str());
+        return 2;
+    }
     // the prompt chunk, set in the config's args like Strata's: --prefill auto | N (a chunk of N tokens) | 0
     // (the engine reads it as STRATA_GLM_PREFILL; without either, auto)
     if (!o.prefill_arg.empty()) set_env("STRATA_GLM_PREFILL", o.prefill_arg.c_str());
@@ -1075,10 +1502,55 @@ static int glm_pack_generate(const Options& o) {
         std::fprintf(stderr, "maya generate: --dump-routing: %s\n", err.c_str());
         return 1;
     }
-    // the layer split across the visible GPUs: STRATA_GLM_SPLIT, else --layer-split (auto | K1,K2,..)
-    if (!model.load_pack_env(o.glm_pack, o.max_context, err, o.layer_split)) {
+    // the layer split across the visible GPUs: STRATA_GLM_SPLIT, else --layer-split (auto | K1,K2,..); a layer stage's
+    // coordinator: layers [0, K) on this PC's one GPU (and the head with --layer-stage-head coordinator)
+    if (stage_mode) model.set_head_here(o.stage_head == "coordinator" ? 1 : 0);
+    if (stage_mode ? !model.load_pack(o.glm_pack, o.max_context, err, o.stage_gpu, 0, o.stage_split)
+                   : !model.load_pack_env(o.glm_pack, o.max_context, err, o.layer_split)) {
         std::fprintf(stderr, "maya generate: %s\n", err.c_str());
         return 1;
+    }
+    if (stage_mode) {
+        std::string why;
+        if (!strata::glm::stage::check_split(model.geometry().n_layers, o.stage_split, why)) {
+            std::fprintf(stderr, "maya generate: --layer-stage-split %d: %s\n", o.stage_split, why.c_str());
+            return 2;
+        }
+        const strata::glm::stage::Spec spec = glm_stage_spec(o, model);
+        const char* tok = std::getenv("STRATA_RPC_TOKEN");
+        // the worker may still be loading: wait while its port does not answer (STRATA_GLM_STAGE_WAIT_S, 30 minutes by
+        // default), saying so every minute; a refusal (the token, a setting that differs) stops at once
+        const char* wait_env = std::getenv("STRATA_GLM_STAGE_WAIT_S");
+        const double wait_s = wait_env != nullptr ? std::max(0.0, std::atof(wait_env)) : 1800.0;
+        const auto wait_t0 = std::chrono::steady_clock::now();
+        bool linked = false;
+        for (double note_at = 0.0;;) {
+            linked = stage_link.connect(o.stage_client, tok != nullptr ? tok : "", spec, err);
+            const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - wait_t0).count();
+            if (linked || stage_link.refused() || s >= wait_s) break;
+            if (s >= note_at) {
+                std::printf("NOTE glm stage: waiting for the worker at %s (%s) - start it and wait for its READY line\n",
+                            o.stage_client.c_str(), err.c_str());
+                std::fflush(stdout);
+                std::fprintf(stderr, "glm stage: waiting for the worker at %s (%s)\n", o.stage_client.c_str(),
+                             err.c_str());
+                note_at = s + 60.0;
+            }
+            std::this_thread::sleep_for(std::chrono::seconds(3));
+        }
+        if (!linked && !stage_link.refused())
+            err = "the worker at " + o.stage_client + " did not answer in " + std::to_string((int) wait_s) +
+                  " s (STRATA_GLM_STAGE_WAIT_S): " + err;
+        if (!linked || !model.stage_attach(&stage_link, spec.head_on_coordinator, err)) {
+            std::fprintf(stderr, "maya generate: %s\n", err.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "glm stage: coordinator, layers 0-%d of %d%s; the worker at %s runs layers %d-%d%s "
+                             "(wire %s)\n",
+                     o.stage_split - 1, model.geometry().n_layers,
+                     spec.head_on_coordinator ? " and the head" : "", o.stage_client.c_str(), o.stage_split,
+                     model.geometry().n_layers - 1, spec.head_on_coordinator ? "" : " and the head",
+                     strata::glm::stage::wire_name(spec.wire));
     }
     const int64_t n_vocab = model.geometry().n_vocab;
     // the driver samples on the device (sample_token), so the fast path never downloads the logits
@@ -3969,6 +4441,23 @@ static int glm_pack_generate(const Options& o) {
             std::fprintf(stderr, "maya serve: the expert profile was not saved: %s\n", e.c_str());
         profile_saved_at = Clock::now();
     };
+    // StrataRPCG's disk sessions (SAVE / RESTORE below): what a session file must match - this model (its pack and
+    // files) and, with a layer stage, the stage (split, head, wire)
+    glm_session::Head sess_mine;
+    if (model.fast()) {
+        if (stage_mode) {
+            const strata::glm::stage::Spec sp = glm_stage_spec(o, model);
+            sess_mine.id_a = sp.identity_a;
+            sess_mine.id_b = sp.identity_b;
+            sess_mine.split = sp.split;
+            sess_mine.head = sp.head_on_coordinator ? 1 : 0;
+            sess_mine.wire = (uint32_t) sp.wire;
+        } else {
+            strata::glm::stage::hash_text(model.stage_identity(o.glm_pack), sess_mine.id_a, sess_mine.id_b);
+            sess_mine.head = 2;
+        }
+        sess_mine.ctx = (uint64_t) o.max_context;
+    }
     std::string line;
     for (;;) {
         if (multi && !pending.empty()) admit_pending();
@@ -4018,6 +4507,149 @@ static int glm_pack_generate(const Options& o) {
         if (cmd == "VRECLAIM") {
             if (model.vision_reclaim(err)) std::printf("VRECLAIMED\n");
             else std::printf("ERR %s\n", err.c_str());
+            std::fflush(stdout);
+            continue;
+        }
+        // SAVE <file> / RESTORE <file> (StrataRPCG's disk sessions; the server's /slots/0?action=save|restore): the
+        // conversation the engine holds - its snapshot, the state before its last prompt token - to or from <file>,
+        // and with a layer stage the worker's half to or from its session folder (written first, read first).
+        // SAVED / RESTORED <tokens> <bytes> <ms>; SERR <invalid|storage|memory|io> <published 0|1> <reason> when the
+        // file is refused or fails (the engine stays in step); SWAIT <step> <seconds> before a step that may take long.
+        if (cmd == "SAVE" || cmd == "RESTORE") {
+            std::string path;
+            std::getline(ss, path);
+            while (!path.empty() && (path.front() == ' ' || path.front() == '\t')) path.erase(path.begin());
+            while (!path.empty() && (path.back() == '\r' || path.back() == '\n')) path.pop_back();
+            const auto serr = [&](const char* kind, const std::string& why) {
+                std::string w = why;
+                for (char& c : w)
+                    if (c == '\n' || c == '\r') c = ' ';
+                std::printf("SERR %s 0 %s\n", kind, w.c_str());
+                std::fflush(stdout);
+            };
+            const auto swait = [&](const char* step, int seconds) {
+                std::printf("SWAIT %s %d\n", step, seconds);
+                std::fflush(stdout);
+            };
+            if (path.empty()) {
+                serr("invalid", "no file");
+                continue;
+            }
+            if (multi) {
+                serr("invalid", "disk sessions are not available with several conversations at once (--parallel)");
+                continue;
+            }
+            if (!model.fast()) {
+                serr("invalid", "disk sessions need the fast path");
+                continue;
+            }
+            if (stage_mode && !o.stage_sessions) {
+                serr("invalid", "disk sessions are off: start both PCs with --layer-stage-sessions");
+                continue;
+            }
+            namespace fs = std::filesystem;
+            const auto t0 = std::chrono::steady_clock::now();
+            const auto ms_now = [&] {
+                return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            };
+            std::string e;
+            if (cmd == "SAVE") {
+                if (snap_tokens.empty() || model.snapshot_pos() != (int64_t) snap_tokens.size()) {
+                    serr("invalid", "no finished conversation to save (send a request first; a stopped one keeps none)");
+                    continue;
+                }
+                if (!glm_session::room(path, e)) {
+                    serr("storage", e);
+                    continue;
+                }
+                glm_session::Head h = sess_mine;
+                h.role = 0;
+                h.snap_id = strata::glm::stage::new_snapshot_id();
+                h.n = (int64_t) snap_tokens.size();
+                h.tokens = snap_tokens;
+                h.prefix = strata::glm::stage::prefix_hash(snap_tokens);
+                h.img = snap_img_hash;
+                uint64_t wbytes = 0;
+                if (stage_mode) {
+                    swait("worker", 1800);
+                    const strata::glm::stage::SnapshotRef ref{h.snap_id, h.n, h.prefix};
+                    if (!stage_link.session(true, ref, wbytes, e)) {
+                        serr("io", "the worker's half: " + e);
+                        continue;
+                    }
+                }
+                swait("disk", 1800);
+                const std::string tmp = path + ".tmp";
+                const uint64_t bytes = model.slot_save(tmp, e, glm_session::pack(h));
+                std::error_code ec;
+                if (bytes == 0) {
+                    fs::remove(tmp, ec);
+                    serr("io", e);
+                    continue;
+                }
+                fs::rename(tmp, path, ec);
+                if (ec) {
+                    fs::remove(tmp, ec);
+                    serr("io", "cannot publish " + path + ": " + ec.message());
+                    continue;
+                }
+                std::fprintf(stderr, "glm sessions: saved %zu tokens to %s (%.2f GB here%s) in %.0f ms\n",
+                             snap_tokens.size(), path.c_str(), (double) bytes / 1e9,
+                             stage_mode ? (", " + std::to_string((double) wbytes / 1e9).substr(0, 4) +
+                                           " GB on the worker, id " + h.snap_id).c_str()
+                                        : "",
+                             ms_now());
+                std::printf("SAVED %zu %llu %.1f\n", snap_tokens.size(), (unsigned long long) (bytes + wbytes), ms_now());
+                std::fflush(stdout);
+                continue;
+            }
+            glm_session::Head h;
+            uint64_t hl = 0;
+            if (!glm_session::read(path, h, hl, (uint64_t) o.max_context, e)) {
+                serr("invalid", e);
+                continue;
+            }
+            if (h.role != 0 || h.id_a != sess_mine.id_a || h.id_b != sess_mine.id_b) {
+                serr("invalid", "the session was saved with another model or pack");
+                continue;
+            }
+            if (h.split != sess_mine.split || h.head != sess_mine.head || h.wire != sess_mine.wire) {
+                serr("invalid", "the session was saved with another layer stage (its split, head or wire differ)");
+                continue;
+            }
+            if (strata::glm::stage::prefix_hash(h.tokens) != h.prefix) {
+                serr("invalid", "a damaged session file (its tokens do not match their hash)");
+                continue;
+            }
+            // whatever was held is another conversation from here on (a failure below resets both PCs)
+            snap_tokens.clear();
+            snap_in_slot = false;
+            ckpt_drop_past(0);
+            lp_ctx.clear();
+            uint64_t wbytes = 0;
+            if (stage_mode) {
+                swait("worker", 1800);
+                const strata::glm::stage::SnapshotRef ref{h.snap_id, h.n, h.prefix};
+                if (!stage_link.session(false, ref, wbytes, e)) {
+                    model.reset();
+                    serr("invalid", "the worker's half: " + e);
+                    continue;
+                }
+            }
+            swait("disk", 1800);
+            if (!model.slot_load(path, h.n, e, hl)) {
+                model.reset();
+                serr("io", e);
+                continue;
+            }
+            snap_tokens = h.tokens;
+            snap_img_hash = h.img;
+            snap_in_slot = false;
+            std::error_code ec;
+            const uint64_t bytes = (uint64_t) fs::file_size(path, ec);
+            std::fprintf(stderr, "glm sessions: restored %zu tokens from %s in %.0f ms\n", snap_tokens.size(), path.c_str(),
+                         ms_now());
+            std::printf("RESTORED %zu %llu %.1f\n", snap_tokens.size(), (unsigned long long) (bytes + wbytes), ms_now());
             std::fflush(stdout);
             continue;
         }
@@ -4470,6 +5102,14 @@ int main(int argc, char** argv) {
         else if (a == "--stop-eos") { o.stop_eos = true; o.eos_given = true; }
         else if (a == "--spec-split") o.spec_split = true;
         else if (a == "--layer-split") o.layer_split = next("--layer-split");
+        else if (a == "--layer-stage-client") o.stage_client = next("--layer-stage-client");
+        else if (a == "--layer-stage-server") o.stage_server = next("--layer-stage-server");
+        else if (a == "--layer-stage-split") o.stage_split = std::atoi(next("--layer-stage-split"));
+        else if (a == "--layer-stage-wire") o.stage_wire = next("--layer-stage-wire");
+        else if (a == "--layer-stage-head") o.stage_head = next("--layer-stage-head");
+        else if (a == "--layer-stage-sessions") o.stage_sessions = true;
+        else if (a == "--layer-stage-session-dir") o.stage_session_dir = next("--layer-stage-session-dir");
+        else if (a == "--layer-stage-gpu") o.stage_gpu = std::atoi(next("--layer-stage-gpu"));
         else if (a == "--dflash") o.dflash = next("--dflash");
         else if (a == "--split-device") o.split_device = next("--split-device");
         else if (a == "--pcie-mode") o.pcie_mode = next("--pcie-mode");
@@ -4603,6 +5243,11 @@ int main(int argc, char** argv) {
         if (o.pack != "pack/full") {
             std::fprintf(stderr, "maya generate: note: --glm-pack supersedes --pack (%s ignored)\n", o.pack.c_str());
         }
+        if (!o.stage_client.empty() && !o.stage_server.empty()) {
+            std::fprintf(stderr, "maya generate: a PC is either the layer stage's coordinator or its worker\n");
+            return 2;
+        }
+        if (!o.stage_server.empty()) return glm_stage_worker(o);   // (StrataRPCG: the worker serves no API)
         return glm_pack_generate(o);
     }
     // Layer split (multi-GPU): the later stages run layers [K_i, K_i+1) on their own GPUs (--split-device, default

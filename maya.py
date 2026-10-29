@@ -240,6 +240,25 @@ MODELS = {
                            "3627575df16bd152db0f3fd7e488d270b33f3a9e6c7fa3b1b8ac381faafde882",
                        "GLM-5.3-Flash-vocab.gguf":
                            "8f53cb1bd2e631c14ef413e3284735d9e53f3c508d07a6f609e705b487105912"}}},
+    # StrataRPCG: pfeifferj's GSQ-RCO 3.0-bit GGUF (GSQ experts mostly Q2_K, Q3_K / Q4_K in layers 3-8, Q8_0 attention and
+    # shared experts; no MTP block - nothing drafts with it), one file; the vision files are Maya's (its encoder reads
+    # them).  The model card measured it against a Q8_0 conversion of the FP8 release: MMLU-Pro 60.0% vs 61.95%,
+    # perplexity +9.1%.  Revision pinned to the commit its SHA256SUMS lists this file in.
+    "GSQ-RCO-3.0bit": {
+        "about": "pfeifferj's GSQ-RCO 3.0-bit GGUF (StrataRPCG's model): GSQ-trained experts, mostly Q2_K with Q3_K / "
+                 "Q4_K in the first MoE layers, Q8_0 attention and shared experts; no MTP block (no drafting)",
+        "repo": "pfeifferj/GLM-5.3-Flash-GSQ-RCO-GGUF", "revision": "892aabe2e45835f58f3f24bf03dc5427d345e230",
+        "folder": "", "file": "GLM-5.3-Flash-GSQ-RCO-3.0bit.gguf", "shards": 1, "download_gb": 117.5,
+        "sha256": {"GLM-5.3-Flash-GSQ-RCO-3.0bit.gguf":
+                       "a60586ce30494bf61a2f3eb0da72ae212ea9f9957434e4061a137889e7d63d7b"},
+        "vision": {
+            "repo": "peasantsmith/GLM-5.3-Flash-Maya-GGUF", "revision": "main",
+            "folder": "vision", "mmproj": "mmproj-GLM-5.3-Flash-F16.gguf", "vocab": "GLM-5.3-Flash-vocab.gguf",
+            "download_gb": 1.14,
+            "sha256": {"mmproj-GLM-5.3-Flash-F16.gguf":
+                           "3627575df16bd152db0f3fd7e488d270b33f3a9e6c7fa3b1b8ac381faafde882",
+                       "GLM-5.3-Flash-vocab.gguf":
+                           "8f53cb1bd2e631c14ef413e3284735d9e53f3c508d07a6f609e705b487105912"}}},
     # turboderp's EXL3 (exllamav3) quants, read in place from their safetensors: the pack (tools/exl3_pack.py) puts a
     # small GGUF of the unquantized tensors beside them.  "files": every file of the branch with its size (what is
     # downloaded, and how a download is known whole); "revision": the branch's commit the hashes belong to.

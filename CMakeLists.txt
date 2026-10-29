@@ -166,6 +166,28 @@ add_library(strata_artifact INTERFACE)
 target_include_directories(strata_artifact INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(strata_artifact INTERFACE strata_warnings)
 
+# ---- strata_stage_net (StrataRPCG) -----------------------------------------
+# The GLM layer stage over two PCs: the TCP transport, the activations' wire formats and the protocol (plain C++, no
+# GPU - glm_stage_test runs it over loopback).  The GLM engine links it; nothing runs it unless --layer-stage-* is given.
+find_package(Threads REQUIRED)
+add_library(strata_stage_net STATIC src/core/rpc_transport.cpp src/core/layer_stage_codec.cpp src/core/glm_stage.cpp)
+target_include_directories(strata_stage_net PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(strata_stage_net PUBLIC Threads::Threads PRIVATE strata_warnings)
+if(WIN32)
+  target_link_libraries(strata_stage_net PUBLIC ws2_32)
+endif()
+if(STRATA_BUILD_TESTS)
+  enable_testing()
+  add_executable(glm_stage_test tests/core/glm_stage_test.cpp)
+  target_link_libraries(glm_stage_test PRIVATE strata_stage_net strata_warnings)
+  add_test(NAME glm_stage_test COMMAND glm_stage_test)
+  set_tests_properties(glm_stage_test PROPERTIES TIMEOUT 120)
+  add_executable(rpc_transport_test tests/core/rpc_transport_test.cpp)
+  target_link_libraries(rpc_transport_test PRIVATE strata_stage_net strata_warnings)
+  add_test(NAME rpc_transport_test COMMAND rpc_transport_test)
+  set_tests_properties(rpc_transport_test PROPERTIES TIMEOUT 120)
+endif()
+
 add_executable(strata-gguf src/artifact/gguf_reader.cpp)
 target_link_libraries(strata-gguf PRIVATE strata_artifact)
 
@@ -455,9 +477,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
     src/core/glm_model.cu src/core/glm_fast_path.cu src/core/glm_prefill.cu src/core/glm_multi.cu src/core/glm_rows.cu
-    src/core/glm_window.cu src/core/glm_dflash.cu src/core/glm_mtp.cu src/core/glm_mtp_rows.cu)
+    src/core/glm_window.cu src/core/glm_dflash.cu src/core/glm_mtp.cu src/core/glm_mtp_rows.cu
+    src/core/glm_stage_model.cu)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-  target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
+  target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu strata_stage_net
+                        ${_strata_gpu_runtime_target})
   if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA)
     # the DFlash2 drafter against a CPU float forward of the same GGUF (glm_dflash_test <draft.gguf>; needs a GPU)
     # the fast path's multi-column GEMV: every column against the single-column call, and its time (needs a GPU)

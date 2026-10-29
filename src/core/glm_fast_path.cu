@@ -16,6 +16,7 @@
 // slot while it is overwritten: the device is parked in that layer's wait kernel, the layer's
 // resident experts are excluded, and every other layer's slots are untouched.
 #include "glm_fast_state.hpp"
+#include "strata/core/glm_stage.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/glm_model.hpp"
 #include "strata/kernels/glm_fast.hpp"
@@ -5847,6 +5848,15 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
     }
     FastState* FT = tail->fast_;
     cudaSetDevice(tail->dev_);
+    if (stage_ != nullptr) {   // StrataRPCG: the worker's layers - and the head there, unless it is this part's
+        int tok = -1;
+        if (!stage_hand_over(tail, p, tok, err)) return false;
+        if (!stage_head_local_) {
+            last_tok_ = tok;
+            cudaSetDevice(dev_);
+            return true;
+        }
+    }
     gf::head_prep(tail->state_, tail->w_.at("output_norm.weight"), g.norm_eps, g.n_embd, FT->head_x, FT->head_xq,
                   FT->cs);
     // GLM_DUMP_H=<file> (debug): append every position's final hidden state (output_norm of the stream mean - what the
@@ -6932,12 +6942,29 @@ bool Glm5Model::snapshot_save() {
         }
     }
     cudaSetDevice(dev_);
+    if (stage_ != nullptr) {   // StrataRPCG: the worker's layers keep theirs at the same position
+        bool saved = false;
+        std::string e;
+        if (!stage_->connected() || !stage_->snap_save(pos_, saved, e) || !saved) {
+            if (!e.empty()) std::fprintf(stderr, "glm stage: the worker's snapshot: %s\n", e.c_str());
+            for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) m->snap_pos_ = -1;
+            return false;
+        }
+    }
     return true;
 }
 
 bool Glm5Model::snapshot_restore() {
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get())
         if (m->fast_ == nullptr || m->snap_pos_ < 0) return false;
+    if (stage_ != nullptr) {   // StrataRPCG: the worker first (it holds the same position, or nothing is restored)
+        bool restored = false;
+        std::string e;
+        if (!stage_link_ok(e) || snap_pos_ < 0 || !stage_->snap_restore(snap_pos_, restored, e) || !restored) {
+            if (!e.empty()) std::fprintf(stderr, "glm stage: the worker's snapshot: %s\n", e.c_str());
+            return false;
+        }
+    }
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         const Glm5Geometry& g = m->g_;
         const size_t run = (size_t) g.d_inner() * g.kda_head_dim + (size_t) 3 * g.d_inner() * (g.d_conv - 1);
@@ -7045,6 +7072,16 @@ bool Glm5Model::ckpt_save_snapshot(int slot, std::string& err) {
         }
         for (Glm5Model* m : ms) m->ckpt_pos_[(size_t) slot] = ok ? m->snap_pos_ : -1;
     });
+    if (stage_ != nullptr) {   // StrataRPCG: the worker copies its snapshot into the same slot
+        bool saved = false;
+        std::string e;
+        if (!stage_->connected() || !stage_->ckpt_save(slot, true, snap_pos_, saved, e) || !saved) {
+            ckpt_join();
+            for (Glm5Model* m : ms) m->ckpt_pos_[(size_t) slot] = -1;
+            err = "checkpoint: the worker's " + (e.empty() ? std::string("was not kept") : e);
+            return false;
+        }
+    }
     return true;
 }
 
@@ -7094,6 +7131,15 @@ bool Glm5Model::ckpt_save(int slot, std::string& err) {
         m->ckpt_pos_[(size_t) slot] = m->pos_;
     }
     cudaSetDevice(dev_);
+    if (stage_ != nullptr) {   // StrataRPCG: the worker's layers into the same slot
+        bool saved = false;
+        std::string e;
+        if (!stage_->connected() || !stage_->ckpt_save(slot, false, pos_, saved, e) || !saved) {
+            for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) m->ckpt_pos_[(size_t) slot] = -1;
+            err = "checkpoint: the worker's " + (e.empty() ? std::string("was not kept") : e);
+            return false;
+        }
+    }
     return true;
 }
 
@@ -7105,6 +7151,14 @@ bool Glm5Model::ckpt_restore(int slot, std::string& err) {
             err = "checkpoint: slot " + std::to_string(slot) + " holds none";
             return false;
         }
+    if (stage_ != nullptr) {   // StrataRPCG: the worker first (the same slot at the same position, or nothing)
+        bool restored = false;
+        std::string e;
+        if (!stage_link_ok(e) || !stage_->ckpt_restore(slot, ckpt_pos_[(size_t) slot], restored, e) || !restored) {
+            err = "checkpoint: the worker's slot " + std::to_string(slot) + (e.empty() ? " holds none" : ": " + e);
+            return false;
+        }
+    }
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         const Glm5Geometry& g = m->g_;
         const size_t run = (size_t) g.d_inner() * g.kda_head_dim + (size_t) 3 * g.d_inner() * (g.d_conv - 1);
@@ -7168,7 +7222,7 @@ std::vector<std::pair<float*, int64_t>> slot_dsa_runs(const Glm5Geometry& g, boo
 }
 }  // namespace
 
-uint64_t Glm5Model::slot_save(const std::string& path, std::string& err) {
+uint64_t Glm5Model::slot_save(const std::string& path, std::string& err, const std::string& head) {
     std::vector<Glm5Model*> halves;
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         if (m->fast_ == nullptr || m->snap_pos_ < 0 || m->snap_pos_ != snap_pos_) {
@@ -7184,6 +7238,7 @@ uint64_t Glm5Model::slot_save(const std::string& path, std::string& err) {
     }
     const int64_t n = snap_pos_;
     const auto put = [&](const void* p, size_t bytes) { f.write((const char*) p, (std::streamsize) bytes); };
+    if (!head.empty()) put(head.data(), head.size());   // (a disk session's own header, before the slot)
     const uint32_t nh = (uint32_t) halves.size();
     put(&kSlotMagic, 8);
     put(&nh, 4);
@@ -7244,11 +7299,15 @@ uint64_t Glm5Model::slot_save(const std::string& path, std::string& err) {
     return (uint64_t) f.tellp();
 }
 
-bool Glm5Model::slot_load(const std::string& path, int64_t n_pos, std::string& err) {
+bool Glm5Model::slot_load(const std::string& path, int64_t n_pos, std::string& err, uint64_t skip) {
     ckpt_join();   // (ckpt_save_snapshot reads snap_ / snap_pool_)
     dflash_reset();   // another conversation's state: the drafter's cached positions are not its
     std::ifstream f(path, std::ios::binary);
     if (!f) {
+        err = "cannot read " + path;
+        return false;
+    }
+    if (skip > 0 && !f.seekg((std::streamoff) skip)) {   // (a disk session's own header, before the slot)
         err = "cannot read " + path;
         return false;
     }
@@ -7543,6 +7602,14 @@ bool Glm5Model::forward_fast(const std::vector<int32_t>& tokens, std::vector<flo
         if (!fast_token(t, err)) return false;
         F->ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         ++F->tokens;
+    }
+    if (host_logits_ && stage_ != nullptr && !stage_head_local_) {   // (the head is the worker's)
+        std::string e;
+        if (!stage_->logits(logits_out, e)) {
+            err = "glm stage: the worker's logits: " + e;
+            return false;
+        }
+        return true;
     }
     if (host_logits_) {
         Glm5Model* tail = this;

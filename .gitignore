@@ -56,3 +56,6 @@ build-vision.bat
 *.done
 /third_party/*.zip
 
+# StrataRPCG: saved chats (each PC's half; scripts/stratarpcg) - private conversation state, never committed
+/sessions-host/
+/sessions-worker/

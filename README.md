@@ -1,3 +1,5 @@
+> **StrataRPCG branch:** GLM-5.3-Flash split over two PCs (an RTX 4090 coordinator and an RTX 5070 Ti worker), built on Project Maya. Start with [`START-HERE.bat`](START-HERE.bat) and [docs/STRATARPCG.md](docs/STRATARPCG.md); developers read [HANDOFF.md](HANDOFF.md).
+
 <h1 align="center">Project Maya</h1>
 
 <p align="center"><b>GLM-5.3-Flash (321 B), DeepSeek-V4.1-Flash-1017 (748 B) and MiniMax-M3.1-Flash (428 B) on your own GPU</b><br>

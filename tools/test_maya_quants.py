@@ -25,6 +25,7 @@ ALIASES = {
     "EXL3-3.05bpw": ("glm", "EXL3-3.05bpw"), "EXL3-4.05bpw": ("glm", "EXL3-4.05bpw"),
     "EXL3-sc_4.10bpw": ("glm", "EXL3-sc_4.10bpw"),
     "DeepSeek-V4.1-Flash-1017": ("deepseek", None), "MiniMax-M3.1-Flash": ("minimax", None),
+    "GSQ-RCO-3.0bit": ("glm", "GSQ-RCO-3.0bit"),   # (StrataRPCG: pfeifferj's GGUF, a GLM download by its own name)
 }
 # the setup ids (new) -> (family, key, what the picker and the dashboard show)
 IDS = {
