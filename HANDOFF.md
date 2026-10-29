@@ -37,7 +37,13 @@ engine on every participating PC. See `docs/STRATARPCD-THREE-PC.md` for the comp
   checkpoints, save/reset/restore and downstream sampling failure. Four PowerShell launcher/config tests and
   43 existing Python session/API tests pass. Linux CUDA 13.2 compilation passed for sm_89 and sm_120 (no GPU).
   Protocol and session-envelope tests also pass ASan/UBSan.
-  Windows build and hardware checks are pending at this source commit. HIP/SYCL toolchains are not installed here.
+  **Windows build passed:** [run 40853673787](https://github.com/Protonburn35/StrataRPC/actions/runs/40853673787),
+  source `bf4c056246ab83a59da8c05f28ba725fb38c83e9`, native version `0.1.52 build bf4c05624`, CUDA 13.2 /
+  MSVC 14.44.35207 / sm_89 + sm_120. Windows launcher tests (4) and CPU tests (3), compilation, package and upload
+  all succeeded. [Download the 407 MB engine package](https://github.com/Protonburn35/StrataRPC/actions/runs/40853673787/artifacts/12889408046).
+  Packaging verified all five presets, both guides and the launch scripts. The subsequent documentation commit adds
+  this evidence and clarifies the extra BF16 activation boundary; it does not change the built source.
+  Hardware checks remain pending. HIP/SYCL toolchains are not installed here.
   No actual model output, GPU snapshot restore, numerical parity, throughput or full-1M-state claim is made.
 
 First hardware check: compare short text and image/follow-up, then manual save, switch, restore, restart all three

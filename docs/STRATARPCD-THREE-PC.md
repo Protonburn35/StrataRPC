@@ -4,6 +4,11 @@ This is an experimental three-PC mode. Its speed and GPU correctness have not ye
 Keep the working two-PC preset for comparison. Both modes use the same new protocol-3 binary; update every
 participating PC together. Model packs stay unchanged.
 
+[Download the Windows engine package](https://github.com/Protonburn35/StrataRPC/actions/runs/40853673787/artifacts/12889408046)
+(407 MB; [successful build](https://github.com/Protonburn35/StrataRPC/actions/runs/40853673787)). The binary reports
+`strata-dsv41 0.1.52 build bf4c05624`. This package passed the Windows build and CPU/launcher checks, not a
+three-GPU inference benchmark.
+
 | PC | Address | Three-PC work |
 | --- | --- | --- |
 | A: RTX 4090, 32 GB RAM | 192.168.50.206 | API, GPU vision, embedding, Engram, layers 0-19 |
@@ -20,7 +25,9 @@ The opt-in flag is `--layer-stage-middle-end 24` on all three PCs. The model val
 other supported indexer boundaries are 28, 32 and 36. Start with the supplied 24 preset. B forwards prompts
 in at most 2048-token requests, bounding its retained input and C's paired-row buffer. The three-PC path
 processes every prompt row rather than using the native prompt-skip optimization. This can cost prefill time.
-All six experts remain selected. There is no DSpark, forced temperature, expert pruning, or new quantization.
+All six experts remain selected. There is no DSpark, forced temperature, expert pruning, or new weight quantization.
+The extra BF16 activation boundary and execution on different GPUs can change floating-point results and sampled
+answers. Pass `-Wire fp32` to all three launchers for numerical comparisons; normal sampling remains supported in both modes.
 
 ## Prepare the laptop once
 
