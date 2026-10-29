@@ -22,6 +22,8 @@ engineering and Switch recomp ports, where exactness matters. Both files don't f
   - `START-HERE.bat` now defaults to `--model GSQ-RCO-3.5bit`; `--model GSQ-RCO-3.0bit` still selects 3-bit.
   - The config is `maya-gsq-rco-3.5bit.json` and the coordinator's log is `maya-gsq-rco-3.5bit-stratarpcg.log`.
   - `tools/test_maya_quants.py` knows both names.
+  - `tools/test_maya_models.py` reads a single-file download's label from the end of its name. The multi-file rule
+    gave "Flash" for both GSQ-RCO files and failed CI on `6004e96c`; the fix was test-only.
 - **Vision files:** they live in the model's folder (`<download dir>\vision`). The switch moves them from
   `models-glm\GSQ-RCO-3.0bit\vision` to `models-glm\GSQ-RCO-3.5bit\vision` before the 3.0-bit GGUF and pack are
   deleted, so they are not downloaded again.

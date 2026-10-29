@@ -236,8 +236,12 @@ class LabelledNames(unittest.TestCase):
                          "GLM-5.3-Flash-Maya-S24-IQ2_XXS_S-00002-of-00003.gguf")
         # one label per model in a repo: Hugging Face adds up the files that share one (Maya-S is IQ2_XXS); a model in
         # a repo of its own may share a label (Maya-M-Derisked's IQ2_S)
+        # (a single file's label ends its name: pfeifferj's GLM-5.3-Flash-GSQ-RCO-3.0bit.gguf / -3.5bit.gguf)
+        def label(m):
+            name = maya.shard_names(m)[0]
+            return name.split("-")[-4] if maya.SHARD_RE.search(name) else name[:-len(".gguf")].split("-")[-1]
         for repo in {m["repo"] for m in maya.MODELS.values()}:
-            labels = [maya.shard_names(m)[0].split("-")[-4] for m in maya.MODELS.values()
+            labels = [label(m) for m in maya.MODELS.values()
                       if m["repo"] == repo and "files" not in m]   # (an EXL3 model has no shards)
             self.assertEqual(len(labels), len(set(labels)), (repo, labels))
 
