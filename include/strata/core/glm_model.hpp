@@ -1075,6 +1075,10 @@ public:
     /// Where the output head is loaded (set before load_pack): -1 on the part of the last layer (as without a stage),
     /// 1 on this part, 0 not on this part.  --layer-stage-head coordinator: 1 on the coordinator, 0 on the worker.
     void set_head_here(int where) { head_here_ = where; }
+    /// The layers this PC loads, [l0, l1) (l1 0: to the last), set before load_pack: the RAM tier's budget is this PC's
+    /// to share among those layers alone - the other PC's layers never draw on it.  Without it (no stage) the budget is
+    /// shared over the whole model's MoE layers, whose later parts a split on this PC loads after this one.
+    void set_stage_layers(int l0, int l1) { stage_l0_ = l0; stage_l1_ = l1; }
     bool head_loaded() const { return ws_map_.count("output.weight") != 0; }
     /// The coordinator: from now on every position also runs the worker's layers behind `link` (its connection made);
     /// head_here: the head and the sampling are this part's (--layer-stage-head coordinator), else the worker's.
@@ -1103,6 +1107,7 @@ private:
     bool stage_head_local_ = false;                        // ... the head is this part's
     uint64_t stage_epoch_ = 0;                             // ... the link's epoch this state belongs to
     int head_here_ = -1;                                   // set_head_here
+    int stage_l0_ = -1, stage_l1_ = 0;                     // set_stage_layers (-1: no stage, the whole model)
     std::vector<float> stage_rows_;                        // the worker's prompt rows (one chunk), or the
                                                            // coordinator's chunk on its way out
     std::vector<float> stage_row_;                         // one position's row in and out (2 x hc x n_embd)

@@ -1536,6 +1536,12 @@ bool Glm5Model::fast_setup(std::string& err) {
         // the headroom free.
         static int64_t total = -1, remaining = -1;
         static int remaining_layers = 0;
+        // the layers this process serves: the whole model's, or a layer stage's own range (StrataRPCG: the other PC
+        // holds the rest and never draws on this PC's RAM - shared over the whole model, the coordinator's layers 0-23
+        // took 21 / 42 of its budget and left the other half unused)
+        const bool stage_local = stage_l0_ >= 0;
+        const int local_end = stage_local && stage_l1_ > 0 ? std::min(stage_l1_, g.n_layers) : g.n_layers;
+        const int local_begin = stage_local ? std::max(stage_l0_, 0) : 0;
         static int64_t unpinned = 0;   // a parallel load: the earlier parts' planned tiers, none pinned yet
         const auto pinned_pf = prefill_pinned();
         const int later = n_parts_ - 1 - part_;   // the parts that start after this one
@@ -1585,10 +1591,12 @@ bool Glm5Model::fast_setup(std::string& err) {
                     total = std::max<int64_t>(0, avail_kb * 1024 - head_b - unseen_pf);
                 }
                 remaining = total;
-                remaining_layers = g.n_layers - g.dense_lead + (getenv("STRATA_GLM_NO_MTP") ? 0 : g.nextn);
+                remaining_layers = std::max(0, local_end - std::max(local_begin, g.dense_lead)) +
+                                   (local_end >= g.n_layers && !getenv("STRATA_GLM_NO_MTP") ? g.nextn : 0);
             }
-            // the last half takes everything left (one device: the NextN block, counted above, is not loaded)
-            budget = l1_ >= g.n_layers ? remaining
+            // the last half takes everything left (one device: the NextN block, counted above, is not loaded; a layer
+            // stage: the last part of this PC's range)
+            budget = l1_ >= local_end ? remaining
                                        : std::min<int64_t>(remaining, (int64_t) ((double) remaining * (double) n_moe /
                                                                                  (double) std::max(1, remaining_layers)));
             // a later part: no more than is free now, less what is still to come and half the headroom (a parallel

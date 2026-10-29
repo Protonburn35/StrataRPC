@@ -4,6 +4,40 @@ Read this first. Claude and Sol (GPT/Codex) both work here. Fetch before you sta
 this file with every push, and never force-push. Doc-only commits carry `[skip ci]`. Never commit
 `STRATA_RPC_TOKEN`, raw logs or other private data.
 
+## Coordinator RAM budget fixed (2026-10-29, Claude)
+
+Sol's priority below is implemented. **Not yet measured on the PCs.** The user compiles this one update locally on
+both PCs; later engine updates should come as a GitHub-built package (see "Next" at the end).
+
+- **Cause, as Sol found:** the coordinator's RAM tier was sized as one part of a split over the whole model. Shared
+  over all 42 MoE layers, the coordinator's 21 layers got half the eligible budget. The other half was set aside
+  for layers that live on the other PC and never use it.
+- **Fix:** `Glm5Model::set_stage_layers(l0, l1)` tells the model which layers this PC loads; `l1 = 0` means
+  "to the last layer", as in `load_pack`.
+  - `generate.cpp` calls it on the coordinator (`0, split`) and on the worker (`split, 0`) before `load_pack`.
+  - In the RAM-tier block of `src/core/glm_fast_path.cu`, `remaining_layers` then counts only this PC's MoE layers.
+    The last part of this PC's range takes everything left (`l1_ >= local_end`).
+  - Without a stage (`stage_l0_ = -1`) the arithmetic is exactly as before: one GPU, local multi-GPU splits and the
+    parallel load are unchanged.
+  - Kept unchanged: the 6 GiB headroom, Windows' physical/commit checks, staging reserves, the pinning-cap
+    fallback, the global geometry and layer indexing.
+- **Expected effect:**
+  - **4090:** the eligible budget roughly doubles, from about 3.7-3.9 GiB to about 7.4-7.8 GiB under the same
+    startup conditions, subject to pinning/commit limits.
+  - **5070 Ti:** unchanged; it already took its whole budget.
+  - `STRATA_GLM_RAM_GB` / `MAYA_GLM_RAM_GB` in a stage is now this PC's whole RAM-tier budget, no longer a whole-model
+    figure that the coordinator halved.
+- **Validation:** the CUDA engine builds (Linux, sm_89); `glm_stage_test` passes. The Windows workflow re-checks
+  sm_89 + sm_120 on this push.
+- **Measure next:** the same prompt, sampling, context, split, head placement and pictures as before. Compare:
+  - the 4090's `glm fast: CUDA0 RAM tier ... GB pinned, ... slots` line and whether a pinning-cap line appears;
+  - disk loads per token and the disk-miss service time;
+  - the VRAM hit rate;
+  - decode and prefill speed.
+- **Install route the user chose:** download the commit's ZIP, copy it over `C:\StrataRPCG` (the user backs the folder
+  up first) and run `START-HERE.bat --yes --download-model --no-start` on each PC. That recompiles the engine and
+  reuses the model, pack, picture encoder and configs.
+
 ## Latest hardware results and Claude's next fix (2026-10-29, Codex)
 
 **Read this section first; it supersedes the older "first hardware run pending" status below.** The user is
@@ -293,9 +327,12 @@ The user's folder is `C:\StrataRPCG`. The user guide is `docs/STRATARPCG.md`.
 
 ## Next
 
-1. **Fix the coordinator's RAM budget and deliver a GitHub-built Windows engine ZIP**, as detailed in the latest
-   section above. The first split runs now have logs; repeat the same prompt after the fix and check both PCs.
-2. **Tune `-Split`** from each PC's expert-pool lines (VRAM vs RAM experts). With `-HeadOnCoordinator`, the 4090 loses
+1. **Measure the RAM-budget fix** (top section) with the same prompt on both PCs.
+2. **A GitHub-built Windows engine package for later updates.** The user does not want to compile again after this
+   one. Sol's packaging notes above still apply: maya.exe with its real DLLs (dumpbin), `STRATA_PORTABLE=ON`, and an
+   installer that updates the folder and `build\MAYA-BUILD.json`'s `src` fingerprint so Maya does not recompile.
+   Claude has drafted the installer and its test; they are not pushed yet.
+3. **Tune `-Split`** from each PC's expert-pool lines (VRAM vs RAM experts). With `-HeadOnCoordinator`, the 4090 loses
    the head's VRAM to experts and the 5070 Ti gains it.
-3. **Possible speedups, opt-in first:** overlap the worker's receive of chunk c+1 with its compute of chunk c (it
+4. **Possible speedups, opt-in first:** overlap the worker's receive of chunk c+1 with its compute of chunk c (it
    receives and computes in turn now); prefetch the worker's first-layer experts during the 4090's half of decode.

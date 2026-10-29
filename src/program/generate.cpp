@@ -1404,6 +1404,7 @@ static int glm_stage_worker(const Options& o) {
     strata::core::Glm5Model model;
     if (!o.expert_profile.empty()) model.set_expert_profile(o.expert_profile);
     model.set_head_here(o.stage_head == "coordinator" ? 0 : 1);
+    model.set_stage_layers(o.stage_split, 0);   // (its RAM tier: this PC's, for its own layers)
     if (!model.load_pack(o.glm_pack, o.max_context, err, o.stage_gpu, o.stage_split, 0)) {
         std::fprintf(stderr, "maya generate: %s\n", err.c_str());
         return 1;
@@ -1504,7 +1505,10 @@ static int glm_pack_generate(const Options& o) {
     }
     // the layer split across the visible GPUs: STRATA_GLM_SPLIT, else --layer-split (auto | K1,K2,..); a layer stage's
     // coordinator: layers [0, K) on this PC's one GPU (and the head with --layer-stage-head coordinator)
-    if (stage_mode) model.set_head_here(o.stage_head == "coordinator" ? 1 : 0);
+    if (stage_mode) {
+        model.set_head_here(o.stage_head == "coordinator" ? 1 : 0);
+        model.set_stage_layers(0, o.stage_split);   // (its RAM tier: this PC's, for its own layers)
+    }
     if (stage_mode ? !model.load_pack(o.glm_pack, o.max_context, err, o.stage_gpu, 0, o.stage_split)
                    : !model.load_pack_env(o.glm_pack, o.max_context, err, o.layer_split)) {
         std::fprintf(stderr, "maya generate: %s\n", err.c_str());
