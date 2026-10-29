@@ -4,6 +4,24 @@ Read this first. Claude and Sol (GPT/Codex) both work here. Fetch before you sta
 this file with every push, and never force-push. Doc-only commits carry `[skip ci]`. Never commit
 `STRATA_RPC_TOKEN`, raw logs or other private data.
 
+## Shelved: the user stays on DeepSeek (2026-10-29, Claude)
+
+**Read this first.** The user decided to stick with DeepSeek V4.1 Flash on StrataRPCD and not use GLM-5.3-Flash for now.
+The reasons:
+- DeepSeek is the larger model (748B vs 321B parameters) with 1M context.
+- On these PCs it answers about 40% faster: about 6.8 tok/s at 2.25 bpw, against an estimated 4.6-5.0 for GLM's 3.5-bit
+  file.
+- Answering time dominates the user's reverse-engineering work. GLM reads fresh prompts about twice as fast, but that
+  is used up after about 2,000 generated tokens, and follow-up turns are cached anyway.
+
+- **State of this branch:** working and measured as of `80d285f0` / `1792f471`.
+  - Two-PC split, RAM-tier fix, long-prompt memory fix, the 3.5-bit default, the delete-and-recreate update route.
+  - Nothing is half-done. A quality comparison on the user's own tasks was offered and declined.
+- **The user is removing the GLM install:** the 3.5-bit download was in progress. `C:\StrataRPCG` and
+  `C:\Strata-data\models-glm` on both PCs can go.
+- **Don't push GLM work** unless the user brings it back. If they do, start from "How the user updates" and the
+  measurements below.
+
 ## The model is now the 3.5-bit file (2026-10-29, Claude)
 
 **The user's decision:** delete the 3.0-bit file and run pfeifferj's GSQ-RCO **3.5-bit** GGUF. The user does reverse
